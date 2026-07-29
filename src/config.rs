@@ -83,6 +83,8 @@ pub struct Config {
     pub pam_service: String,
     /// The only account permitted to log in: the user running this process.
     pub owner: String,
+    /// The owner's home directory (from the passwd DB), for the spawned shell.
+    pub owner_home: String,
     pub slots_per_user: usize,
     pub max_share_secs: u64,
     pub sharing_enabled: bool,
@@ -102,7 +104,11 @@ pub struct Config {
 impl Config {
     pub fn from_settings(s: Settings) -> Self {
         let is_root = unsafe { libc::geteuid() } == 0;
-        let owner = process_owner();
+        // Resolve identity from the passwd DB, NOT from the environment: when a
+        // root supervisor (e.g. processmaster/systemd) setuids us to the owner,
+        // HOME/USER are still root's, and chdir-ing the shell into $HOME=/root
+        // fails with EACCES.
+        let owner = owner_info();
 
         let public_base_url = s
             .public_base_url
@@ -118,9 +124,8 @@ impl Config {
             // A genuine pre-authenticated login shell as {user}.
             vec!["/bin/login".into(), "-f".into(), "{user}".into()]
         } else {
-            // Dev fallback: login shell as the current (only) user.
-            let sh = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-            vec![sh, "-l".into()]
+            // The owner's actual login shell from the passwd DB.
+            vec![owner.shell.clone(), "-l".into()]
         };
 
         let secret_base64 = env::var("WEBSHELL_SECRET").ok().or(s.secret_base64);
@@ -128,7 +133,8 @@ impl Config {
         Config {
             bind_addr: s.bind,
             pam_service: s.pam_service,
-            owner,
+            owner_home: owner.home,
+            owner: owner.name,
             slots_per_user: s.max_sessions.clamp(1, 64),
             max_share_secs: s.max_sharing_duration_secs.max(1),
             sharing_enabled: s.sharing_enabled,
@@ -162,15 +168,36 @@ impl Config {
     }
 }
 
-/// The username of the user running this process (euid).
-fn process_owner() -> String {
+/// Identity of the user running this process (euid), resolved from the passwd
+/// database rather than the (possibly root-inherited) environment.
+struct OwnerInfo {
+    name: String,
+    home: String,
+    shell: String,
+}
+
+fn owner_info() -> OwnerInfo {
     unsafe {
         let uid = libc::geteuid();
         let pw = libc::getpwuid(uid);
         if pw.is_null() {
-            return env::var("USER").unwrap_or_else(|_| uid.to_string());
+            return OwnerInfo {
+                name: env::var("USER").unwrap_or_else(|_| uid.to_string()),
+                home: "/".to_string(),
+                shell: "/bin/sh".to_string(),
+            };
         }
-        CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+        let cstr = |p: *const std::os::raw::c_char| CStr::from_ptr(p).to_string_lossy().into_owned();
+        let name = cstr((*pw).pw_name);
+        let home = {
+            let h = cstr((*pw).pw_dir);
+            if h.is_empty() { "/".to_string() } else { h }
+        };
+        let shell = {
+            let s = cstr((*pw).pw_shell);
+            if s.is_empty() { "/bin/sh".to_string() } else { s }
+        };
+        OwnerInfo { name, home, shell }
     }
 }
 

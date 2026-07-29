@@ -96,6 +96,8 @@ pub struct Terminals {
     slots_per_user: usize,
     /// Login command template; `{user}` is substituted per user.
     login_cmd: Vec<String>,
+    /// The owner's home directory, for the spawned shell's cwd/$HOME.
+    owner_home: String,
     scrollback_cap: usize,
 }
 
@@ -106,11 +108,17 @@ pub struct SlotStatus {
 }
 
 impl Terminals {
-    pub fn new(slots_per_user: usize, login_cmd: Vec<String>, scrollback_cap: usize) -> Self {
+    pub fn new(
+        slots_per_user: usize,
+        login_cmd: Vec<String>,
+        owner_home: String,
+        scrollback_cap: usize,
+    ) -> Self {
         Terminals {
             pools: Mutex::new(HashMap::new()),
             slots_per_user,
             login_cmd,
+            owner_home,
             scrollback_cap,
         }
     }
@@ -166,8 +174,15 @@ impl Terminals {
             if let Some(old) = guard.take() {
                 old.stop();
             }
-            let term = spawn_terminal(&self.login_cmd, user, cols, rows, self.scrollback_cap)
-                .map_err(|e| e.to_string())?;
+            let term = spawn_terminal(
+                &self.login_cmd,
+                user,
+                &self.owner_home,
+                cols,
+                rows,
+                self.scrollback_cap,
+            )
+            .map_err(|e| e.to_string())?;
             *guard = Some(term);
         }
 
@@ -245,6 +260,7 @@ impl Terminals {
 fn spawn_terminal(
     login_cmd: &[String],
     user: &str,
+    owner_home: &str,
     cols: u16,
     rows: u16,
     scrollback_cap: usize,
@@ -269,15 +285,23 @@ fn spawn_terminal(
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
     cmd.env("TERM", "xterm-256color");
-    // For the dev fallback (shell as current user) start in HOME; `login`
-    // sets the target user's HOME itself.
-    if program.ends_with("sh") {
-        if let Some(home) = std::env::var_os("HOME") {
-            cmd.cwd(home);
-        }
+    // When we spawn the shell directly (non-root), fix up the environment and
+    // cwd to the real owner. The inherited env may come from a root supervisor
+    // (HOME=/root, USER=root) — chdir-ing into /root as the unprivileged owner
+    // fails with EACCES, which is what killed the spawn. `login` (root path)
+    // sets all of this itself, so leave it alone there.
+    let is_login = program.ends_with("login");
+    if !is_login {
+        cmd.env("HOME", owner_home);
+        cmd.env("USER", user);
+        cmd.env("LOGNAME", user);
+        cmd.cwd(owner_home);
     }
 
-    let child = pair.slave.spawn_command(cmd)?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| anyhow::anyhow!("spawn {program:?} (cwd {owner_home}): {e}"))?;
     drop(pair.slave); // so the master sees EOF when the shell exits
 
     let reader = pair.master.try_clone_reader()?;

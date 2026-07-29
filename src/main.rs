@@ -199,6 +199,7 @@ async fn run_server(config_path: &std::path::Path) {
     let terminals = Arc::new(Terminals::new(
         config.slots_per_user,
         config.login_cmd.clone(),
+        config.owner_home.clone(),
         config.scrollback_cap,
     ));
     let shares = Arc::new(ShareStore::new());
@@ -651,10 +652,18 @@ async fn access_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    tracing::info!("access ws: upgrade request");
     let Some((user, index)) = resolve_share(&state, &q.token) else {
+        tracing::warn!("access ws: rejected — invalid or expired share token");
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
     };
     if !origin_allowed(&state, &headers) {
+        tracing::warn!(
+            "access ws: rejected — origin not allowed: Origin={:?} Host={:?} allowed_origin={:?}",
+            header_str(&headers, ORIGIN),
+            header_str(&headers, HOST),
+            state.config.allowed_origin
+        );
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
     // Force-close the viewer exactly when the token expires.
@@ -664,9 +673,13 @@ async fn access_ws(
         .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
     match state.terminals.attach_view(&user, index) {
         Ok(attachment) => {
+            tracing::info!("access ws: attached (viewer) user={user:?} term={index}");
             ws.on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline))
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => {
+            tracing::warn!("access ws: attach_view failed user={user:?} term={index}: {e}");
+            (StatusCode::BAD_REQUEST, e).into_response()
+        }
     }
 }
 
@@ -690,13 +703,22 @@ async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    tracing::info!("ws: upgrade request term={} mode={:?}", q.term, q.mode);
     let Some(session) = authed_session(&state, &jar) else {
+        tracing::warn!("ws: rejected — not authenticated (no valid session cookie)");
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     };
     if !csrf_matches(&session.csrf, &q.csrf) {
+        tracing::warn!("ws: rejected — CSRF mismatch for user {:?}", session.username);
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
     if !origin_allowed(&state, &headers) {
+        let origin = header_str(&headers, ORIGIN);
+        let host = header_str(&headers, HOST);
+        tracing::warn!(
+            "ws: rejected — origin not allowed: Origin={origin:?} Host={host:?} allowed_origin={:?}",
+            state.config.allowed_origin
+        );
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
 
@@ -708,11 +730,29 @@ async fn ws_handler(
         .terminals
         .attach(&session.username, q.term, cols, rows)
     {
-        Ok(a) => a,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Ok(a) => {
+            tracing::info!("ws: attached user={:?} term={}", session.username, q.term);
+            a
+        }
+        Err(e) => {
+            tracing::error!(
+                "ws: attach/spawn failed for user {:?} term {}: {e}",
+                session.username,
+                q.term
+            );
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
     };
 
     ws.on_upgrade(move |socket| pty::bridge(socket, attachment, read_only, None))
+}
+
+fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>")
+        .to_string()
 }
 
 /// Reject cross-site WebSocket upgrades: `Origin` must match the configured
