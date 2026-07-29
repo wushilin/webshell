@@ -1,25 +1,90 @@
 # webshell
 
 A browser-based login shell built with **axum** + **tokio** and
-[xterm.js](https://xtermjs.org/). Authenticates against **PAM** (your real
+[xterm.js](https://xtermjs.org/). It authenticates against **PAM** (your real
 system password), opens a genuine login shell, and gives you persistent,
-resumable terminal slots — like an always-attached `tmux`, in the browser.
+resumable terminal slots — like an always-attached `tmux`, in the browser — plus
+read-only share links so others can watch a session live.
+
+## Screenshots
+
+> Replace the placeholders below with your own images (drop them in `docs/`).
+
+**Login**
+
+<!-- paste: login screen -->
+![Login](docs/login.png)
+
+**Terminal with slot switcher**
+
+<!-- paste: main terminal + slot bar -->
+![Terminal](docs/terminal.png)
+
+**Create a share link**
+
+<!-- paste: share modal -->
+![Share](docs/share.png)
+
+**Read-only shared view (with expiry countdown)**
+
+<!-- paste: read-only viewer -->
+![Shared](docs/shared.png)
+
+## What it does
+
+Point a browser at `https://your-host/webshell/`, log in with your system
+password, and you get a real terminal. Each user has a fixed set of **persistent
+slots**: the shell in a slot keeps running even after you close the tab, and
+reconnecting replays the recent scrollback — so long-running work survives
+disconnects and you can pick up exactly where you left off from any device.
+
+You can also hand out **read-only share links** to any slot: a login-free URL
+that lets someone watch that terminal live (for pairing, demos, or debugging),
+with a validity you choose and no ability to type.
 
 ## Features
 
-- **PAM authentication, single user.** Only the process owner can log in, with
-  their system password. Running as root additionally spawns each shell as the
-  authenticated user via `login -f`; non-root runs the owner's `$SHELL -l`.
-- **Persistent, resumable slots** (default 10). A slot's shell keeps running
-  across disconnects; reconnecting replays recent scrollback. Switching between
-  opened slots is instant (each is its own always-connected session).
-- **Read-only share links.** Generate a login-free, read-only URL to a slot with
-  a chosen validity (1d/3d/7d/30d/custom). Read-only and expiry are enforced
-  server-side; the viewer mirrors the owner's grid + font, scaled to fit.
-- **Security by construction.** Structural auth middleware on `/webshell/private/*`,
-  signed `HttpOnly` `SameSite=Strict` session cookies, per-session CSRF tokens on
-  every state-changing request and the WebSocket, an `Origin` check on WS
-  upgrades, session-id rotation on login, and a login brute-force tarpit.
+- **PAM authentication, single user.** Only the user the process runs as can log
+  in, with their real system password (username + password). No app-specific
+  accounts to manage.
+- **Genuine login shell.** Running as root, each session is spawned as the
+  authenticated user via `login -f` (real PAM session, correct uid/gid, groups,
+  `$HOME`, utmp). Running unprivileged, it opens the owner's own login shell.
+- **Persistent, resumable slots** (default 10). A slot's shell survives
+  disconnects; reattaching replays recent scrollback. Switching between opened
+  slots is **instant** — each is its own always-connected session, not a repaint.
+- **Reset / recycle** a slot from the toolbar to kill a stuck shell and start
+  fresh; other viewers of that slot follow the reset automatically.
+- **Read-only share links.** Generate a login-free URL for a slot with a chosen
+  validity (1 day / 3 / 7 / 30, or custom seconds). Read-only and expiry are
+  **enforced server-side**; the link stops working exactly at expiry (the viewer
+  pops an "expired" notice), and dies immediately if sharing is disabled.
+- **Faithful viewer.** The read-only view mirrors the owner's terminal grid and
+  font and scales to fit — no wrong-wrapping from size mismatches — and shows a
+  live "expires in …" countdown.
+- **Auto-reconnect** with backoff on the client, and a live **font size / family**
+  setting persisted in your browser.
+- **Security by construction.** Structural auth middleware on
+  `/webshell/private/*`, signed `HttpOnly` `SameSite=Strict` session cookies,
+  per-session CSRF tokens on every state-changing request and the WebSocket, an
+  `Origin` check on WS upgrades, session-id rotation on login, short-lived
+  pre-auth sessions, and a login brute-force tarpit.
+- **Single static binary.** All HTML/JS is embedded (`include_str!`); deploy just
+  the binary + a small YAML config.
+
+## How it works
+
+```
+browser (xterm.js)  ──TLS──►  reverse proxy  ──►  webshell (axum)
+  /webshell/login              (terminates TLS)     PAM auth, CSRF, session
+  /webshell/private/...  ◄── auth-gated ──►         persistent per-user slots
+  /webshell/public/access  ◄── token, read-only ──► each slot = login shell / PTY
+```
+
+- `/webshell/login` — PAM login form.
+- `/webshell/private/*` — the terminal UI, WebSocket, and APIs (auth-gated by a
+  single middleware layer).
+- `/webshell/public/access?token=…` — the login-free, read-only viewer.
 
 ## Build
 
@@ -27,11 +92,9 @@ resumable terminal slots — like an always-attached `tmux`, in the browser.
 cargo build --release
 ```
 
-Cross-compile a Linux x86_64 binary from any host (used for deployment) with
-`./build-x86_64.sh` — it targets **glibc** via `cargo-zigbuild`, not static musl,
-because PAM is loaded at runtime with `dlopen("libpam.so.0")` (static musl's
-`dlopen` is a stub). The HTML is embedded into the binary (`include_str!`), so
-only the binary is needed at runtime.
+Cross-compile a Linux x86_64 binary from any host with `./build-x86_64.sh` — it
+targets **glibc** via `cargo-zigbuild` (not static musl, because PAM is loaded at
+runtime with `dlopen("libpam.so.0")`, which a static musl binary can't do).
 
 ## Configure
 
@@ -40,7 +103,7 @@ Configuration is a YAML file (default `config.yaml`):
 ```sh
 webshell genconfig -c config.yaml   # write a default config
 webshell validate -c config.yaml    # check it
-webshell run -c config.yaml         # run (default subcommand)
+webshell run -c config.yaml         # run (this is also the default subcommand)
 ```
 
 Keys (all optional; `genconfig` writes the defaults):
@@ -52,30 +115,37 @@ Keys (all optional; `genconfig` writes the defaults):
 | `max_sessions` | `10` | Persistent slots for the user. |
 | `max_sharing_duration_secs` | `2592000` | Cap on a share link's lifetime. |
 | `sharing_enabled` | `true` | Master switch for share links. |
-| `public_base_url` | *(none)* | External base URL — builds absolute share links and derives the accepted WS `Origin`. |
+| `public_base_url` | *(none)* | External base URL — builds absolute share links and derives the accepted WebSocket `Origin`. |
 | `scrollback_bytes` | `131072` | Replay buffer per slot. |
 | `session_ttl_secs` | `28800` | Login-session lifetime. |
 | `cookie_secure` | `false` | Set `true` when served over HTTPS. |
-| `allowed_origin` | *(derived)* | Exact WS `Origin` to accept. |
+| `allowed_origin` | *(derived)* | Exact WebSocket `Origin` to accept. |
 | `secret_base64` | *(ephemeral)* | base64 cookie-signing key (≥64 bytes). |
 
 `WEBSHELL_SECRET` (base64 key) and `WEBSHELL_CONFIG` (config path) may also be set
 via the environment.
 
+Behind a **TLS reverse proxy**, set `public_base_url` (and thus `allowed_origin`)
+to the exact browser-facing origin — e.g. `https://shell.example.com` (include a
+non-default port if any). A mismatch here rejects the WebSocket upgrade and the
+terminal will just say "reconnecting".
+
 ## Run
 
 ```sh
 webshell run -c config.yaml
-# browse to http://<bind>/webshell/
+# then browse to  https://<public_base_url>/webshell/
 ```
 
-For real multi-user shells (each person gets their own login shell), run as
-**root**; the owner-only single-user model applies when running unprivileged.
+For real multi-user shells (each person gets their own login shell as themselves),
+run as **root**; the owner-only single-user model applies when running
+unprivileged.
 
 ## Security notes
 
-- **Serve over TLS.** Login sends your system password and the shell stream is
-  interactive — over plaintext HTTP both are exposed on the wire. Put TLS in
-  front (nginx/caddy), set `cookie_secure: true`, and restrict network exposure.
+- **Serve over TLS.** The login sends your system password and the shell stream
+  is interactive — over plaintext HTTP both are exposed on the wire. Terminate
+  TLS in front (nginx/caddy/etc.), set `cookie_secure: true`, and restrict who
+  can reach it.
 - The server is in the keystroke path, as with any web terminal — run it only on
   hosts and networks you trust.

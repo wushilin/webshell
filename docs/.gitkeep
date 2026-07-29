@@ -1,0 +1,5 @@
+Drop screenshots here (referenced by ../README.md):
+  login.png     - the login screen
+  terminal.png  - main terminal with the slot switcher
+  share.png     - the "create share link" modal
+  shared.png    - the read-only shared view with expiry countdown
