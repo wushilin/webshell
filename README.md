@@ -13,22 +13,26 @@ read-only share links so others can watch a session live.
 **Login**
 
 <!-- paste: login screen -->
-![Login](docs/login.png)
+<img width="447" height="331" alt="image" src="https://github.com/user-attachments/assets/0d5a4457-2bdd-4ca7-9e4c-cb5261e47532" />
+
 
 **Terminal with slot switcher**
 
 <!-- paste: main terminal + slot bar -->
-![Terminal](docs/terminal.png)
+<img width="1725" height="839" alt="image" src="https://github.com/user-attachments/assets/78ce8119-8f5a-4fa7-961f-87e2b3482633" />
+
 
 **Create a share link**
+<img width="481" height="207" alt="image" src="https://github.com/user-attachments/assets/2339a997-5a00-40f9-b098-4367a40485c9" />
 
 <!-- paste: share modal -->
-![Share](docs/share.png)
+<img width="487" height="252" alt="image" src="https://github.com/user-attachments/assets/b3427b65-6a3a-4a1a-bdf1-3f174d937b68" />
 
 **Read-only shared view (with expiry countdown)**
 
 <!-- paste: read-only viewer -->
-![Shared](docs/shared.png)
+<img width="1728" height="457" alt="image" src="https://github.com/user-attachments/assets/d8f918ca-ab98-4673-87e3-c924f7382801" />
+
 
 ## What it does
 
@@ -41,6 +45,8 @@ disconnects and you can pick up exactly where you left off from any device.
 You can also hand out **read-only share links** to any slot: a login-free URL
 that lets someone watch that terminal live (for pairing, demos, or debugging),
 with a validity you choose and no ability to type.
+
+You can even broadcast your live session in 1 to N multicasting.
 
 ## Features
 
