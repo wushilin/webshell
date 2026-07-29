@@ -23,6 +23,7 @@ read-only share links so others can watch a session live.
 
 
 **Create a share link**
+
 <img width="481" height="207" alt="image" src="https://github.com/user-attachments/assets/2339a997-5a00-40f9-b098-4367a40485c9" />
 
 <!-- paste: share modal -->
