@@ -1,0 +1,26 @@
+[package]
+name = "webshell"
+version = "0.1.0"
+edition = "2021"
+description = "A browser-based, PAM-authenticated login shell with persistent, resumable per-user terminal slots."
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+axum-extra = { version = "0.9", features = ["cookie-signed"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+futures = "0.3"
+anyhow = "1"
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+subtle = "2"
+base64 = "0.22"
+libloading = "0.8"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

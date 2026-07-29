@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="same-origin" />
+  <title>webshell</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+  <style>
+    html, body { height: 100%; margin: 0; background: #000; color: #cbd0d8; }
+    #bar {
+      display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+      padding: .4rem .6rem; background: #14171d;
+      font: .8rem system-ui, sans-serif; box-sizing: border-box;
+      border-bottom: 1px solid #23272f;
+    }
+    #bar strong { margin-right: .25rem; }
+    #bar .user { color: #9aa0aa; }
+    #bar .grow { flex: 1; }
+    .slots { display: flex; gap: .25rem; }
+    .slot {
+      width: 30px; height: 26px; border: 1px solid #2c313c; border-radius: 6px;
+      background: #0f1115; color: #7d828c; cursor: pointer; font: inherit; position: relative;
+    }
+    /* a slot whose shell is running (per the server) */
+    .slot.running { color: #cbd0d8; border-color: #34506e; }
+    .slot.running::after {
+      content: ""; position: absolute; top: 3px; right: 3px; width: 6px; height: 6px;
+      border-radius: 50%; background: #7ecb7e;
+    }
+    .slot.active { background: #4c8bf5; color: #fff; border-color: #4c8bf5; }
+    .slot.active.running::after { background: #eafbea; }
+    label.ro { display: flex; align-items: center; gap: .3rem; user-select: none; cursor: pointer; }
+    button.action {
+      background: transparent; border: 1px solid #2c313c; color: #cbd0d8;
+      border-radius: 6px; padding: .25rem .6rem; cursor: pointer; font: inherit;
+    }
+    button.action:hover { border-color: #4c8bf5; }
+    #status { min-width: 6.5rem; text-align: right; color: #7ecb7e; }
+    #status.down { color: #ff6b6b; }
+    #status.wait { color: #e0b34c; }
+    form.logout { margin: 0; }
+    /* All session panes stack in the same area; only the active one shows. */
+    #panes { position: absolute; left: 0; right: 0; bottom: 0; top: 46px; }
+    .pane { position: absolute; inset: 0; padding: 4px; display: none; }
+    .pane.visible { display: block; }
+    @media (max-width: 640px) { #panes { top: 76px; } }
+
+    /* Share modal */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.6);
+      display: grid; place-items: center; z-index: 50;
+    }
+    .modal-overlay[hidden] { display: none; }
+    .modal {
+      background: #1a1d24; border: 1px solid #2c313c; border-radius: 12px;
+      padding: 1.2rem 1.4rem; width: min(92vw, 420px);
+      font: .85rem system-ui, sans-serif; color: #e6e6e6;
+      box-shadow: 0 12px 48px rgba(0,0,0,.55);
+    }
+    .modal h3 { margin: 0 0 .3rem; font-size: 1rem; }
+    .modal .modal-sub { color: #9aa0aa; margin: .2rem 0 .9rem; font-size: .8rem; }
+    .ttl-row { display: flex; flex-wrap: wrap; gap: .4rem; }
+    .ttl {
+      flex: 1 1 auto; padding: .45rem .5rem; border: 1px solid #2c313c;
+      border-radius: 8px; background: #0f1115; color: #cbd0d8; cursor: pointer; font: inherit;
+    }
+    .ttl.sel { border-color: #4c8bf5; background: #22304a; color: #fff; }
+    #customRow { margin: .7rem 0 0; }
+    #customRow input {
+      width: 9rem; padding: .35rem .5rem; border: 1px solid #2c313c;
+      border-radius: 6px; background: #0f1115; color: #e6e6e6;
+    }
+    .modal-actions { display: flex; gap: .5rem; margin-top: 1.1rem; }
+    .modal-actions .action { flex: 1; padding: .5rem; text-align: center; }
+    .action.primary { background: #4c8bf5; color: #fff; border-color: #4c8bf5; }
+    .action.primary:hover { background: #3f7be0; }
+    #shareUrl {
+      width: 100%; box-sizing: border-box; padding: .5rem; border: 1px solid #2c313c;
+      border-radius: 6px; background: #0f1115; color: #e6e6e6;
+      font-family: ui-monospace, monospace; font-size: .8rem;
+    }
+    /* Display-settings popover */
+    .cog-panel {
+      position: absolute; top: 44px; right: 8px; z-index: 40;
+      background: #1a1d24; border: 1px solid #2c313c; border-radius: 10px;
+      padding: .7rem .8rem; font: .8rem system-ui, sans-serif; color: #e6e6e6;
+      box-shadow: 0 10px 32px rgba(0,0,0,.5); display: grid; gap: .55rem;
+    }
+    .cog-panel[hidden] { display: none; }
+    .cog-panel label { display: flex; align-items: center; justify-content: space-between; gap: .8rem; }
+    .cog-panel input, .cog-panel select {
+      background: #0f1115; border: 1px solid #2c313c; color: #e6e6e6;
+      border-radius: 6px; padding: .25rem .4rem; font: inherit;
+    }
+    .cog-panel input[type=number] { width: 4rem; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <strong>webshell</strong>
+    <span class="user">{{USER}}</span>
+    <div class="slots" id="slots"></div>
+    <label class="ro"><input type="checkbox" id="ro" /> read-only</label>
+    <button class="action" id="share" title="Create a read-only share link for this slot">share</button>
+    <button class="action" id="reset" title="Kill and restart the selected slot">reset</button>
+    <span class="grow"></span>
+    <span id="status">connecting…</span>
+    <button class="action" id="cog" title="Display settings">⚙</button>
+    <form class="logout" method="post" action="/webshell/private/logout">
+      <input type="hidden" name="csrf" value="{{CSRF}}" />
+      <button class="action" type="submit">log out</button>
+    </form>
+  </div>
+  <div id="panes"></div>
+
+  <div id="cogPanel" class="cog-panel" hidden>
+    <label>Font size <input type="number" id="fontSize" min="8" max="40" step="1" /></label>
+    <label>Font <select id="fontFamily"></select></label>
+    <button type="button" class="action primary" id="applyPrefs">Apply</button>
+  </div>
+
+  <div id="shareModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h3>Share terminal <span id="shareSlotNum"></span></h3>
+      <p class="modal-sub">Creates a <strong>read-only</strong>, login-free link. It works until it expires, even after you log out.</p>
+      <div id="shareStep1">
+        <div class="ttl-row" id="ttlOpts">
+          <button type="button" class="ttl" data-secs="86400">1 day</button>
+          <button type="button" class="ttl" data-secs="259200">3 days</button>
+          <button type="button" class="ttl" data-secs="604800">7 days</button>
+          <button type="button" class="ttl" data-secs="2592000">30 days</button>
+          <button type="button" class="ttl" data-secs="custom">Custom…</button>
+        </div>
+        <div id="customRow" hidden>
+          <label>Seconds: <input type="number" id="customSecs" min="1" max="31536000" placeholder="e.g. 3600" /></label>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="action primary" id="shareCreate">Create link</button>
+          <button type="button" class="action" id="shareCancel">Cancel</button>
+        </div>
+      </div>
+      <div id="shareStep2" hidden>
+        <p class="modal-sub">Expires in <span id="shareExpiry"></span>. Copied to clipboard.</p>
+        <input id="shareUrl" readonly />
+        <div class="modal-actions">
+          <button type="button" class="action primary" id="shareCopy">Copy link</button>
+          <button type="button" class="action" id="shareDone">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script>
+    const CSRF = "{{CSRF}}";
+    const SLOTS = parseInt("{{SLOTS}}", 10) || 1;
+
+    // Display preferences (font size/family), persisted in localStorage.
+    const TermPrefs = (function () {
+      const FONTS = [
+        ["System mono", "ui-monospace, SFMono-Regular, Menlo, monospace"],
+        ["Menlo", "Menlo, monospace"],
+        ["Consolas", "Consolas, monospace"],
+        ["Courier New", "'Courier New', monospace"],
+        ["DejaVu Sans Mono", "'DejaVu Sans Mono', monospace"],
+        ["Monospace", "monospace"],
+      ];
+      const KEY = "webshell.term";
+      const DEF = { fontSize: 14, fontFamily: FONTS[0][1] };
+      function load() {
+        try { return Object.assign({}, DEF, JSON.parse(localStorage.getItem(KEY) || "{}")); }
+        catch (_) { return Object.assign({}, DEF); }
+      }
+      function save(p) {
+        try { localStorage.setItem(KEY, JSON.stringify({ fontSize: p.fontSize, fontFamily: p.fontFamily })); }
+        catch (_) {}
+      }
+      function wireControls(prefs, onChange) {
+        const cog = document.getElementById("cog");
+        const panel = document.getElementById("cogPanel");
+        const sizeEl = document.getElementById("fontSize");
+        const famEl = document.getElementById("fontFamily");
+        FONTS.forEach(([label, val]) => {
+          const o = document.createElement("option"); o.value = val; o.textContent = label; famEl.appendChild(o);
+        });
+        const applyEl = document.getElementById("applyPrefs");
+        sizeEl.value = prefs.fontSize;
+        famEl.value = prefs.fontFamily;
+        cog.addEventListener("click", (e) => { e.stopPropagation(); panel.hidden = !panel.hidden; });
+        document.addEventListener("click", (e) => {
+          if (!panel.hidden && !panel.contains(e.target) && e.target !== cog) panel.hidden = true;
+        });
+        // Changes take effect only on Apply.
+        applyEl.addEventListener("click", () => {
+          let v = parseInt(sizeEl.value, 10); if (!v || v < 8) v = 8; if (v > 40) v = 40;
+          sizeEl.value = v;
+          prefs.fontSize = v;
+          prefs.fontFamily = famEl.value;
+          save(prefs);
+          onChange();
+          panel.hidden = true;
+        });
+      }
+      return { load, wireControls };
+    })();
+    const prefs = TermPrefs.load();
+
+    const statusEl = document.getElementById("status");
+    const slotsEl = document.getElementById("slots");
+    const panesEl = document.getElementById("panes");
+    const roEl = document.getElementById("ro");
+    const enc = new TextEncoder();
+
+    // One independent, always-connected session per slot, created lazily on
+    // first visit and kept alive afterward — so switching between opened slots
+    // is instant (no repaint) and background slots stay live.
+    const sessions = new Array(SLOTS).fill(null);
+    let active = 0;
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = cls || "";
+    }
+    function markActive() {
+      slotBtns.forEach((b, i) => b.classList.toggle("active", i === active));
+    }
+    function refreshStatus() {
+      const s = sessions[active];
+      if (!s || !s.ws) { setStatus("connecting…", "wait"); return; }
+      switch (s.ws.readyState) {
+        case WebSocket.OPEN: setStatus(s.readOnly ? "read-only" : "connected"); break;
+        case WebSocket.CONNECTING: setStatus("connecting…", "wait"); break;
+        default: setStatus("reconnecting…", "wait");
+      }
+    }
+
+    async function refreshSlots() {
+      try {
+        const res = await fetch("/webshell/private/api/terminals", { credentials: "same-origin" });
+        if (!res.ok) return;
+        const list = await res.json();
+        list.forEach((s) => {
+          if (slotBtns[s.index]) slotBtns[s.index].classList.toggle("running", s.running);
+        });
+      } catch (_) { /* ignore */ }
+    }
+
+    function wsUrl(index, mode, cols, rows) {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${location.host}/webshell/private/ws?csrf=${encodeURIComponent(CSRF)}`
+        + `&term=${index}&mode=${mode}&cols=${cols}&rows=${rows}`;
+    }
+
+    class Session {
+      constructor(index) {
+        this.index = index;
+        this.readOnly = false;
+        this.ws = null;
+        this.opened = false;
+        // Per-socket reconnect identity (see the double-socket fix).
+        this.generation = 0;
+        this.reconnectDelay = 500;
+        this.reconnectTimer = null;
+        // Suppress xterm report replies while the replay frame is parsed.
+        this.suppressReports = false;
+
+        this.pane = document.createElement("div");
+        this.pane.className = "pane";
+        panesEl.appendChild(this.pane);
+
+        this.term = new Terminal({
+          cursorBlink: true,
+          fontFamily: prefs.fontFamily,
+          fontSize: prefs.fontSize,
+          scrollback: 5000,
+          theme: { background: "#000000" },
+        });
+        this.fit = new FitAddon.FitAddon();
+        this.term.loadAddon(this.fit);
+        this.term.open(this.pane);
+
+        this.term.onData((d) => {
+          if (this.suppressReports) return;
+          if (!this.readOnly && this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(enc.encode(d));
+          }
+        });
+        this.term.onResize(() => this.sendResize());
+      }
+
+      isActive() { return active === this.index; }
+
+      sendResize() {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.readOnly) {
+          this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
+        }
+      }
+
+      // Fit to the current viewport. Only meaningful while the pane is visible.
+      fitAndResize() {
+        try { this.fit.fit(); } catch (_) { /* hidden/0-size */ }
+        this.sendResize();
+      }
+
+      connect() {
+        clearTimeout(this.reconnectTimer);
+        this.opened = true;
+        const myGen = ++this.generation;
+        this.term.options.disableStdin = this.readOnly;
+        if (this.isActive()) setStatus("connecting…", "wait");
+
+        const sock = new WebSocket(
+          wsUrl(this.index, this.readOnly ? "ro" : "rw", this.term.cols, this.term.rows));
+        this.ws = sock;
+        sock.binaryType = "arraybuffer";
+        let firstFrame = true;
+
+        sock.onopen = () => {
+          if (myGen !== this.generation) return;
+          this.reconnectDelay = 500;
+          this.sendResize();
+          refreshSlots();
+          if (this.isActive()) { refreshStatus(); this.term.focus(); }
+        };
+        sock.onmessage = (ev) => {
+          if (myGen !== this.generation) return;
+          const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
+          if (firstFrame) {
+            // Replay frame: suppress report replies so answers to historical
+            // color/status queries are not injected into the live shell.
+            firstFrame = false;
+            this.suppressReports = true;
+            // Clear any stale content first: on a reconnect after the slot was
+            // reset/respawned, the replay is a *different* shell — otherwise the
+            // dead shell's screen lingers until a manual refresh.
+            this.term.reset();
+            const clear = () => { this.suppressReports = false; };
+            this.term.write(data, clear);
+            setTimeout(clear, 300);
+          } else {
+            this.term.write(data);
+          }
+        };
+        sock.onclose = () => {
+          if (myGen !== this.generation) return;  // superseded socket: stay closed
+          if (this.isActive()) setStatus("reconnecting…", "wait");
+          refreshSlots();
+          this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
+          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+        };
+        sock.onerror = () => { try { sock.close(); } catch (_) {} };
+      }
+
+      dropSocket() {
+        this.generation++;               // orphan the current socket's handlers
+        clearTimeout(this.reconnectTimer);
+        if (this.ws) {
+          this.ws.onmessage = null;      // no late frames into this term
+          try { this.ws.close(); } catch (_) {}
+          this.ws = null;
+        }
+      }
+
+      reconnect() { this.dropSocket(); this.connect(); }
+    }
+
+    // Build slot buttons.
+    const slotBtns = [];
+    for (let i = 0; i < SLOTS; i++) {
+      const b = document.createElement("button");
+      b.className = "slot";
+      b.textContent = i + 1;
+      b.title = "Terminal " + (i + 1);
+      b.addEventListener("click", () => activate(i));
+      slotsEl.appendChild(b);
+      slotBtns.push(b);
+    }
+
+    function activate(i) {
+      active = i;
+      let s = sessions[i];
+      if (!s) { s = new Session(i); sessions[i] = s; }
+
+      sessions.forEach((sess, idx) => {
+        if (sess) sess.pane.classList.toggle("visible", idx === i);
+      });
+      markActive();
+      roEl.checked = s.readOnly;
+
+      if (!s.opened) s.connect();
+      // Pane is now visible: fit it to the viewport, then focus.
+      requestAnimationFrame(() => {
+        s.fitAndResize();
+        s.term.focus();
+        refreshStatus();
+      });
+    }
+
+    roEl.addEventListener("change", () => {
+      const s = sessions[active];
+      if (!s) return;
+      s.readOnly = roEl.checked;
+      s.term.options.disableStdin = s.readOnly;
+      s.term.reset();
+      s.reconnect();     // re-attach in the new mode
+    });
+
+    // ---- share modal ----
+    const shareModal = document.getElementById("shareModal");
+    let shareSecs = 86400;
+
+    function humanizeSecs(s) {
+      if (s % 86400 === 0) { const d = s / 86400; return d + " day" + (d > 1 ? "s" : ""); }
+      if (s % 3600 === 0) { const h = s / 3600; return h + " hour" + (h > 1 ? "s" : ""); }
+      if (s % 60 === 0) { const m = s / 60; return m + " minute" + (m > 1 ? "s" : ""); }
+      return s + " second" + (s > 1 ? "s" : "");
+    }
+    function updateTtlSel() {
+      document.querySelectorAll("#ttlOpts .ttl").forEach((b) => {
+        const v = b.dataset.secs;
+        const on = (v === "custom" && shareSecs === "custom") ||
+                   (v !== "custom" && Number(v) === shareSecs);
+        b.classList.toggle("sel", on);
+      });
+    }
+    function openShareModal() {
+      document.getElementById("shareSlotNum").textContent = active + 1;
+      document.getElementById("shareStep1").hidden = false;
+      document.getElementById("shareStep2").hidden = true;
+      document.getElementById("customRow").hidden = true;
+      document.getElementById("customSecs").value = "";
+      shareSecs = 86400;
+      updateTtlSel();
+      shareModal.hidden = false;
+    }
+    function closeShareModal() { shareModal.hidden = true; }
+
+    document.getElementById("share").addEventListener("click", openShareModal);
+    document.getElementById("shareCancel").addEventListener("click", closeShareModal);
+    document.getElementById("shareDone").addEventListener("click", closeShareModal);
+    shareModal.addEventListener("click", (e) => { if (e.target === shareModal) closeShareModal(); });
+
+    document.querySelectorAll("#ttlOpts .ttl").forEach((b) => {
+      b.addEventListener("click", () => {
+        if (b.dataset.secs === "custom") {
+          shareSecs = "custom";
+          document.getElementById("customRow").hidden = false;
+          document.getElementById("customSecs").focus();
+        } else {
+          shareSecs = Number(b.dataset.secs);
+          document.getElementById("customRow").hidden = true;
+        }
+        updateTtlSel();
+      });
+    });
+
+    document.getElementById("shareCreate").addEventListener("click", async () => {
+      let secs = shareSecs;
+      if (secs === "custom") {
+        secs = parseInt(document.getElementById("customSecs").value, 10);
+        if (!secs || secs < 1) { alert("Enter a valid number of seconds."); return; }
+      }
+      const idx = active;
+      try {
+        const res = await fetch("/webshell/private/api/share", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ csrf: CSRF, index: String(idx), ttl_secs: String(secs) }),
+        });
+        if (!res.ok) { alert("Could not create share link."); return; }
+        const data = await res.json();
+        // The server returns an absolute URL when public_base_url is configured;
+        // otherwise a path to resolve against this origin.
+        const full = /^https?:\/\//i.test(data.url) ? data.url : location.origin + data.url;
+        document.getElementById("shareUrl").value = full;
+        document.getElementById("shareExpiry").textContent = humanizeSecs(data.expires_in_secs);
+        document.getElementById("shareStep1").hidden = true;
+        document.getElementById("shareStep2").hidden = false;
+        try { await navigator.clipboard.writeText(full); } catch (_) { /* ignore */ }
+        const u = document.getElementById("shareUrl"); u.focus(); u.select();
+      } catch (_) {
+        alert("Could not create share link.");
+      }
+    });
+
+    document.getElementById("shareCopy").addEventListener("click", async () => {
+      const u = document.getElementById("shareUrl");
+      u.focus(); u.select();
+      try { await navigator.clipboard.writeText(u.value); } catch (_) { document.execCommand("copy"); }
+    });
+
+    document.getElementById("reset").addEventListener("click", async () => {
+      const s = sessions[active];
+      if (!s) return;
+      if (!confirm("Kill and restart terminal " + (active + 1) + "?")) return;
+      const body = new URLSearchParams({ csrf: CSRF, index: String(active) });
+      try {
+        await fetch("/webshell/private/api/reset", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
+        });
+      } catch (_) { /* ignore */ }
+      s.term.reset();
+      s.reconnect();     // respawns a fresh shell on attach
+    });
+
+    // Only the active pane can be measured; resize it on viewport changes.
+    window.addEventListener("resize", () => {
+      const s = sessions[active];
+      if (s) s.fitAndResize();
+    });
+
+    setInterval(refreshSlots, 5000);
+
+    // Publish the owner's font prefs so read-only viewers can mirror them.
+    function postPrefs() {
+      fetch("/webshell/private/api/prefs", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          csrf: CSRF, font_size: String(prefs.fontSize), font_family: prefs.fontFamily,
+        }),
+      }).catch(() => {});
+    }
+
+    // Apply font prefs live to all open sessions; refit the visible one.
+    TermPrefs.wireControls(prefs, () => {
+      sessions.forEach((s) => {
+        if (s) { s.term.options.fontSize = prefs.fontSize; s.term.options.fontFamily = prefs.fontFamily; }
+      });
+      const a = sessions[active];
+      if (a) a.fitAndResize();
+      postPrefs();
+    });
+
+    postPrefs();
+    activate(0);
+  </script>
+</body>
+</html>

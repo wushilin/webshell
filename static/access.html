@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- no-referrer: never leak the ?token=... to the CDN or anywhere else. -->
+  <meta name="referrer" content="no-referrer" />
+  <title>webshell · shared (read-only)</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+  <style>
+    html, body { height: 100%; margin: 0; background: #000; color: #cbd0d8; }
+    #bar {
+      display: flex; align-items: center; gap: .6rem;
+      padding: .4rem .6rem; background: #14171d;
+      font: .8rem system-ui, sans-serif; box-sizing: border-box;
+      border-bottom: 1px solid #23272f;
+    }
+    #bar .tag {
+      background: #3a2d12; color: #e0b34c; border: 1px solid #5a4a1e;
+      border-radius: 6px; padding: .1rem .45rem; font-size: .72rem;
+    }
+    #bar .grow { flex: 1; }
+    #deadline { color: #9aa0aa; font-variant-numeric: tabular-nums; }
+    #status { text-align: right; color: #7ecb7e; }
+    #status.wait { color: #e0b34c; }
+    #status.down { color: #ff6b6b; }
+    /* The viewer mirrors the owner's grid exactly, then scales to fit here. */
+    #term { position: absolute; left: 0; right: 0; bottom: 0; top: 40px; overflow: hidden; background: #000; }
+    #screen { position: absolute; top: 4px; left: 4px; transform-origin: top left; }
+    #expired {
+      position: fixed; inset: 0; background: rgba(0,0,0,.82);
+      display: grid; place-items: center; z-index: 50;
+    }
+    #expired[hidden] { display: none; }
+    #expired .box {
+      background: #1a1d24; border: 1px solid #5a2323; border-radius: 12px;
+      padding: 1.4rem 1.6rem; width: min(90vw, 380px); text-align: center;
+      font: .9rem system-ui, sans-serif; color: #e6e6e6;
+    }
+    #expired h3 { margin: 0 0 .4rem; color: #ff6b6b; }
+    #expired p { margin: 0; color: #9aa0aa; font-size: .82rem; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <strong>webshell</strong>
+    <span class="tag">read-only · shared</span>
+    <span class="grow"></span>
+    <span id="deadline"></span>
+    <span id="status">connecting…</span>
+  </div>
+  <div id="term"><div id="screen"></div></div>
+
+  <div id="expired" hidden>
+    <div class="box">
+      <h3>Share link expired</h3>
+      <p>This read-only session link is no longer valid.</p>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script>
+    const token = new URLSearchParams(location.search).get("token") || "";
+    const statusEl = document.getElementById("status");
+    const deadlineEl = document.getElementById("deadline");
+    function setStatus(t, c) { statusEl.textContent = t; statusEl.className = c || ""; }
+
+    // No font config here: the viewer mirrors the OWNER's font + grid so its
+    // rendering matches exactly (a different size would wrap the output wrong).
+    const term = new Terminal({
+      disableStdin: true,
+      cursorBlink: false,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontSize: 14,
+      scrollback: 5000,
+      theme: { background: "#000000" },
+    });
+    term.open(document.getElementById("screen"));
+    // No onData handler: this page never sends anything upstream.
+
+    let curCols = 0, curRows = 0;
+
+    // Fit the owner-sized grid into this viewport by scaling down (never up).
+    function rescale() {
+      const screen = document.getElementById("screen");
+      const view = document.getElementById("term");
+      const natW = screen.offsetWidth, natH = screen.offsetHeight;
+      if (!natW || !natH) return;
+      const k = Math.min(1, (view.clientWidth - 8) / natW, (view.clientHeight - 8) / natH);
+      screen.style.transform = "scale(" + Math.max(k, 0.05) + ")";
+    }
+
+    function applyMeta(m) {
+      let changed = false;
+      if (m.font_size && term.options.fontSize !== m.font_size) { term.options.fontSize = m.font_size; changed = true; }
+      if (m.font_family && term.options.fontFamily !== m.font_family) { term.options.fontFamily = m.font_family; changed = true; }
+      if (m.cols && m.rows && (m.cols !== curCols || m.rows !== curRows)) {
+        curCols = m.cols; curRows = m.rows; term.resize(m.cols, m.rows); changed = true;
+      }
+      if (changed) { requestAnimationFrame(rescale); setTimeout(rescale, 120); }
+    }
+
+    async function fetchJson(path) {
+      try {
+        const r = await fetch(path, { cache: "no-store" });
+        if (!r.ok) return null;
+        return await r.json();
+      } catch (_) { return null; }
+    }
+    function metaUrl() { return `/webshell/public/access/meta?token=${encodeURIComponent(token)}`; }
+    function statusUrl() { return `/webshell/public/access/status?token=${encodeURIComponent(token)}`; }
+    async function checkStatus() {
+      const j = await fetchJson(statusUrl());
+      return j || { valid: true, expires_in_secs: null, unknown: true };
+    }
+    async function checkMeta() { const m = await fetchJson(metaUrl()); if (m) applyMeta(m); }
+
+    // ---- expiry / deadline ----
+    let ws = null, generation = 0, delay = 500, reconnectTimer = null;
+    let expiryTimer = null, pollTimer = null, tickTimer = null, expired = false;
+    let remaining = null;
+    const MAX_TIMEOUT = 2147483000;
+
+    function fmtRemaining(s) {
+      if (s == null) return "";
+      if (s >= 86400) { const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600); return `expires in ${d}d ${h}h`; }
+      if (s >= 3600) { const h = Math.floor(s/3600), m = Math.floor((s%3600)/60); return `expires in ${h}h ${m}m`; }
+      const m = Math.floor(s/60), sec = s%60;
+      return `expires in ${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
+    }
+    function renderDeadline() { deadlineEl.textContent = fmtRemaining(remaining); }
+
+    function showExpired() {
+      if (expired) return;
+      expired = true; generation++;
+      clearTimeout(reconnectTimer); clearTimeout(expiryTimer);
+      clearInterval(pollTimer); clearInterval(tickTimer);
+      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+      remaining = 0; renderDeadline();
+      setStatus("expired", "down");
+      document.getElementById("expired").hidden = false;
+    }
+    function scheduleExpiry(secs) {
+      if (secs == null) return;
+      remaining = secs; renderDeadline();
+      clearTimeout(expiryTimer);
+      expiryTimer = setTimeout(async () => {
+        const st = await checkStatus();
+        if (st.valid) scheduleExpiry(st.expires_in_secs);
+        else showExpired();
+      }, Math.min(secs * 1000, MAX_TIMEOUT));
+    }
+
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;
+    }
+    function connect() {
+      if (expired) return;
+      clearTimeout(reconnectTimer);
+      const myGen = ++generation;
+      setStatus("connecting…", "wait");
+      const sock = new WebSocket(wsUrl());
+      ws = sock; sock.binaryType = "arraybuffer";
+      let firstFrame = true;
+      sock.onopen = () => { if (myGen !== generation) return; delay = 500; setStatus("watching (read-only)"); checkMeta(); };
+      sock.onmessage = (ev) => {
+        if (myGen !== generation) return;
+        const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
+        if (firstFrame) { firstFrame = false; term.reset(); }
+        term.write(data);
+      };
+      sock.onclose = async () => {
+        if (myGen !== generation || expired) return;
+        const st = await checkStatus();
+        if (!st.valid && !st.unknown) { showExpired(); return; }
+        setStatus("waiting for session…", "wait");
+        reconnectTimer = setTimeout(connect, delay);
+        delay = Math.min(delay * 2, 10000);
+      };
+      sock.onerror = () => { try { sock.close(); } catch (_) {} };
+    }
+
+    window.addEventListener("resize", rescale);
+
+    (async function start() {
+      const st = await checkStatus();
+      if (!st.valid && !st.unknown) { showExpired(); return; }
+      if (st.valid && st.expires_in_secs != null) scheduleExpiry(st.expires_in_secs);
+      await checkMeta();
+      tickTimer = setInterval(() => {
+        if (remaining != null && remaining > 0) { remaining -= 1; renderDeadline(); }
+      }, 1000);
+      pollTimer = setInterval(async () => {
+        const s = await checkStatus();
+        if (!s.valid && !s.unknown) showExpired();
+        else if (s.valid && s.expires_in_secs != null) scheduleExpiry(s.expires_in_secs);
+        checkMeta();                 // follow the owner's size/font changes
+      }, 4000);
+      connect();
+    })();
+  </script>
+</body>
+</html>

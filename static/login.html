@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="same-origin" />
+  <title>webshell · login</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      display: grid; place-items: center; min-height: 100vh; margin: 0;
+      background: #0f1115; color: #e6e6e6;
+    }
+    .card {
+      background: #1a1d24; padding: 2rem 2.25rem; border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0,0,0,.5); width: min(90vw, 340px);
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 1.25rem; font-weight: 600; }
+    label { display: block; font-size: .8rem; margin: .75rem 0 .25rem; color: #9aa0aa; }
+    input {
+      width: 100%; box-sizing: border-box; padding: .6rem .7rem; border-radius: 8px;
+      border: 1px solid #2c313c; background: #0f1115; color: #e6e6e6; font-size: .95rem;
+    }
+    input:focus { outline: 2px solid #4c8bf5; border-color: transparent; }
+    button {
+      margin-top: 1.25rem; width: 100%; padding: .65rem; border: 0; border-radius: 8px;
+      background: #4c8bf5; color: #fff; font-size: .95rem; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: #3f7be0; }
+    .error { color: #ff6b6b; font-size: .85rem; margin: .75rem 0 0; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/webshell/login" autocomplete="off">
+    <h1>webshell</h1>
+    <!--ERROR-->
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" autofocus required />
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required />
+    <input type="hidden" name="csrf" value="{{CSRF}}" />
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>
