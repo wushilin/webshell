@@ -8,8 +8,6 @@ read-only share links so others can watch a session live.
 
 ## Screenshots
 
-> Replace the placeholders below with your own images (drop them in `docs/`).
-
 **Login**
 
 <!-- paste: login screen -->
