@@ -65,7 +65,10 @@ You can even broadcast your live session in 1 to N multicasting.
 - **Read-only share links.** Generate a login-free URL for a slot with a chosen
   validity (1 day / 3 / 7 / 30, or custom seconds). Read-only and expiry are
   **enforced server-side**; the link stops working exactly at expiry (the viewer
-  pops an "expired" notice), and dies immediately if sharing is disabled.
+  pops an "expired" notice), and dies immediately if sharing is disabled. Tokens
+  are **stateless and HMAC-signed** (they carry their own slot + expiry), so they
+  keep working **across server restarts** — provided a stable `secret_base64` is
+  set — with nothing stored server-side.
 - **Faithful viewer.** The read-only view mirrors the owner's terminal grid and
   font and scales to fit — no wrong-wrapping from size mismatches — and shows a
   live "expires in …" countdown.
@@ -127,7 +130,7 @@ Keys (all optional; `genconfig` writes the defaults):
 | `session_ttl_secs` | `28800` | Login-session lifetime. |
 | `cookie_secure` | `false` | Set `true` when served over HTTPS. |
 | `allowed_origin` | *(derived)* | Exact WebSocket `Origin` to accept. |
-| `secret_base64` | *(ephemeral)* | base64 cookie-signing key (≥64 bytes). |
+| `secret_base64` | *(ephemeral)* | base64 signing key (≥64 bytes). Signs session cookies **and** share tokens; set a stable value so both survive restarts. Ephemeral resets both. |
 
 `WEBSHELL_SECRET` (base64 key) and `WEBSHELL_CONFIG` (config path) may also be set
 via the environment.

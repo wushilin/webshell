@@ -202,8 +202,10 @@ async fn run_server(config_path: &std::path::Path) {
         config.owner_home.clone(),
         config.scrollback_cap,
     ));
-    let shares = Arc::new(ShareStore::new());
     let key = load_signing_key(config.secret_base64.as_deref());
+    // Share tokens are HMAC-signed with the cookie master key, so they survive
+    // restarts as long as the key is stable (a configured secret_base64).
+    let shares = Arc::new(ShareStore::new(key.master().to_vec()));
     let bind = config.bind_addr.clone();
 
     let state = AppState {
@@ -216,15 +218,13 @@ async fn run_server(config_path: &std::path::Path) {
         key,
     };
 
-    // Expire auth sessions (terminal slots are persistent by design) and prune
-    // expired share tokens. Share links have their own TTL, independent of the
-    // creator's session.
+    // Expire auth sessions (terminal slots are persistent by design). Share
+    // tokens are stateless and self-expiring, so there is nothing to sweep.
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
             sessions.sweep();
-            shares.sweep();
         }
     });
 
@@ -250,6 +250,8 @@ async fn run_server(config_path: &std::path::Path) {
 
     let app = Router::new()
         .route("/webshell/login", get(login_page).post(login_submit))
+        .route("/favicon.ico", get(favicon))
+        .route("/webshell/favicon.ico", get(favicon))
         .merge(public)
         .merge(private)
         .route("/webshell", get(|| async { Redirect::to("/webshell/private/") }))
@@ -274,11 +276,28 @@ fn load_signing_key(secret_base64: Option<&str>) -> Key {
         }
         None => {
             tracing::warn!(
-                "no secret_base64 set; generating ephemeral key (login sessions reset on restart)"
+                "no secret_base64 set; generating ephemeral key \
+                 (login sessions AND share links reset on restart)"
             );
             Key::generate()
         }
     }
+}
+
+// ---- static assets ---------------------------------------------------------
+
+/// Terminal-style favicon, embedded in the binary and served without auth.
+const FAVICON: &[u8] = include_bytes!("../static/favicon.ico");
+
+async fn favicon() -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/x-icon"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        FAVICON,
+    )
+        .into_response()
 }
 
 // ---- cookie / session helpers ---------------------------------------------
@@ -631,7 +650,8 @@ async fn access_meta(State(state): State<AppState>, Query(q): Query<AccessQuery>
 }
 
 const SHARE_INVALID_HTML: &str = "<!doctype html><meta charset=utf-8>\
-<title>webshell</title><body style=\"font-family:system-ui;background:#0f1115;\
+<title>webshell</title><link rel=icon href=/webshell/favicon.ico>\
+<body style=\"font-family:system-ui;background:#0f1115;\
 color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0\">\
 <p>This share link is invalid or has expired.</p>";
 
