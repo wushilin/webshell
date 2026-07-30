@@ -24,7 +24,7 @@ read-only share links so others can watch a session live.
 
 <img width="481" height="207" alt="image" src="https://github.com/user-attachments/assets/2339a997-5a00-40f9-b098-4367a40485c9" />
 
-<!-- paste: share modal -->
+
 <img width="487" height="252" alt="image" src="https://github.com/user-attachments/assets/b3427b65-6a3a-4a1a-bdf1-3f174d937b68" />
 
 **Read-only shared view (with expiry countdown)**
