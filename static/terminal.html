@@ -655,6 +655,21 @@
 
     setInterval(refreshSlots, 5000);
 
+    // Coming back to the foreground (mobile backgrounds kill sockets):
+    // reconnect dead sessions immediately instead of waiting out the
+    // exponential backoff, which can sit at 10s.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      sessions.forEach((s) => {
+        if (!s || !s.opened) return;
+        if (!s.ws || s.ws.readyState === WebSocket.CLOSING || s.ws.readyState === WebSocket.CLOSED) {
+          s.reconnectDelay = 500;
+          s.reconnect();
+        }
+      });
+      refreshSlots();
+    });
+
     // Publish the owner's font prefs so read-only viewers can mirror them.
     function postPrefs() {
       fetch("/webshell/private/api/prefs", {
