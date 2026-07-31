@@ -254,11 +254,11 @@ enum ClientControl {
 
 /// Bridge a WebSocket to ONE attached terminal (share viewers). Sends a
 /// hello text frame, then the replay/delta as the first binary frame (even
-/// if empty — the client keys report-suppression off it), then live output.
-/// When `read_only` is set, all input and resize frames from this client are
-/// dropped (server-enforced). When `deadline` is set (share links), the
-/// connection is force-closed at that time so an expired token cannot keep
-/// watching a connection it opened before expiry.
+/// if empty — this keeps the frame sequence uniform: hello, replay, live),
+/// then live output. When `read_only` is set, all input and resize frames
+/// from this client are dropped (server-enforced). When `deadline` is set
+/// (share links), the connection is force-closed at that time so an expired
+/// token cannot keep watching a connection it opened before expiry.
 pub async fn bridge(
     socket: WebSocket,
     attachment: Attachment,

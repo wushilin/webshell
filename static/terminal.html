@@ -331,7 +331,14 @@
           this.failures = 0;
           // Restore every slot the user has opened; each resumes from its
           // own offset (delta) or replays in full — one round trip.
-          sessions.forEach((s) => { if (s && s.opened) s.sendOpen(); });
+          // Re-open live slots; a dead background slot stays dead until the
+          // user activates it (respawning it silently would be a surprise).
+          // The dead ACTIVE slot must re-open here: its delayed respawn
+          // timer no-ops while the socket is down, so this is its only
+          // revival path after a reconnect.
+          sessions.forEach((s) => {
+            if (s && s.opened && (!s.dead || s.isActive())) s.sendOpen();
+          });
           refreshSlots();
           refreshStatus();
           const a = sessions[active];
@@ -599,10 +606,11 @@
 
       onClosed(m) {
         // Shell exited / was reset ("exit") or attach failed ("error").
-        // Either way our resume state is for a dead stream.
+        // Keep epoch/offset: the next open carries them so the server can
+        // decide delta vs. full replay via its epoch check. If the shell
+        // really did respawn, the epoch mismatch forces a full replay
+        // anyway, so retaining stale state here is always safe.
         this.dead = true;
-        this.epoch = null;
-        this.offset = 0;
         refreshSlots();
         if (!this.isActive()) return;   // background: re-opened on activation
         // Respawn the visible slot on a small delay so a crash-looping or
@@ -758,6 +766,8 @@
       s.term.options.disableStdin = s.readOnly;
       // Server-side enforcement flips instantly; no reconnect, no replay.
       Conn.sendJson({ type: "mode", term: s.index, ro: s.readOnly });
+      // While read-only, resize() was suppressed — resync the pty now.
+      s.sendResize();
       refreshStatus();
     });
 
