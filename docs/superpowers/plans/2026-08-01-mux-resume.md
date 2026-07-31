@@ -936,6 +936,7 @@ with the channel state
         this.dead = false;        // server closed the channel; re-open respawns
         this.epoch = null;        // shell-instance id from the last hello
         this.offset = 0;          // stream bytes received (the resume checkpoint)
+        this.awaitingHello = false; // open sent; drop data frames until the hello
         this.expectFirst = false; // next data frame is the replay/delta blob
         this.reopenTimer = null;
 ```
@@ -950,6 +951,10 @@ with the channel state
       sendOpen() {
         clearTimeout(this.reopenTimer);
         this.dead = false;
+        // Frames for this slot arriving before the hello are a previous
+        // attachment's stream (re-open race); writing them would duplicate
+        // output and corrupt the offset. Drop until the hello re-syncs us.
+        this.awaitingHello = true;
         const msg = {
           type: "open", term: this.index,
           cols: this.term.cols, rows: this.term.rows,
@@ -960,6 +965,7 @@ with the channel state
       }
 
       onHello(m) {
+        this.awaitingHello = false;
         this.epoch = m.epoch;
         this.offset = m.offset;
         this.expectFirst = true;
@@ -971,6 +977,7 @@ with the channel state
       }
 
       onOutput(data) {
+        if (this.awaitingHello) return;  // stale frames from a replaced attachment
         this.offset += data.length;
         if (this.expectFirst) {
           // Replay/delta blob (sent even when empty): suppress terminal
