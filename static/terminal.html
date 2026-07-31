@@ -52,7 +52,15 @@
       #more { display: inline-block; }
       .slots { overflow-x: auto; min-width: 0; }
       #bar { flex-wrap: nowrap; }
+      #status { min-width: 0; font-size: 0; }
+      #status::before {
+        content: ""; display: inline-block; width: 10px; height: 10px;
+        border-radius: 50%; background: #7ecb7e; vertical-align: middle;
+      }
+      #status.wait::before { background: #e0b34c; animation: statusblink 1s infinite; }
+      #status.down::before { background: #ff6b6b; }
     }
+    @keyframes statusblink { 50% { opacity: .25; } }
 
     /* Share modal */
     .modal-overlay {
@@ -247,6 +255,7 @@
 
     function setStatus(text, cls) {
       statusEl.textContent = text;
+      statusEl.title = text;
       statusEl.className = cls || "";
     }
     function markActive() {
@@ -255,6 +264,7 @@
     function refreshStatus() {
       const s = sessions[active];
       if (!s || !s.ws) { setStatus("connecting…", "wait"); return; }
+      if (s.failures >= 30) { setStatus("connection lost — reload", "down"); return; }
       switch (s.ws.readyState) {
         case WebSocket.OPEN: setStatus(s.readOnly ? "read-only" : "connected"); break;
         case WebSocket.CONNECTING: setStatus("connecting…", "wait"); break;
@@ -289,6 +299,8 @@
         this.generation = 0;
         this.reconnectDelay = 500;
         this.reconnectTimer = null;
+        // Consecutive failed connection cycles; 30 = give up (red status).
+        this.failures = 0;
         // Suppress xterm report replies while the replay frame is parsed.
         this.suppressReports = false;
 
@@ -310,6 +322,20 @@
         this.fit = new FitAddon.FitAddon();
         this.term.loadAddon(this.fit);
         this.term.open(this.pane);
+
+        // Best-effort: keep mobile autofill (passwords/cards/addresses) and
+        // text suggestions away from xterm's hidden textarea. The browser's
+        // keyboard accessory UI is not fully page-controllable.
+        const ta = this.pane.querySelector(".xterm-helper-textarea");
+        if (ta) {
+          ta.setAttribute("autocomplete", "off");
+          ta.setAttribute("autocorrect", "off");
+          ta.setAttribute("autocapitalize", "none");
+          ta.setAttribute("spellcheck", "false");
+          ta.setAttribute("name", "xt-" + this.index);
+          ta.setAttribute("data-form-type", "other");
+          ta.setAttribute("data-lpignore", "true");
+        }
 
         this.term.onData((d) => this.input(d));
         this.term.onResize(() => this.sendResize());
@@ -425,6 +451,7 @@
         sock.onopen = () => {
           if (myGen !== this.generation) return;
           this.reconnectDelay = 500;
+          this.failures = 0;
           this.sendResize();
           refreshSlots();
           if (this.isActive()) { refreshStatus(); this.term.focus(); }
@@ -450,10 +477,17 @@
         };
         sock.onclose = () => {
           if (myGen !== this.generation) return;  // superseded socket: stay closed
-          if (this.isActive()) setStatus("reconnecting…", "wait");
           refreshSlots();
+          this.failures++;
+          if (this.failures >= 30) {
+            // Give up: stop auto-retrying until reload or an explicit
+            // user action (reset / read-only toggle) revives the session.
+            if (this.isActive()) setStatus("connection lost — reload", "down");
+            return;
+          }
+          if (this.isActive()) setStatus("reconnecting…", "wait");
           this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
-          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
         };
         sock.onerror = () => { try { sock.close(); } catch (_) {} };
       }
@@ -468,7 +502,7 @@
         }
       }
 
-      reconnect() { this.dropSocket(); this.connect(); }
+      reconnect() { this.failures = 0; this.dropSocket(); this.connect(); }
     }
 
     // Build slot buttons.
@@ -548,7 +582,6 @@
     const KEYS = [
       ["esc", "\x1b"], ["tab", "\t"], ["ctrl", "MOD_CTRL"], ["shift", "MOD_SHIFT"],
       ["↑", "\x1b[A"], ["↓", "\x1b[B"], ["←", "\x1b[D"], ["→", "\x1b[C"],
-      ["|", "|"], ["-", "-"],
     ];
     KEYS.forEach(([label, seq]) => {
       const b = document.createElement("button");
@@ -772,6 +805,7 @@
       if (document.visibilityState !== "visible") return;
       sessions.forEach((s) => {
         if (!s || !s.opened) return;
+        if (s.failures >= 30) return;  // given up: only reload/user action revives
         if (!s.ws || s.ws.readyState === WebSocket.CLOSING || s.ws.readyState === WebSocket.CLOSED) {
           s.reconnectDelay = 500;
           s.reconnect();
