@@ -276,6 +276,15 @@
     async function refreshSlots() {
       try {
         const res = await fetch("/webshell/private/api/terminals", { credentials: "same-origin" });
+        if (res.status === 401) {
+          // Logged out (elsewhere), session expired, or server restarted:
+          // the ws upgrade will 401 forever, so retrying is pointless.
+          // A network outage never lands here — fetch throws into the catch
+          // below and the normal reconnect loop keeps trying.
+          setStatus("logged out", "down");
+          location.replace("/webshell/login");
+          return;
+        }
         if (!res.ok) return;
         const list = await res.json();
         list.forEach((s) => {

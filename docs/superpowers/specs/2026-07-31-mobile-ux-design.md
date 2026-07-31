@@ -203,3 +203,22 @@ User feedback from on-device testing. Client-only (`static/terminal.html`).
 - Explicit user actions still revive: `reconnect()` (used by the read-only
   toggle and reset button) clears the counter. Page reload always starts
   fresh.
+
+## Addendum 3 (2026-08-01): logged-out awareness
+
+### 14. Reconnect detects logout instead of retrying forever
+
+- Problem: when the session is logged out (another tab), expired (sweep), or
+  the server restarted (in-memory session store), the ws upgrade returns 401 —
+  but the browser surfaces it as a generic close, so the client retries and
+  the status ball blinks yellow forever (foreground fast-reconnect resets the
+  failure counter, so the red give-up state is never reached either).
+- Fix: `refreshSlots()` — already called on every socket close, i.e. every
+  reconnect cycle — fetches the authenticated `/webshell/private/api/terminals`
+  endpoint. A `401` there now means "logged out": status shows the red ball
+  ("logged out") and the page navigates to `/webshell/login` via
+  `location.replace`. After signing in, the login flow returns to the
+  terminal as usual.
+- A network outage or server-down never triggers this: the fetch throws (or
+  the server isn't there to answer 401), the catch swallows it, and the
+  normal bounded retry loop continues.
