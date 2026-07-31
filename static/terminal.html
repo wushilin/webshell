@@ -312,6 +312,30 @@
 
         this.term.onData((d) => this.input(d));
         this.term.onResize(() => this.sendResize());
+
+        // Touch scrollback: one-finger vertical drag scrolls history. The
+        // renderer layers sit above xterm's viewport, so native touch
+        // scrolling never engages — translate drags into scrollLines().
+        this.touchY = null;
+        this.pane.addEventListener("touchstart", (e) => {
+          this.touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+        }, { passive: true });
+        this.pane.addEventListener("touchmove", (e) => {
+          if (this.touchY === null || e.touches.length !== 1) return;
+          const vv = window.visualViewport;
+          if (vv && vv.scale > 1.01) return;   // zoomed: finger pans the page
+          // vim/less own the alternate screen; leave gestures to them
+          if (this.term.buffer.active.type === "alternate") return;
+          const lineH = this.pane.clientHeight / this.term.rows;
+          const dy = e.touches[0].clientY - this.touchY;
+          const lines = Math.trunc(dy / lineH);
+          if (lines !== 0) {
+            this.term.scrollLines(-lines);
+            this.touchY += lines * lineH;
+          }
+          e.preventDefault();
+        }, { passive: false });
+        this.pane.addEventListener("touchend", () => { this.touchY = null; }, { passive: true });
       }
 
       isActive() { return active === this.index; }
@@ -659,14 +683,12 @@
       layoutQueued = false;
       const vv = window.visualViewport;
       let occluded = 0;
-      if (vv) {
+      if (vv && vv.scale <= 1.01) {
         if (window.scrollY) window.scrollTo(0, 0);
         // Pinch-zoom also shrinks vv.height/offsetTop; don't mistake that for
         // keyboard occlusion, or the key bar floats mid-screen and
         // fitAndResize() fires spurious PTY resizes.
-        if (vv.scale <= 1.01) {
-          occluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-        }
+        occluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
       }
       const kb = keyBar.hidden ? 0 : keyBar.offsetHeight;
       keyBar.style.bottom = occluded + "px";
