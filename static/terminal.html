@@ -269,6 +269,10 @@
 
         this.pane = document.createElement("div");
         this.pane.className = "pane";
+        // xterm must be opened on a visible, laid-out element — opening while
+        // display:none leaves the renderer with 0-size cell metrics and a
+        // black screen that only a real window resize repairs.
+        if (this.isActive()) this.pane.classList.add("visible");
         panesEl.appendChild(this.pane);
 
         this.term = new Terminal({
@@ -391,9 +395,13 @@
       roEl.checked = s.readOnly;
 
       if (!s.opened) s.connect();
-      // Pane is now visible: fit it to the viewport, then focus.
+      // Pane is now visible: fit it to the viewport, then focus. Fitting
+      // alone is not enough — if cols/rows come out unchanged, resize() is a
+      // no-op and a renderer that went stale while the pane was hidden stays
+      // black. Force a full repaint of every row regardless.
       requestAnimationFrame(() => {
         s.fitAndResize();
+        s.term.refresh(0, s.term.rows - 1);
         s.term.focus();
         refreshStatus();
       });
