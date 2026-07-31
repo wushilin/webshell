@@ -582,6 +582,10 @@ async fn create_share(
 #[derive(Deserialize)]
 struct AccessQuery {
     token: String,
+    #[serde(default)]
+    epoch: Option<u64>,
+    #[serde(default)]
+    offset: Option<u64>,
 }
 
 /// Resolve a non-expired share token to `(username, index)`, honoring the
@@ -691,7 +695,11 @@ async fn access_ws(
         .shares
         .remaining_secs(&q.token)
         .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
-    match state.terminals.attach_view(&user, index, None) {
+    let resume = match (q.epoch, q.offset) {
+        (Some(e), Some(o)) => Some((e, o)),
+        _ => None,
+    };
+    match state.terminals.attach_view(&user, index, resume) {
         Ok(attachment) => {
             tracing::info!("access ws: attached (viewer) user={user:?} term={index}");
             ws.on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline))
@@ -708,12 +716,6 @@ async fn access_ws(
 #[derive(Deserialize)]
 struct WsQuery {
     csrf: String,
-    #[serde(default)]
-    term: usize,
-    #[serde(default)]
-    mode: Option<String>,
-    cols: Option<u16>,
-    rows: Option<u16>,
 }
 
 async fn ws_handler(
@@ -723,7 +725,7 @@ async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    tracing::info!("ws: upgrade request term={} mode={:?}", q.term, q.mode);
+    tracing::info!("ws: mux upgrade request");
     let Some(session) = authed_session(&state, &jar) else {
         tracing::warn!("ws: rejected — not authenticated (no valid session cookie)");
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
@@ -742,29 +744,9 @@ async fn ws_handler(
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
 
-    let read_only = q.mode.as_deref() == Some("ro");
-    let cols = q.cols.unwrap_or(80);
-    let rows = q.rows.unwrap_or(24);
-
-    let attachment = match state
-        .terminals
-        .attach(&session.username, q.term, cols, rows, None)
-    {
-        Ok(a) => {
-            tracing::info!("ws: attached user={:?} term={}", session.username, q.term);
-            a
-        }
-        Err(e) => {
-            tracing::error!(
-                "ws: attach/spawn failed for user {:?} term {}: {e}",
-                session.username,
-                q.term
-            );
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
-    };
-
-    ws.on_upgrade(move |socket| pty::bridge(socket, attachment, read_only, None))
+    let terminals = state.terminals.clone();
+    let user = session.username;
+    ws.on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user))
 }
 
 fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
