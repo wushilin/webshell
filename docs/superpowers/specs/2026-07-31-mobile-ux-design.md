@@ -132,3 +132,41 @@ User feedback after first deploy. All client-only (`static/terminal.html`).
 - The `window.scrollTo(0, 0)` keyboard pin in `layoutViewport()` is gated on
   `vv.scale <= 1.01` (same guard as occlusion) so panning while pinch-zoomed
   is not fought by the layout code.
+
+## Addendum 2 (2026-07-31): keyboard shift-up, pixel-smooth scroll with momentum
+
+User feedback from on-device testing. Client-only (`static/terminal.html`).
+
+### 8. Keyboard = shift, not resize
+
+- Problem: every keyboard open/close refits the terminal → cols/rows change →
+  PTY resize (SIGWINCH) → full app reflow, twice per keyboard cycle. Heavy.
+- On mobile the layout viewport never changes size except on orientation
+  change, so the terminal keeps a FIXED size (full height minus top bar minus
+  key bar) and the keyboard becomes a pure visual shift:
+  `panesEl.style.transform = translateY(-occluded)` — the bottom rows
+  (prompt/cursor) stay visible above the key bar, top rows slide behind the
+  top bar. No fit, no PTY resize, no repaint of terminal content.
+- `fitAndResize` on viewport events fires ONLY when `window.innerWidth/Height`
+  actually changed (orientation, desktop window resize) — tracked via
+  last-seen values. Slot activation and font-change fits are unchanged.
+- The key bar keeps riding above the keyboard exactly as today.
+- `#bar` gets `position: relative; z-index: 35` so shifted pane content
+  slides underneath it.
+
+### 9. Pixel-smooth touch scroll with momentum
+
+- Problem: line-quantized `scrollLines(trunc(dy/lineH))` steps ~20px at a
+  time and stops dead on finger lift.
+- Drag now drives xterm's own scrollable viewport element
+  (`.xterm-viewport`, captured once after `term.open`) by the raw pixel
+  delta: `viewport.scrollTop -= dy` per move. xterm keeps the buffer in sync
+  from its scroll listener; content tracks the finger 1:1.
+- Momentum: velocity is low-passed during the drag (`v = 0.8*(dy/dt) +
+  0.2*v`); on touchend with |v| > 0.05 px/ms a rAF loop continues
+  `scrollTop -= v*dt` with exponential decay (×0.94 per 16.7ms) until
+  |v| < 0.02 px/ms. Any new touch, or the alternate screen becoming active,
+  stops the fling. `touchcancel` resets state without a fling.
+- All existing gesture guards keep working: capture+stopPropagation
+  ownership, one-finger only, zoomed → native pan, alternate screen → app
+  owns gestures.
