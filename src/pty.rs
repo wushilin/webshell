@@ -157,7 +157,11 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
                     MuxControl::Open { term, cols, rows, epoch, offset, ro } => {
                         // Last open wins: a re-open replaces the old channel.
                         if let Some(old) = channels.remove(&term) {
-                            old.stop();
+                            old.forward.abort();
+                            // Ensure the old forward task is fully gone before cutting the new
+                            // attachment: an in-flight send after the new hello would corrupt
+                            // the client's stream and offset accounting.
+                            let _ = old.forward.await;
                         }
                         let resume = match (epoch, offset) {
                             (Some(e), Some(o)) => Some((e, o)),
