@@ -316,12 +316,17 @@
         // Touch scrollback: one-finger vertical drag scrolls history. The
         // renderer layers sit above xterm's viewport, so native touch
         // scrolling never engages — translate drags into scrollLines().
+        // xterm 5.5 registers its own touch handlers on term.element (a
+        // child of this.pane); capturing here + stopPropagation on move
+        // makes the pane the single owner of the gesture so xterm's
+        // handler never fires and can't double-scroll or fight zoom-pan.
         this.touchY = null;
         this.pane.addEventListener("touchstart", (e) => {
           this.touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
-        }, { passive: true });
+        }, { passive: true, capture: true });
         this.pane.addEventListener("touchmove", (e) => {
           if (this.touchY === null || e.touches.length !== 1) return;
+          e.stopPropagation();
           const vv = window.visualViewport;
           if (vv && vv.scale > 1.01) return;   // zoomed: finger pans the page
           // vim/less own the alternate screen; leave gestures to them
@@ -334,8 +339,8 @@
             this.touchY += lines * lineH;
           }
           e.preventDefault();
-        }, { passive: false });
-        this.pane.addEventListener("touchend", () => { this.touchY = null; }, { passive: true });
+        }, { passive: false, capture: true });
+        this.pane.addEventListener("touchend", () => { this.touchY = null; }, { passive: true, capture: true });
       }
 
       isActive() { return active === this.index; }
