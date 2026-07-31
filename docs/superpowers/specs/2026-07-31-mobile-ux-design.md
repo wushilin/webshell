@@ -103,3 +103,32 @@ rewriting the transport for reconnect count alone.
   line, backgrounding + returning reconnects promptly.
 - iOS WebKit keyboard behavior cannot be reproduced headlessly; on-device
   confirmation by the user is the acceptance gate.
+
+## Addendum (2026-07-31, post-deploy): shift key, touch scrollback, zoom-pan fix
+
+User feedback after first deploy. All client-only (`static/terminal.html`).
+
+### 5. Sticky Shift key
+
+- New `shift` bar key, one-shot sticky like Ctrl (highlight while armed).
+- `shift`+`tab` → back-tab `\x1b[Z` (primary use: Claude Code mode switch).
+- Armed modifiers apply xterm CSI encoding to arrows: `\x1b[1;{1+shift+4*ctrl}{A|B|C|D}`
+  (shift+arrow = `1;2`, ctrl+arrow = `1;5` word-jump, both = `1;6`). This also
+  fixes the prior gap where armed Ctrl + arrow sent a plain arrow.
+- Keys with no shifted form (esc, `|`, `-`) and typed characters send unchanged
+  and consume the armed modifiers (native keyboard shift owns typed letters).
+
+### 6. Touch scrollback scrolling
+
+- One-finger vertical drag on the terminal pane scrolls history via
+  `term.scrollLines()`, one line per cell-height of movement, accumulated.
+- `preventDefault` on handled moves so the page never pans.
+- Skipped when the alternate screen is active (`term.buffer.active.type ===
+  "alternate"`) — vim/less own the screen there; and skipped for multi-touch
+  so pinch-zoom still works.
+
+### 7. Zoom-pan fix
+
+- The `window.scrollTo(0, 0)` keyboard pin in `layoutViewport()` is gated on
+  `vv.scale <= 1.01` (same guard as occlusion) so panning while pinch-zoomed
+  is not fought by the layout code.
