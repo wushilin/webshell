@@ -45,7 +45,12 @@
     #panes { position: absolute; left: 0; right: 0; bottom: 0; top: 46px; }
     .pane { position: absolute; inset: 0; padding: 4px; display: none; }
     .pane.visible { display: block; }
-    @media (max-width: 640px) { #panes { top: 76px; } }
+    #more { display: none; }
+    @media (max-width: 640px) {
+      #bar strong, #bar .user { display: none; }
+      #more { display: inline-block; }
+      .slots { overflow-x: auto; min-width: 0; }
+    }
 
     /* Share modal */
     .modal-overlay {
@@ -102,13 +107,14 @@
     <strong>webshell</strong>
     <span class="user">{{USER}}</span>
     <div class="slots" id="slots"></div>
-    <label class="ro"><input type="checkbox" id="ro" /> read-only</label>
+    <label class="ro" id="roLabel"><input type="checkbox" id="ro" /> read-only</label>
     <button class="action" id="share" title="Create a read-only share link for this slot">share</button>
     <button class="action" id="reset" title="Kill and restart the selected slot">reset</button>
-    <span class="grow"></span>
+    <span class="grow" id="grow"></span>
     <span id="status">connecting…</span>
+    <button class="action" id="more" title="Menu">⋯</button>
     <button class="action" id="cog" title="Display settings">⚙</button>
-    <form class="logout" method="post" action="/webshell/private/logout">
+    <form class="logout" id="logoutForm" method="post" action="/webshell/private/logout">
       <input type="hidden" name="csrf" value="{{CSRF}}" />
       <button class="action" type="submit">log out</button>
     </form>
@@ -120,6 +126,8 @@
     <label>Font <select id="fontFamily"></select></label>
     <button type="button" class="action primary" id="applyPrefs">Apply</button>
   </div>
+
+  <div id="morePanel" class="cog-panel" hidden></div>
 
   <div id="shareModal" class="modal-overlay" hidden>
     <div class="modal">
@@ -382,6 +390,41 @@
       slotsEl.appendChild(b);
       slotBtns.push(b);
     }
+
+    // ---- compact top bar: on narrow screens the right-side controls live
+    // in the ⋯ popover; on wide screens they sit inline. The elements are
+    // moved, not cloned, so their listeners survive the transition. ----
+    const barEl = document.getElementById("bar");
+    const moreBtn = document.getElementById("more");
+    const morePanel = document.getElementById("morePanel");
+    const growEl = document.getElementById("grow");
+    const roLabel = document.getElementById("roLabel");
+    const shareBtn = document.getElementById("share");
+    const resetBtn = document.getElementById("reset");
+    const cogBtn = document.getElementById("cog");
+    const logoutForm = document.getElementById("logoutForm");
+    const narrow = window.matchMedia("(max-width: 640px)");
+
+    function layoutBar() {
+      if (narrow.matches) {
+        [roLabel, shareBtn, resetBtn, cogBtn, logoutForm].forEach((el) => morePanel.appendChild(el));
+      } else {
+        morePanel.hidden = true;
+        [roLabel, shareBtn, resetBtn].forEach((el) => barEl.insertBefore(el, growEl));
+        barEl.appendChild(cogBtn);
+        barEl.appendChild(logoutForm);
+      }
+      panesEl.style.top = barEl.offsetHeight + "px";
+    }
+    moreBtn.addEventListener("click", (e) => { e.stopPropagation(); morePanel.hidden = !morePanel.hidden; });
+    document.addEventListener("click", (e) => {
+      if (!morePanel.hidden && !morePanel.contains(e.target) && e.target !== moreBtn) morePanel.hidden = true;
+    });
+    // Opening display settings from inside the menu: close the menu so the
+    // two popovers don't stack in the same corner.
+    cogBtn.addEventListener("click", () => { morePanel.hidden = true; });
+    narrow.addEventListener("change", layoutBar);
+    layoutBar();
 
     function activate(i) {
       active = i;
