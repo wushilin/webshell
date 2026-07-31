@@ -192,3 +192,14 @@ User feedback from on-device testing. Client-only (`static/terminal.html`).
   10px ball: solid green = connected/read-only, blinking yellow = connecting/
   reconnecting (`.wait`), red = down (`.down`). Full text moves to `title`
   (set in `setStatus`). Desktop keeps the text unchanged.
+
+### 13. Bounded reconnect with give-up state
+
+- Reconnect backoff cap drops 10s → 5s. A `failures` counter increments per
+  failed connection cycle and resets on successful open.
+- After 30 consecutive failures the session gives up: status shows the red
+  ball / "connection lost — reload" (`.down`), no further auto-retries.
+  Foreground fast-reconnect skips given-up sessions.
+- Explicit user actions still revive: `reconnect()` (used by the read-only
+  toggle and reset button) clears the counter. Page reload always starts
+  fresh.
