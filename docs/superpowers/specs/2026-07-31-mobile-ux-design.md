@@ -170,3 +170,18 @@ User feedback from on-device testing. Client-only (`static/terminal.html`).
 - All existing gesture guards keep working: capture+stopPropagation
   ownership, one-finger only, zoomed → native pan, alternate screen → app
   owns gestures.
+
+### 10. Trim the key bar
+
+- Remove `|` and `-` keys (typeable on the soft keyboard; not worth the
+  width). Bar becomes: `esc` `tab` `ctrl` `shift` `↑` `↓` `←` `→`.
+
+### 11. Suppress keyboard autofill/suggestion clutter (best-effort)
+
+- After `term.open()`, harden xterm's hidden textarea
+  (`.xterm-helper-textarea`): `autocomplete=off`, `autocorrect=off`,
+  `autocapitalize=none`, `spellcheck=false`, a non-form-like `name`, and
+  password-manager opt-out data attributes.
+- Goal: stop iPhone Chrome offering password/credit-card/address autofill for
+  terminal input. Known limitation: the browser's keyboard accessory row is
+  not fully page-controllable; attributes are the strongest available lever.
