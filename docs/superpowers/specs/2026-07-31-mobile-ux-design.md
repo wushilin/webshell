@@ -222,3 +222,24 @@ User feedback from on-device testing. Client-only (`static/terminal.html`).
 - A network outage or server-down never triggers this: the fetch throws (or
   the server isn't there to answer 401), the catch swallows it, and the
   normal bounded retry loop continues.
+
+### 15. Alternate-screen touch scroll + pull-to-refresh kill (on-device fix)
+
+- Problem: in the alternate screen (vim, less, Claude Code — where the user
+  lives) the touchmove handler stopPropagation'd (blinding xterm) and then
+  returned WITHOUT preventDefault. Net effect on device: the drag scrolled
+  nothing, the page panned natively, and with the keyboard closed a downward
+  swipe triggered Chrome's pull-to-refresh and reloaded the page.
+- Fix 1: the alternate-screen branch now owns the gesture. It converts the
+  drag into synthetic `WheelEvent`s (pixel deltaMode, deltaY = -dy, touch
+  coords) dispatched on `term.element`, and preventDefaults. xterm 5.5's own
+  wheel pipeline then delivers it the way the app expects (verified in the
+  5.5.0 bundle): mouse-wheel reports when the app enabled mouse tracking
+  (Claude Code transcript scroll), otherwise up/down arrow keys for
+  no-scrollback buffers (less/vim), honoring application cursor keys mode.
+  Fractional lines accumulate in xterm's `_wheelPartialScroll`, so pixel
+  deltas per touchmove are handled exactly. Momentum fling remains
+  normal-buffer only.
+- Fix 2 (defense in depth): `overscroll-behavior: none` on `html, body` so
+  pull-to-refresh/rubber-banding can never fire, including on gestures the
+  app deliberately leaves native (pinch-zoomed panning).

@@ -8,7 +8,9 @@
   <link rel="icon" href="/webshell/favicon.ico" sizes="any" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
   <style>
-    html, body { height: 100%; margin: 0; background: #000; color: #cbd0d8; }
+    /* overscroll-behavior: kill pull-to-refresh / rubber-banding — a swipe
+       must never reload the page, even on gestures the app doesn't own. */
+    html, body { height: 100%; margin: 0; background: #000; color: #cbd0d8; overscroll-behavior: none; }
     #bar {
       display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
       padding: .4rem .6rem; background: #14171d;
@@ -375,14 +377,25 @@
           e.stopPropagation();
           const vv = window.visualViewport;
           if (vv && vv.scale > 1.01) return;   // zoomed: finger pans the page
-          // vim/less own the alternate screen; leave gestures to them
-          if (this.term.buffer.active.type === "alternate") return;
-          if (!this.viewport) return;
-          const y = e.touches[0].clientY;
+          const touch = e.touches[0];
+          const y = touch.clientY;
           const dy = y - this.touchY;
           const dt = Math.max(1, e.timeStamp - this.touchT);
           this.touchY = y;
           this.touchT = e.timeStamp;
+          if (this.term.buffer.active.type === "alternate") {
+            // vim/less/claude-code: no scrollback to drag. Re-emit the drag
+            // as wheel events into xterm's pipeline, which delivers them the
+            // way the app expects: mouse-wheel reports if it enabled mouse
+            // tracking, up/down arrow keys otherwise. Finger down = wheel up.
+            this.term.element.dispatchEvent(new WheelEvent("wheel", {
+              bubbles: true, cancelable: true, deltaMode: 0,
+              deltaY: -dy, clientX: touch.clientX, clientY: y,
+            }));
+            e.preventDefault();
+            return;
+          }
+          if (!this.viewport) return;
           this.viewport.scrollTop -= dy;
           this.touchV = 0.8 * (dy / dt) + 0.2 * this.touchV;
           e.preventDefault();
