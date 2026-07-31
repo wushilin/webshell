@@ -611,7 +611,7 @@
       if (seq === "MOD_SHIFT") shiftBtn = b;
       keyBar.appendChild(b);
     });
-    if (window.matchMedia("(pointer: coarse)").matches) keyBar.hidden = false;
+    if (window.matchMedia("(pointer: coarse) and (hover: none)").matches) keyBar.hidden = false;
 
     function activate(i) {
       active = i;
