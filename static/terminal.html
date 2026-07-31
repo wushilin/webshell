@@ -326,9 +326,11 @@
       // one-shot Ctrl modifier, then forwards to the socket.
       input(d) {
         if (this.suppressReports) return;
-        if (ctrlArmed) {
-          if (d.length === 1) d = ctrlTransform(d);
-          setCtrl(false); // one-shot; multi-char chunks (paste) pass unmodified
+        if (ctrlArmed || shiftArmed) {
+          if (ctrlArmed && d.length === 1) d = ctrlTransform(d);
+          // One-shot: any chunk consumes both modifiers. Typed characters
+          // have no bar-shift form — the native keyboard's shift owns them.
+          setCtrl(false); setShift(false);
         }
         if (!this.readOnly && this.ws && this.ws.readyState === WebSocket.OPEN) {
           this.ws.send(enc.encode(d));
@@ -456,12 +458,16 @@
 
     // ---- mobile key bar (touch devices only) ----
     const keyBar = document.getElementById("keybar");
-    let ctrlArmed = false;
-    let ctrlBtn = null;
+    let ctrlArmed = false, shiftArmed = false;
+    let ctrlBtn = null, shiftBtn = null;
 
     function setCtrl(on) {
       ctrlArmed = on;
       if (ctrlBtn) ctrlBtn.classList.toggle("armed", on);
+    }
+    function setShift(on) {
+      shiftArmed = on;
+      if (shiftBtn) shiftBtn.classList.toggle("armed", on);
     }
     // Map a keystroke to its control byte: letters and @[\]^_ use code&31,
     // ? maps to DEL; anything else passes through unchanged.
@@ -471,8 +477,10 @@
       if (code >= 64 && code <= 95) return String.fromCharCode(code & 31);
       return d;
     }
+    // CSI final bytes for arrows, used for modifier encoding.
+    const ARROWS = { "\x1b[A": "A", "\x1b[B": "B", "\x1b[D": "D", "\x1b[C": "C" };
     const KEYS = [
-      ["esc", "\x1b"], ["tab", "\t"], ["ctrl", null],
+      ["esc", "\x1b"], ["tab", "\t"], ["ctrl", "MOD_CTRL"], ["shift", "MOD_SHIFT"],
       ["↑", "\x1b[A"], ["↓", "\x1b[B"], ["←", "\x1b[D"], ["→", "\x1b[C"],
       ["|", "|"], ["-", "-"],
     ];
@@ -483,11 +491,25 @@
       // keyboard stays up while tapping bar keys.
       b.addEventListener("pointerdown", (e) => {
         e.preventDefault();
-        if (seq === null) { setCtrl(!ctrlArmed); return; }
+        if (seq === "MOD_CTRL") { setCtrl(!ctrlArmed); return; }
+        if (seq === "MOD_SHIFT") { setShift(!shiftArmed); return; }
         const s = sessions[active];
-        if (s) s.input(seq);
+        if (!s) return;
+        let out = seq;
+        // Armed modifiers give arrows/tab their CSI-modified forms here; the
+        // generic one-shot consumption in input() covers every other key.
+        const mod = 1 + (shiftArmed ? 1 : 0) + (ctrlArmed ? 4 : 0);
+        if (ARROWS[seq] && mod > 1) {
+          out = "\x1b[1;" + mod + ARROWS[seq];
+          setCtrl(false); setShift(false);
+        } else if (seq === "\t" && shiftArmed) {
+          out = "\x1b[Z";
+          setCtrl(false); setShift(false);
+        }
+        s.input(out);
       });
-      if (seq === null) ctrlBtn = b;
+      if (seq === "MOD_CTRL") ctrlBtn = b;
+      if (seq === "MOD_SHIFT") shiftBtn = b;
       keyBar.appendChild(b);
     });
     if (window.matchMedia("(pointer: coarse)").matches) keyBar.hidden = false;
