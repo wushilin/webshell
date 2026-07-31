@@ -485,10 +485,7 @@
       if (seq === null) ctrlBtn = b;
       keyBar.appendChild(b);
     });
-    if (window.matchMedia("(pointer: coarse)").matches) {
-      keyBar.hidden = false;
-      panesEl.style.bottom = keyBar.offsetHeight + "px";
-    }
+    if (window.matchMedia("(pointer: coarse)").matches) keyBar.hidden = false;
 
     function activate(i) {
       active = i;
@@ -623,11 +620,38 @@
       s.reconnect();     // respawns a fresh shell on attach
     });
 
-    // Only the active pane can be measured; resize it on viewport changes.
-    window.addEventListener("resize", () => {
+    // ---- keyboard-aware layout: size everything to the *visible* viewport.
+    // iOS WebKit does not shrink the layout viewport for the soft keyboard —
+    // it scrolls the page instead. Pin the scroll and derive the occluded
+    // height from visualViewport, so the key bar rides on top of the
+    // keyboard and the terminal fits in what remains. ----
+    let layoutQueued = false;
+    function layoutViewport() {
+      layoutQueued = false;
+      const vv = window.visualViewport;
+      let occluded = 0;
+      if (vv) {
+        if (window.scrollY) window.scrollTo(0, 0);
+        occluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      }
+      const kb = keyBar.hidden ? 0 : keyBar.offsetHeight;
+      keyBar.style.bottom = occluded + "px";
+      panesEl.style.top = barEl.offsetHeight + "px";
+      panesEl.style.bottom = (occluded + kb) + "px";
       const s = sessions[active];
       if (s) s.fitAndResize();
-    });
+    }
+    function scheduleLayout() {
+      if (layoutQueued) return;
+      layoutQueued = true;
+      requestAnimationFrame(layoutViewport);
+    }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", scheduleLayout);
+      window.visualViewport.addEventListener("scroll", scheduleLayout);
+    }
+    window.addEventListener("resize", scheduleLayout);
+    scheduleLayout();
 
     setInterval(refreshSlots, 5000);
 
