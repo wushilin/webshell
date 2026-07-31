@@ -185,3 +185,10 @@ User feedback from on-device testing. Client-only (`static/terminal.html`).
 - Goal: stop iPhone Chrome offering password/credit-card/address autofill for
   terminal input. Known limitation: the browser's keyboard accessory row is
   not fully page-controllable; attributes are the strongest available lever.
+
+### 12. Status ball instead of text (narrow screens)
+
+- On ≤640px the `#status` text ("connecting…", "connected", …) renders as a
+  10px ball: solid green = connected/read-only, blinking yellow = connecting/
+  reconnecting (`.wait`), red = down (`.down`). Full text moves to `title`
+  (set in `setStatus`). Desktop keeps the text unchanged.
