@@ -314,15 +314,22 @@
         this.term.onData((d) => this.input(d));
         this.term.onResize(() => this.sendResize());
 
-        // Touch scrollback: one-finger vertical drag scrolls history. The
-        // renderer layers sit above xterm's viewport, so native touch
-        // scrolling never engages — translate drags into scrollLines().
-        // xterm 5.5 registers its own touch handlers on term.element (a
-        // child of this.pane); capturing here + stopPropagation on move
-        // makes the pane the single owner of the gesture so xterm's
-        // handler never fires and can't double-scroll or fight zoom-pan.
+        // Touch scrollback: one-finger drag drives xterm's own scrollable
+        // viewport by raw pixel deltas — content tracks the finger 1:1 —
+        // with a momentum fling on release. xterm 5.5 registers its own
+        // touch handlers on term.element (a child of this.pane); capturing
+        // here + stopPropagation on move keeps the pane the single owner of
+        // the gesture so xterm's handler can't double-scroll or fight
+        // zoom-pan.
+        this.viewport = this.pane.querySelector(".xterm-viewport");
         this.touchY = null;
+        this.touchT = 0;
+        this.touchV = 0;          // px/ms, low-passed drag velocity
+        this.flinging = false;
         this.pane.addEventListener("touchstart", (e) => {
+          this.flinging = false;  // any touch stops a fling
+          this.touchV = 0;
+          this.touchT = e.timeStamp;
           this.touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
         }, { passive: true, capture: true });
         this.pane.addEventListener("touchmove", (e) => {
@@ -332,16 +339,23 @@
           if (vv && vv.scale > 1.01) return;   // zoomed: finger pans the page
           // vim/less own the alternate screen; leave gestures to them
           if (this.term.buffer.active.type === "alternate") return;
-          const lineH = this.pane.clientHeight / this.term.rows;
-          const dy = e.touches[0].clientY - this.touchY;
-          const lines = Math.trunc(dy / lineH);
-          if (lines !== 0) {
-            this.term.scrollLines(-lines);
-            this.touchY += lines * lineH;
-          }
+          if (!this.viewport) return;
+          const y = e.touches[0].clientY;
+          const dy = y - this.touchY;
+          const dt = Math.max(1, e.timeStamp - this.touchT);
+          this.touchY = y;
+          this.touchT = e.timeStamp;
+          this.viewport.scrollTop -= dy;
+          this.touchV = 0.8 * (dy / dt) + 0.2 * this.touchV;
           e.preventDefault();
         }, { passive: false, capture: true });
-        this.pane.addEventListener("touchend", () => { this.touchY = null; }, { passive: true, capture: true });
+        this.pane.addEventListener("touchend", () => {
+          if (this.touchY !== null && Math.abs(this.touchV) > 0.05) this.fling();
+          this.touchY = null;
+        }, { passive: true, capture: true });
+        this.pane.addEventListener("touchcancel", () => {
+          this.touchY = null; this.touchV = 0;
+        }, { passive: true, capture: true });
       }
 
       isActive() { return active === this.index; }
@@ -350,6 +364,28 @@
         if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.readOnly) {
           this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
         }
+      }
+
+      // Momentum fling: keep scrolling after release with exponential decay
+      // until the velocity fades or a new touch interrupts.
+      fling() {
+        if (this.flinging || !this.viewport) return;
+        this.flinging = true;
+        let last = performance.now();
+        const step = (now) => {
+          if (!this.flinging) return;
+          const dt = now - last;
+          last = now;
+          this.touchV *= Math.pow(0.94, dt / 16.7);
+          if (Math.abs(this.touchV) < 0.02 ||
+              this.term.buffer.active.type === "alternate") {
+            this.flinging = false;
+            return;
+          }
+          this.viewport.scrollTop -= this.touchV * dt;
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
       }
 
       // Single entry point for keystrokes (typed or key-bar): applies the
