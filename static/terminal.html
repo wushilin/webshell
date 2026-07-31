@@ -265,11 +265,14 @@
       slotBtns.forEach((b, i) => b.classList.toggle("active", i === active));
     }
     function refreshStatus() {
-      const s = sessions[active];
-      if (!s || !s.ws) { setStatus("connecting…", "wait"); return; }
-      if (s.failures >= MAX_FAILURES) { setStatus("connection lost — reload", "down"); return; }
-      switch (s.ws.readyState) {
-        case WebSocket.OPEN: setStatus(s.readOnly ? "read-only" : "connected"); break;
+      if (Conn.failures >= MAX_FAILURES) { setStatus("connection lost — reload", "down"); return; }
+      if (!Conn.ws) { setStatus("connecting…", "wait"); return; }
+      switch (Conn.ws.readyState) {
+        case WebSocket.OPEN: {
+          const s = sessions[active];
+          setStatus(s && s.readOnly ? "read-only" : "connected");
+          break;
+        }
         case WebSocket.CONNECTING: setStatus("connecting…", "wait"); break;
         default: setStatus("reconnecting…", "wait");
       }
@@ -295,24 +298,110 @@
       } catch (_) { /* ignore */ }
     }
 
-    function wsUrl(index, mode, cols, rows) {
+    function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      return `${proto}//${location.host}/webshell/private/ws?csrf=${encodeURIComponent(CSRF)}`
-        + `&term=${index}&mode=${mode}&cols=${cols}&rows=${rows}`;
+      return `${proto}//${location.host}/webshell/private/ws?csrf=${encodeURIComponent(CSRF)}`;
     }
+
+    // ---- single multiplexed connection: every opened slot rides this one
+    // socket. Binary frames carry a 1-byte slot prefix; JSON text frames
+    // carry control (open/resize/mode/close up, hello/closed down). The
+    // reconnect loop, give-up state, logout probe and status ball all
+    // describe this one socket now. ----
+    const Conn = {
+      ws: null,
+      generation: 0,          // orphans superseded sockets' handlers
+      reconnectDelay: 500,
+      reconnectTimer: null,
+      failures: 0,            // consecutive failed cycles; MAX_FAILURES = give up
+
+      isOpen() { return !!this.ws && this.ws.readyState === WebSocket.OPEN; },
+
+      connect() {
+        clearTimeout(this.reconnectTimer);
+        const myGen = ++this.generation;
+        const sock = new WebSocket(wsUrl());
+        this.ws = sock;
+        sock.binaryType = "arraybuffer";
+        refreshStatus();
+
+        sock.onopen = () => {
+          if (myGen !== this.generation) return;
+          this.reconnectDelay = 500;
+          this.failures = 0;
+          // Restore every slot the user has opened; each resumes from its
+          // own offset (delta) or replays in full — one round trip.
+          sessions.forEach((s) => { if (s && s.opened) s.sendOpen(); });
+          refreshSlots();
+          refreshStatus();
+          const a = sessions[active];
+          if (a) a.term.focus();
+        };
+        sock.onmessage = (ev) => {
+          if (myGen !== this.generation) return;
+          if (typeof ev.data === "string") {
+            let m;
+            try { m = JSON.parse(ev.data); } catch (_) { return; }
+            const s = sessions[m.term];
+            if (!s) return;
+            if (m.type === "hello") s.onHello(m);
+            else if (m.type === "closed") s.onClosed(m);
+            return;
+          }
+          const data = new Uint8Array(ev.data);
+          if (!data.length) return;
+          const s = sessions[data[0]];
+          if (s) s.onOutput(data.subarray(1));
+        };
+        sock.onclose = () => {
+          if (myGen !== this.generation) return;  // superseded socket: stay closed
+          refreshSlots();                          // also probes auth: 401 -> login
+          this.failures++;
+          if (this.failures >= MAX_FAILURES) {
+            // Give up: stop auto-retrying until the page is reloaded.
+            refreshStatus();
+            return;
+          }
+          refreshStatus();
+          this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
+          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
+        };
+        sock.onerror = () => { try { sock.close(); } catch (_) {} };
+      },
+
+      sendJson(obj) { if (this.isOpen()) this.ws.send(JSON.stringify(obj)); },
+      sendInput(index, text) {
+        if (!this.isOpen()) return;
+        const b = enc.encode(text);
+        const f = new Uint8Array(b.length + 1);
+        f[0] = index;
+        f.set(b, 1);
+        this.ws.send(f);
+      },
+
+      drop() {
+        this.generation++;
+        clearTimeout(this.reconnectTimer);
+        if (this.ws) {
+          this.ws.onmessage = null;   // no late frames into any term
+          try { this.ws.close(); } catch (_) {}
+          this.ws = null;
+        }
+      },
+      reconnect() { this.failures = 0; this.reconnectDelay = 500; this.drop(); this.connect(); },
+    };
 
     class Session {
       constructor(index) {
         this.index = index;
         this.readOnly = false;
-        this.ws = null;
-        this.opened = false;
-        // Per-socket reconnect identity (see the double-socket fix).
-        this.generation = 0;
-        this.reconnectDelay = 500;
-        this.reconnectTimer = null;
-        // Consecutive failed connection cycles; MAX_FAILURES = give up (red status).
-        this.failures = 0;
+        this.opened = false;      // user has visited this slot; re-open on reconnect
+        this.dead = false;        // server closed the channel; re-open respawns
+        this.epoch = null;        // shell-instance id from the last hello
+        this.offset = 0;          // stream bytes received (the resume checkpoint)
+        this.awaitingHello = false; // open sent; drop data frames until the hello
+        this.expectFirst = false; // next data frame is the replay/delta blob
+        this.reopenTimer = null;
         // Suppress xterm report replies while the replay frame is parsed.
         this.suppressReports = false;
 
@@ -415,8 +504,8 @@
       isActive() { return active === this.index; }
 
       sendResize() {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.readOnly) {
-          this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
+        if (!this.readOnly && this.opened) {
+          Conn.sendJson({ type: "resize", term: this.index, cols: this.term.cols, rows: this.term.rows });
         }
       }
 
@@ -452,9 +541,7 @@
           // have no bar-shift form — the native keyboard's shift owns them.
           setCtrl(false); setShift(false);
         }
-        if (!this.readOnly && this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(enc.encode(d));
-        }
+        if (!this.readOnly) Conn.sendInput(this.index, d);
       }
 
       // Fit to the current viewport. Only meaningful while the pane is visible.
@@ -463,74 +550,68 @@
         this.sendResize();
       }
 
-      connect() {
-        clearTimeout(this.reconnectTimer);
-        this.opened = true;
-        const myGen = ++this.generation;
-        this.term.options.disableStdin = this.readOnly;
-        if (this.isActive()) setStatus("connecting…", "wait");
-
-        const sock = new WebSocket(
-          wsUrl(this.index, this.readOnly ? "ro" : "rw", this.term.cols, this.term.rows));
-        this.ws = sock;
-        sock.binaryType = "arraybuffer";
-        let firstFrame = true;
-
-        sock.onopen = () => {
-          if (myGen !== this.generation) return;
-          this.reconnectDelay = 500;
-          this.failures = 0;
-          this.sendResize();
-          refreshSlots();
-          if (this.isActive()) { refreshStatus(); this.term.focus(); }
+      // Ask the server to (re)attach this slot over the mux connection,
+      // resuming from our offset when the server still can.
+      sendOpen() {
+        clearTimeout(this.reopenTimer);
+        this.dead = false;
+        // Frames for this slot arriving before the hello are a previous
+        // attachment's stream (re-open race); writing them would duplicate
+        // output and corrupt the offset. Drop until the hello re-syncs us.
+        this.awaitingHello = true;
+        const msg = {
+          type: "open", term: this.index,
+          cols: this.term.cols, rows: this.term.rows,
+          ro: this.readOnly,
         };
-        sock.onmessage = (ev) => {
-          if (myGen !== this.generation) return;
-          const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
-          if (firstFrame) {
-            // Replay frame: suppress report replies so answers to historical
-            // color/status queries are not injected into the live shell.
-            firstFrame = false;
-            this.suppressReports = true;
-            // Clear any stale content first: on a reconnect after the slot was
-            // reset/respawned, the replay is a *different* shell — otherwise the
-            // dead shell's screen lingers until a manual refresh.
-            this.term.reset();
-            const clear = () => { this.suppressReports = false; };
-            this.term.write(data, clear);
-            setTimeout(clear, 300);
-          } else {
-            this.term.write(data);
-          }
-        };
-        sock.onclose = () => {
-          if (myGen !== this.generation) return;  // superseded socket: stay closed
-          refreshSlots();
-          this.failures++;
-          if (this.failures >= MAX_FAILURES) {
-            // Give up: stop auto-retrying until reload or an explicit
-            // user action (reset / read-only toggle) revives the session.
-            if (this.isActive()) setStatus("connection lost — reload", "down");
-            return;
-          }
-          if (this.isActive()) setStatus("reconnecting…", "wait");
-          this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
-          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
-        };
-        sock.onerror = () => { try { sock.close(); } catch (_) {} };
+        if (this.epoch !== null) { msg.epoch = this.epoch; msg.offset = this.offset; }
+        Conn.sendJson(msg);
       }
 
-      dropSocket() {
-        this.generation++;               // orphan the current socket's handlers
-        clearTimeout(this.reconnectTimer);
-        if (this.ws) {
-          this.ws.onmessage = null;      // no late frames into this term
-          try { this.ws.close(); } catch (_) {}
-          this.ws = null;
+      onHello(m) {
+        this.awaitingHello = false;
+        this.epoch = m.epoch;
+        this.offset = m.offset;
+        this.expectFirst = true;
+        // resume: the stream continues exactly where we left off — keep the
+        // screen, scroll position and all. replay: different shell or missed
+        // window — redraw from scratch.
+        if (m.mode === "replay") this.term.reset();
+        if (this.isActive()) refreshStatus();
+      }
+
+      onOutput(data) {
+        if (this.awaitingHello) return;  // stale frames from a replaced attachment
+        this.offset += data.length;
+        if (this.expectFirst) {
+          // Replay/delta blob (sent even when empty): suppress terminal
+          // report replies so answers to historical color/status queries are
+          // not injected into the live shell.
+          this.expectFirst = false;
+          this.suppressReports = true;
+          const clear = () => { this.suppressReports = false; };
+          this.term.write(data, clear);
+          setTimeout(clear, 300);
+        } else {
+          this.term.write(data);
         }
       }
 
-      reconnect() { this.failures = 0; this.reconnectDelay = 500; this.dropSocket(); this.connect(); }
+      onClosed(m) {
+        // Shell exited / was reset ("exit") or attach failed ("error").
+        // Either way our resume state is for a dead stream.
+        this.dead = true;
+        this.epoch = null;
+        this.offset = 0;
+        refreshSlots();
+        if (!this.isActive()) return;   // background: re-opened on activation
+        // Respawn the visible slot on a small delay so a crash-looping or
+        // unspawnable shell cannot hot-loop open/closed cycles.
+        clearTimeout(this.reopenTimer);
+        this.reopenTimer = setTimeout(() => {
+          if (this.isActive() && this.dead && Conn.isOpen()) this.sendOpen();
+        }, m.reason === "error" ? 2000 : 500);
+      }
     }
 
     // Build slot buttons.
@@ -652,7 +733,12 @@
       markActive();
       roEl.checked = s.readOnly;
 
-      if (!s.opened) s.connect();
+      if (!s.opened) {
+        s.opened = true;
+        if (Conn.isOpen()) s.sendOpen();
+      } else if (s.dead && Conn.isOpen()) {
+        s.sendOpen();
+      }
       // Pane is now visible: fit it to the viewport, then focus. Fitting
       // alone is not enough — if cols/rows come out unchanged, resize() is a
       // no-op and a renderer that went stale while the pane was hidden stays
@@ -670,8 +756,9 @@
       if (!s) return;
       s.readOnly = roEl.checked;
       s.term.options.disableStdin = s.readOnly;
-      s.term.reset();
-      s.reconnect();     // re-attach in the new mode
+      // Server-side enforcement flips instantly; no reconnect, no replay.
+      Conn.sendJson({ type: "mode", term: s.index, ro: s.readOnly });
+      refreshStatus();
     });
 
     // ---- share modal ----
@@ -772,8 +859,8 @@
           body,
         });
       } catch (_) { /* ignore */ }
-      s.term.reset();
-      s.reconnect();     // respawns a fresh shell on attach
+      // The server kills the shell; the resulting closed frame drives the
+      // respawn (Session.onClosed). Nothing else to do here.
     });
 
     // ---- keyboard-aware layout: shift panes visually when the soft keyboard
@@ -840,14 +927,10 @@
     // exponential backoff, which can sit at 5s.
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
-      sessions.forEach((s) => {
-        if (!s || !s.opened) return;
-        if (s.failures >= MAX_FAILURES) return;  // given up: only reload/user action revives
-        if (!s.ws || s.ws.readyState === WebSocket.CLOSING || s.ws.readyState === WebSocket.CLOSED) {
-          s.reconnectDelay = 500;
-          s.reconnect();
-        }
-      });
+      if (Conn.failures >= MAX_FAILURES) { refreshSlots(); return; }  // given up: reload only
+      if (!Conn.ws || Conn.ws.readyState === WebSocket.CLOSING || Conn.ws.readyState === WebSocket.CLOSED) {
+        Conn.reconnect();
+      }
       refreshSlots();
     });
 
@@ -873,6 +956,7 @@
     });
 
     postPrefs();
+    Conn.connect();
     activate(0);
   </script>
 </body>
