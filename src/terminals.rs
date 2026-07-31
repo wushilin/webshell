@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -21,10 +21,27 @@ pub enum PtyCmd {
     Kill,
 }
 
+/// Identity of a shell spawn. A client resuming with a stale epoch (the
+/// shell was reset/respawned meanwhile) gets a full replay, never a delta
+/// spliced across two different shells.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// How an attachment's `replay` bytes relate to what the client already has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttachMode {
+    /// `replay` is exactly the bytes the client is missing; no reset needed.
+    Resume,
+    /// `replay` is the full ring; the client must reset and redraw.
+    Replay,
+}
+
 /// Capped ring buffer of recent shell output, replayed to new clients.
 struct Scrollback {
     buf: VecDeque<u8>,
     cap: usize,
+    /// Total bytes ever pushed since spawn (monotonic, not capped). The
+    /// client mirrors this count; resume = serving the difference.
+    total: u64,
 }
 
 impl Scrollback {
@@ -32,9 +49,11 @@ impl Scrollback {
         Scrollback {
             buf: VecDeque::new(),
             cap,
+            total: 0,
         }
     }
     fn push(&mut self, data: &[u8]) {
+        self.total += data.len() as u64;
         self.buf.extend(data.iter().copied());
         while self.buf.len() > self.cap {
             self.buf.pop_front();
@@ -42,6 +61,26 @@ impl Scrollback {
     }
     fn snapshot(&self) -> Vec<u8> {
         self.buf.iter().copied().collect()
+    }
+
+    /// Cut point for a new attachment. `offset` is the client's stream
+    /// position (None = no resume state / epoch mismatch). Returns
+    /// (mode, base_offset, bytes-to-send): Resume with exactly the missed
+    /// tail when the offset is valid and within the ring, else Replay with
+    /// the full ring. Checked arithmetic: an offset beyond `total` (bogus
+    /// client) can never underflow — it degrades to Replay.
+    fn cut(&self, offset: Option<u64>) -> (AttachMode, u64, Vec<u8>) {
+        if let Some(off) = offset {
+            if let Some(missed) = self.total.checked_sub(off) {
+                if missed <= self.buf.len() as u64 {
+                    let start = self.buf.len() - missed as usize;
+                    let bytes: Vec<u8> = self.buf.iter().skip(start).copied().collect();
+                    return (AttachMode::Resume, off, bytes);
+                }
+            }
+        }
+        let bytes = self.snapshot();
+        (AttachMode::Replay, self.total - bytes.len() as u64, bytes)
     }
 }
 
@@ -59,6 +98,8 @@ struct Terminal {
     /// This is needed because `output_tx` living in this struct keeps the
     /// broadcast channel open, so `Closed` alone never reaches subscribers.
     shutdown_tx: watch::Sender<bool>,
+    /// Identity of this spawn; see NEXT_EPOCH.
+    epoch: u64,
 }
 
 impl Terminal {
@@ -77,6 +118,12 @@ pub struct Attachment {
     pub shutdown_rx: watch::Receiver<bool>,
     /// Recent output to write before streaming live data (resume/replay).
     pub replay: Vec<u8>,
+    /// How an attachment's `replay` bytes relate to what the client already has.
+    pub mode: AttachMode,
+    /// Identity of this shell spawn.
+    pub epoch: u64,
+    /// Stream position where `replay` begins.
+    pub base_offset: u64,
 }
 
 struct UserPool {
@@ -158,6 +205,7 @@ impl Terminals {
         index: usize,
         cols: u16,
         rows: u16,
+        resume: Option<(u64, u64)>,
     ) -> Result<Attachment, String> {
         if index >= self.slots_per_user {
             return Err("slot out of range".into());
@@ -189,10 +237,16 @@ impl Terminals {
         let term = guard.as_ref().unwrap();
         let _ = term.input_tx.send(PtyCmd::Resize { cols, rows });
 
-        // Take a scrollback snapshot and subscribe under the same lock the
-        // reader thread uses, so there is no gap/overlap at the cut point.
+        // Resume only against the same shell instance; a stale epoch means
+        // the client's offset counts a different shell's stream.
+        let client_offset = match resume {
+            Some((e, off)) if e == term.epoch => Some(off),
+            _ => None,
+        };
+        // Cut + subscribe under the same lock the reader thread uses, so
+        // there is no gap/overlap at the cut point.
         let sb = term.scrollback.lock().unwrap();
-        let replay = sb.snapshot();
+        let (mode, base_offset, replay) = sb.cut(client_offset);
         let output_rx = term.output_tx.subscribe();
         drop(sb);
 
@@ -201,6 +255,9 @@ impl Terminals {
             output_rx,
             shutdown_rx: term.shutdown_tx.subscribe(),
             replay,
+            mode,
+            epoch: term.epoch,
+            base_offset,
         })
     }
 
@@ -208,7 +265,7 @@ impl Terminals {
     /// slot. Unlike `attach`, this never spawns a shell and never resizes the
     /// owner's PTY, so a viewer cannot affect the session. Errors if the slot
     /// is not currently running.
-    pub fn attach_view(&self, user: &str, index: usize) -> Result<Attachment, String> {
+    pub fn attach_view(&self, user: &str, index: usize, resume: Option<(u64, u64)>) -> Result<Attachment, String> {
         if index >= self.slots_per_user {
             return Err("slot out of range".into());
         }
@@ -218,8 +275,16 @@ impl Terminals {
             Some(t) if t.alive.load(Ordering::Relaxed) => t,
             _ => return Err("session not running".into()),
         };
+        // Resume only against the same shell instance; a stale epoch means
+        // the client's offset counts a different shell's stream.
+        let client_offset = match resume {
+            Some((e, off)) if e == term.epoch => Some(off),
+            _ => None,
+        };
+        // Cut + subscribe under the same lock the reader thread uses, so
+        // there is no gap/overlap at the cut point.
         let sb = term.scrollback.lock().unwrap();
-        let replay = sb.snapshot();
+        let (mode, base_offset, replay) = sb.cut(client_offset);
         let output_rx = term.output_tx.subscribe();
         drop(sb);
         Ok(Attachment {
@@ -227,6 +292,9 @@ impl Terminals {
             output_rx,
             shutdown_rx: term.shutdown_tx.subscribe(),
             replay,
+            mode,
+            epoch: term.epoch,
+            base_offset,
         })
     }
 
@@ -382,5 +450,84 @@ fn spawn_terminal(
         alive,
         size,
         shutdown_tx,
+        epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_open_is_full_replay() {
+        let mut s = Scrollback::new(10);
+        s.push(b"hello");
+        let (mode, base, bytes) = s.cut(None);
+        assert_eq!(mode, AttachMode::Replay);
+        assert_eq!(base, 0);
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn resume_within_window_returns_missed_tail() {
+        let mut s = Scrollback::new(10);
+        s.push(b"hello"); // client saw these 5 bytes
+        s.push(b"world"); // client missed these 5
+        let (mode, base, bytes) = s.cut(Some(5));
+        assert_eq!(mode, AttachMode::Resume);
+        assert_eq!(base, 5);
+        assert_eq!(bytes, b"world");
+    }
+
+    #[test]
+    fn resume_up_to_date_returns_empty_delta() {
+        let mut s = Scrollback::new(10);
+        s.push(b"hello");
+        let (mode, base, bytes) = s.cut(Some(5));
+        assert_eq!(mode, AttachMode::Resume);
+        assert_eq!(base, 5);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn missing_more_than_the_ring_replays() {
+        let mut s = Scrollback::new(4);
+        s.push(b"hello"); // total 5, ring holds "ello"
+        let (mode, base, bytes) = s.cut(Some(0)); // missed 5 > ring 4
+        assert_eq!(mode, AttachMode::Replay);
+        assert_eq!(base, 1);
+        assert_eq!(bytes, b"ello");
+    }
+
+    #[test]
+    fn exact_window_fit_resumes() {
+        let mut s = Scrollback::new(4);
+        s.push(b"hello"); // total 5, ring "ello"
+        let (mode, base, bytes) = s.cut(Some(1)); // missed 4 == ring len
+        assert_eq!(mode, AttachMode::Resume);
+        assert_eq!(base, 1);
+        assert_eq!(bytes, b"ello");
+    }
+
+    #[test]
+    fn bogus_future_offset_replays() {
+        let mut s = Scrollback::new(10);
+        s.push(b"hello");
+        let (mode, base, bytes) = s.cut(Some(99)); // offset > total: bogus client
+        assert_eq!(mode, AttachMode::Replay);
+        assert_eq!(base, 0);
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn total_keeps_counting_past_the_cap() {
+        let mut s = Scrollback::new(4);
+        s.push(b"aaaa");
+        s.push(b"bbbb");
+        s.push(b"cc");
+        let (mode, base, bytes) = s.cut(None);
+        assert_eq!(mode, AttachMode::Replay);
+        assert_eq!(base, 6);              // total 10 − ring 4
+        assert_eq!(bytes, b"bbcc");
+    }
 }

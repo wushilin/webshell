@@ -691,7 +691,7 @@ async fn access_ws(
         .shares
         .remaining_secs(&q.token)
         .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
-    match state.terminals.attach_view(&user, index) {
+    match state.terminals.attach_view(&user, index, None) {
         Ok(attachment) => {
             tracing::info!("access ws: attached (viewer) user={user:?} term={index}");
             ws.on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline))
@@ -748,7 +748,7 @@ async fn ws_handler(
 
     let attachment = match state
         .terminals
-        .attach(&session.username, q.term, cols, rows)
+        .attach(&session.username, q.term, cols, rows, None)
     {
         Ok(a) => {
             tracing::info!("ws: attached user={:?} term={}", session.username, q.term);

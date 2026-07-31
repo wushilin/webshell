@@ -27,6 +27,7 @@ pub async fn bridge(
         mut output_rx,
         mut shutdown_rx,
         replay,
+        ..
     } = attachment;
 
     let (mut sink, mut stream) = socket.split();
