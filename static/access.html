@@ -122,6 +122,11 @@
     let remaining = null;
     const MAX_TIMEOUT = 2147483000;
 
+    // Resume checkpoint: epoch identifies the shell instance, offset counts
+    // stream bytes received. Passed on reconnect for a delta instead of a
+    // full replay.
+    let epoch = null, offset = 0;
+
     function fmtRemaining(s) {
       if (s == null) return "";
       if (s >= 86400) { const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600); return `expires in ${d}d ${h}h`; }
@@ -154,7 +159,9 @@
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      return `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;
+      let u = `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;
+      if (epoch !== null) u += `&epoch=${epoch}&offset=${offset}`;
+      return u;
     }
     function connect() {
       if (expired) return;
@@ -163,12 +170,23 @@
       setStatus("connecting…", "wait");
       const sock = new WebSocket(wsUrl());
       ws = sock; sock.binaryType = "arraybuffer";
-      let firstFrame = true;
       sock.onopen = () => { if (myGen !== generation) return; delay = 500; setStatus("watching (read-only)"); checkMeta(); };
       sock.onmessage = (ev) => {
         if (myGen !== generation) return;
-        const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
-        if (firstFrame) { firstFrame = false; term.reset(); }
+        if (typeof ev.data === "string") {
+          let m;
+          try { m = JSON.parse(ev.data); } catch (_) { return; }
+          if (m.type === "hello") {
+            epoch = m.epoch;
+            offset = m.offset;
+            // replay: different shell or missed window — redraw from scratch.
+            // resume: stream continues seamlessly; keep the screen.
+            if (m.mode === "replay") term.reset();
+          }
+          return;
+        }
+        const data = new Uint8Array(ev.data);
+        offset += data.length;
         term.write(data);
       };
       sock.onclose = async () => {
