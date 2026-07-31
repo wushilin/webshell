@@ -190,6 +190,7 @@
   <script>
     const CSRF = "{{CSRF}}";
     const SLOTS = parseInt("{{SLOTS}}", 10) || 1;
+    const MAX_FAILURES = 30;  // consecutive failed connects before giving up
 
     // Display preferences (font size/family), persisted in localStorage.
     const TermPrefs = (function () {
@@ -264,7 +265,7 @@
     function refreshStatus() {
       const s = sessions[active];
       if (!s || !s.ws) { setStatus("connecting…", "wait"); return; }
-      if (s.failures >= 30) { setStatus("connection lost — reload", "down"); return; }
+      if (s.failures >= MAX_FAILURES) { setStatus("connection lost — reload", "down"); return; }
       switch (s.ws.readyState) {
         case WebSocket.OPEN: setStatus(s.readOnly ? "read-only" : "connected"); break;
         case WebSocket.CONNECTING: setStatus("connecting…", "wait"); break;
@@ -299,7 +300,7 @@
         this.generation = 0;
         this.reconnectDelay = 500;
         this.reconnectTimer = null;
-        // Consecutive failed connection cycles; 30 = give up (red status).
+        // Consecutive failed connection cycles; MAX_FAILURES = give up (red status).
         this.failures = 0;
         // Suppress xterm report replies while the replay frame is parsed.
         this.suppressReports = false;
@@ -339,6 +340,8 @@
 
         this.term.onData((d) => this.input(d));
         this.term.onResize(() => this.sendResize());
+        // Keep the keyboard shift-clamp honest as the cursor row changes.
+        this.term.onCursorMove(() => { if (this.isActive()) scheduleLayout(); });
 
         // Touch scrollback: one-finger drag drives xterm's own scrollable
         // viewport by raw pixel deltas — content tracks the finger 1:1 —
@@ -375,8 +378,11 @@
           this.touchV = 0.8 * (dy / dt) + 0.2 * this.touchV;
           e.preventDefault();
         }, { passive: false, capture: true });
-        this.pane.addEventListener("touchend", () => {
-          if (this.touchY !== null && Math.abs(this.touchV) > 0.05) this.fling();
+        this.pane.addEventListener("touchend", (e) => {
+          // Age-check the last move: drag-hold-lift must not fling on stale
+          // velocity — only a genuine flick (recent movement) does.
+          if (this.touchY !== null && Math.abs(this.touchV) > 0.05 &&
+              e.timeStamp - this.touchT < 100) this.fling();
           this.touchY = null;
         }, { passive: true, capture: true });
         this.pane.addEventListener("touchcancel", () => {
@@ -479,7 +485,7 @@
           if (myGen !== this.generation) return;  // superseded socket: stay closed
           refreshSlots();
           this.failures++;
-          if (this.failures >= 30) {
+          if (this.failures >= MAX_FAILURES) {
             // Give up: stop auto-retrying until reload or an explicit
             // user action (reset / read-only toggle) revives the session.
             if (this.isActive()) setStatus("connection lost — reload", "down");
@@ -502,7 +508,7 @@
         }
       }
 
-      reconnect() { this.failures = 0; this.dropSocket(); this.connect(); }
+      reconnect() { this.failures = 0; this.reconnectDelay = 500; this.dropSocket(); this.connect(); }
     }
 
     // Build slot buttons.
@@ -774,7 +780,16 @@
       // stays visible above the key bar. No fit, no cols/rows change, no
       // PTY-resize round-trip on keyboard open/close — the top rows just
       // slide behind the top bar until the keyboard goes away.
-      panesEl.style.transform = occluded ? "translateY(-" + occluded + "px)" : "";
+      // Clamp the shift so the cursor row never slides behind the top bar —
+      // on a fresh/cleared screen the prompt is in the TOP rows and a full
+      // shift would hide exactly what the user is typing into.
+      let shift = occluded;
+      const a = sessions[active];
+      if (a && occluded) {
+        const rowH = a.pane.clientHeight / a.term.rows;
+        shift = Math.min(occluded, Math.max(0, Math.floor(a.term.buffer.active.cursorY * rowH)));
+      }
+      panesEl.style.transform = shift ? "translateY(-" + shift + "px)" : "";
       // Refit only when the layout viewport really changed (orientation,
       // desktop window resize). The soft keyboard never alters
       // innerWidth/Height on iOS or modern Android, so it can't refit.
@@ -800,12 +815,12 @@
 
     // Coming back to the foreground (mobile backgrounds kill sockets):
     // reconnect dead sessions immediately instead of waiting out the
-    // exponential backoff, which can sit at 10s.
+    // exponential backoff, which can sit at 5s.
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
       sessions.forEach((s) => {
         if (!s || !s.opened) return;
-        if (s.failures >= 30) return;  // given up: only reload/user action revives
+        if (s.failures >= MAX_FAILURES) return;  // given up: only reload/user action revives
         if (!s.ws || s.ws.readyState === WebSocket.CLOSING || s.ws.readyState === WebSocket.CLOSED) {
           s.reconnectDelay = 500;
           s.reconnect();
