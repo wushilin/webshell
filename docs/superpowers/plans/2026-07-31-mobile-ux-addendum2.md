@@ -190,10 +190,10 @@ git commit -m "Pixel-smooth touch scrolling with momentum via xterm viewport scr
 
 ---
 
-### Task 3: Trim key bar; harden hidden textarea against autofill
+### Task 3: Trim key bar; autofill hardening; status ball; bounded reconnect
 
 **Files:**
-- Modify: `static/terminal.html` (KEYS array ~line 500; `Session` constructor right after `this.term.open(this.pane);`)
+- Modify: `static/terminal.html` (KEYS array ~line 500; `Session` constructor right after `this.term.open(this.pane);`; `#status` CSS; `setStatus`/`refreshStatus`; `Session` reconnect fields, `connect()`'s `onopen`/`onclose`, `reconnect()`; visibilitychange handler)
 
 - [ ] **Step 1: Remove `|` and `-` from KEYS**
 
@@ -226,13 +226,104 @@ Insert immediately after `this.term.open(this.pane);`:
         }
 ```
 
-- [ ] **Step 3: Syntax check** — expected `SYNTAX-OK`.
+- [ ] **Step 3: Status ball on narrow screens**
 
-- [ ] **Step 4: Commit**
+Add inside the existing `@media (max-width: 640px)` CSS block:
+
+```css
+      #status { min-width: 0; font-size: 0; }
+      #status::before {
+        content: ""; display: inline-block; width: 10px; height: 10px;
+        border-radius: 50%; background: #7ecb7e; vertical-align: middle;
+      }
+      #status.wait::before { background: #e0b34c; animation: statusblink 1s infinite; }
+      #status.down::before { background: #ff6b6b; }
+```
+
+Add after that media block (top level):
+
+```css
+    @keyframes statusblink { 50% { opacity: .25; } }
+```
+
+In `setStatus`, also mirror the text into a tooltip — the function becomes:
+
+```js
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.title = text;
+      statusEl.className = cls || "";
+    }
+```
+
+- [ ] **Step 4: Bounded reconnect with give-up state**
+
+In the `Session` constructor, right after `this.reconnectTimer = null;`, add:
+
+```js
+        // Consecutive failed connection cycles; 30 = give up (red status).
+        this.failures = 0;
+```
+
+In `connect()`'s `sock.onopen`, after `this.reconnectDelay = 500;`, add:
+
+```js
+          this.failures = 0;
+```
+
+Replace `sock.onclose` with:
+
+```js
+        sock.onclose = () => {
+          if (myGen !== this.generation) return;  // superseded socket: stay closed
+          refreshSlots();
+          this.failures++;
+          if (this.failures >= 30) {
+            // Give up: stop auto-retrying until reload or an explicit
+            // user action (reset / read-only toggle) revives the session.
+            if (this.isActive()) setStatus("connection lost — reload", "down");
+            return;
+          }
+          if (this.isActive()) setStatus("reconnecting…", "wait");
+          this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
+          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
+        };
+```
+
+Replace `reconnect() { this.dropSocket(); this.connect(); }` with:
+
+```js
+      reconnect() { this.failures = 0; this.dropSocket(); this.connect(); }
+```
+
+In `refreshStatus()`, add a given-up branch — the function becomes:
+
+```js
+    function refreshStatus() {
+      const s = sessions[active];
+      if (!s || !s.ws) { setStatus("connecting…", "wait"); return; }
+      if (s.failures >= 30) { setStatus("connection lost — reload", "down"); return; }
+      switch (s.ws.readyState) {
+        case WebSocket.OPEN: setStatus(s.readOnly ? "read-only" : "connected"); break;
+        case WebSocket.CONNECTING: setStatus("connecting…", "wait"); break;
+        default: setStatus("reconnecting…", "wait");
+      }
+    }
+```
+
+In the `visibilitychange` handler, after `if (!s || !s.opened) return;`, add:
+
+```js
+        if (s.failures >= 30) return;  // given up: only reload/user action revives
+```
+
+- [ ] **Step 5: Syntax check** — expected `SYNTAX-OK`.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add static/terminal.html
-git commit -m "Trim | and - bar keys; harden hidden textarea against mobile autofill"
+git commit -m "Trim bar keys, block mobile autofill, status ball, bounded reconnect"
 ```
 
 ---
