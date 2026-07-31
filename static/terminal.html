@@ -100,6 +100,20 @@
       border-radius: 6px; padding: .25rem .4rem; font: inherit;
     }
     .cog-panel input[type=number] { width: 4rem; }
+    /* Mobile soft-key bar: sits at the bottom of the *visible* viewport,
+       above the soft keyboard when it is open. */
+    #keybar {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+      display: flex; gap: .25rem; padding: .3rem .4rem; box-sizing: border-box;
+      background: #14171d; border-top: 1px solid #23272f;
+    }
+    #keybar[hidden] { display: none; }
+    #keybar button {
+      flex: 1; min-width: 0; height: 34px; border: 1px solid #2c313c; border-radius: 6px;
+      background: #0f1115; color: #cbd0d8; font: .8rem ui-monospace, monospace;
+      touch-action: manipulation; padding: 0;
+    }
+    #keybar button.armed { background: #4c8bf5; color: #fff; border-color: #4c8bf5; }
   </style>
 </head>
 <body>
@@ -120,6 +134,7 @@
     </form>
   </div>
   <div id="panes"></div>
+  <div id="keybar" hidden></div>
 
   <div id="cogPanel" class="cog-panel" hidden>
     <label>Font size <input type="number" id="fontSize" min="8" max="40" step="1" /></label>
@@ -294,12 +309,7 @@
         this.term.loadAddon(this.fit);
         this.term.open(this.pane);
 
-        this.term.onData((d) => {
-          if (this.suppressReports) return;
-          if (!this.readOnly && this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(enc.encode(d));
-          }
-        });
+        this.term.onData((d) => this.input(d));
         this.term.onResize(() => this.sendResize());
       }
 
@@ -308,6 +318,19 @@
       sendResize() {
         if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.readOnly) {
           this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
+        }
+      }
+
+      // Single entry point for keystrokes (typed or key-bar): applies the
+      // one-shot Ctrl modifier, then forwards to the socket.
+      input(d) {
+        if (this.suppressReports) return;
+        if (ctrlArmed) {
+          if (d.length === 1) d = ctrlTransform(d);
+          setCtrl(false); // one-shot; multi-char chunks (paste) pass unmodified
+        }
+        if (!this.readOnly && this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(enc.encode(d));
         }
       }
 
@@ -425,6 +448,47 @@
     cogBtn.addEventListener("click", () => { morePanel.hidden = true; });
     narrow.addEventListener("change", layoutBar);
     layoutBar();
+
+    // ---- mobile key bar (touch devices only) ----
+    const keyBar = document.getElementById("keybar");
+    let ctrlArmed = false;
+    let ctrlBtn = null;
+
+    function setCtrl(on) {
+      ctrlArmed = on;
+      if (ctrlBtn) ctrlBtn.classList.toggle("armed", on);
+    }
+    // Map a keystroke to its control byte: letters and @[\]^_ use code&31,
+    // ? maps to DEL; anything else passes through unchanged.
+    function ctrlTransform(d) {
+      if (d === "?") return "\x7f";
+      const code = d.toUpperCase().charCodeAt(0);
+      if (code >= 64 && code <= 95) return String.fromCharCode(code & 31);
+      return d;
+    }
+    const KEYS = [
+      ["esc", "\x1b"], ["tab", "\t"], ["ctrl", null],
+      ["↑", "\x1b[A"], ["↓", "\x1b[B"], ["←", "\x1b[D"], ["→", "\x1b[C"],
+      ["|", "|"], ["-", "-"],
+    ];
+    KEYS.forEach(([label, seq]) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      // pointerdown + preventDefault: never move focus, so the soft
+      // keyboard stays up while tapping bar keys.
+      b.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        if (seq === null) { setCtrl(!ctrlArmed); return; }
+        const s = sessions[active];
+        if (s) s.input(seq);
+      });
+      if (seq === null) ctrlBtn = b;
+      keyBar.appendChild(b);
+    });
+    if (window.matchMedia("(pointer: coarse)").matches) {
+      keyBar.hidden = false;
+      panesEl.style.bottom = keyBar.offsetHeight + "px";
+    }
 
     function activate(i) {
       active = i;
