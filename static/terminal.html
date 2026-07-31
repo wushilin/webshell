@@ -14,6 +14,7 @@
       padding: .4rem .6rem; background: #14171d;
       font: .8rem system-ui, sans-serif; box-sizing: border-box;
       border-bottom: 1px solid #23272f;
+      position: relative; z-index: 35;
     }
     #bar strong { margin-right: .25rem; }
     #bar .user { color: #9aa0aa; }
@@ -678,29 +679,41 @@
       s.reconnect();     // respawns a fresh shell on attach
     });
 
-    // ---- keyboard-aware layout: size everything to the *visible* viewport.
-    // iOS WebKit does not shrink the layout viewport for the soft keyboard —
-    // it scrolls the page instead. Pin the scroll and derive the occluded
-    // height from visualViewport, so the key bar rides on top of the
-    // keyboard and the terminal fits in what remains. ----
+    // ---- keyboard-aware layout: shift panes visually when the soft keyboard
+    // opens, instead of resizing them. iOS WebKit does not shrink the layout
+    // viewport for the soft keyboard — it scrolls the page instead. Pin the
+    // scroll and derive the occluded height from visualViewport. The key bar
+    // rides on top of the keyboard, and the panes slide up behind the top bar
+    // instead of shrinking. ----
     let layoutQueued = false;
+    let lastW = 0, lastH = 0;
     function layoutViewport() {
       layoutQueued = false;
       const vv = window.visualViewport;
       let occluded = 0;
       if (vv && vv.scale <= 1.01) {
         if (window.scrollY) window.scrollTo(0, 0);
-        // Pinch-zoom also shrinks vv.height/offsetTop; don't mistake that for
-        // keyboard occlusion, or the key bar floats mid-screen and
-        // fitAndResize() fires spurious PTY resizes.
+        // Pinch-zoom also shrinks vv.height/offsetTop; don't mistake that
+        // for keyboard occlusion.
         occluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
       }
       const kb = keyBar.hidden ? 0 : keyBar.offsetHeight;
       keyBar.style.bottom = occluded + "px";
       panesEl.style.top = barEl.offsetHeight + "px";
-      panesEl.style.bottom = (occluded + kb) + "px";
-      const s = sessions[active];
-      if (s) s.fitAndResize();
+      panesEl.style.bottom = kb + "px";
+      // Keyboard = pure visual shift: slide the panes up so the prompt line
+      // stays visible above the key bar. No fit, no cols/rows change, no
+      // PTY-resize round-trip on keyboard open/close — the top rows just
+      // slide behind the top bar until the keyboard goes away.
+      panesEl.style.transform = occluded ? "translateY(-" + occluded + "px)" : "";
+      // Refit only when the layout viewport really changed (orientation,
+      // desktop window resize). The soft keyboard never alters
+      // innerWidth/Height on iOS or modern Android, so it can't refit.
+      if (window.innerWidth !== lastW || window.innerHeight !== lastH) {
+        lastW = window.innerWidth; lastH = window.innerHeight;
+        const s = sessions[active];
+        if (s) s.fitAndResize();
+      }
     }
     function scheduleLayout() {
       if (layoutQueued) return;
