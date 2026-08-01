@@ -44,12 +44,16 @@ struct ClientPrefs {
 /// legitimate user (a success clears it). Failures older than a minute decay.
 struct LoginGuard {
     inner: Mutex<(u32, Instant)>,
+    permit: tokio::sync::Semaphore,
 }
 
 impl LoginGuard {
     fn new() -> Self {
         LoginGuard {
             inner: Mutex::new((0, Instant::now())),
+            // PAM is intentionally serialized. This is a single-user service,
+            // and unbounded spawn_blocking calls are an easy authentication DoS.
+            permit: tokio::sync::Semaphore::new(1),
         }
     }
     fn recent_failures(g: &(u32, Instant)) -> u32 {
@@ -70,6 +74,10 @@ impl LoginGuard {
     }
     fn record_success(&self) {
         *util::lock(&self.inner) = (0, Instant::now());
+    }
+
+    async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.permit.acquire().await.expect("login semaphore closed")
     }
 }
 
@@ -169,6 +177,11 @@ fn validate(path: &std::path::Path) {
 }
 
 async fn run_server(config_path: &std::path::Path) {
+    if let Err(e) = config::ensure_unprivileged() {
+        eprintln!("startup error: {e}");
+        std::process::exit(1);
+    }
+
     let settings = if config_path.exists() {
         match Settings::load(Some(config_path)) {
             Ok(s) => {
@@ -189,13 +202,6 @@ async fn run_server(config_path: &std::path::Path) {
     };
 
     let config = Config::from_settings(settings);
-    if !config.is_root {
-        tracing::warn!(
-            "not running as root: shells spawn as the current user (dev mode). \
-             Run as root for PAM auth + per-user login shells."
-        );
-    }
-
     let sessions = Arc::new(SessionStore::new(config.session_ttl));
     let terminals = Arc::new(Terminals::new(
         config.slots_per_user,
@@ -204,9 +210,12 @@ async fn run_server(config_path: &std::path::Path) {
         config.scrollback_cap,
     ));
     let key = load_signing_key(config.secret_base64.as_deref());
-    // Share tokens are HMAC-signed with the cookie master key, so they survive
-    // restarts as long as the key is stable (a configured secret_base64).
-    let shares = Arc::new(ShareStore::new(key.master().to_vec()));
+    // Derive a distinct share-token key; cookie and capability authentication
+    // must not reuse the same key directly.
+    let shares = Arc::new(ShareStore::new(derive_key(
+        key.master(),
+        b"webshell/share-token/v1",
+    )));
     let bind = config.bind_addr.clone();
 
     let state = AppState {
@@ -220,7 +229,7 @@ async fn run_server(config_path: &std::path::Path) {
     };
 
     // Expire auth sessions (terminal slots are persistent by design). Share
-    // tokens are stateless and self-expiring, so there is nothing to sweep.
+    // grants prune expired entries when listed or resolved.
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -246,6 +255,8 @@ async fn run_server(config_path: &std::path::Path) {
         .route("/webshell/private/api/terminals", get(list_terminals))
         .route("/webshell/private/api/reset", post(reset_terminal))
         .route("/webshell/private/api/share", post(create_share))
+        .route("/webshell/private/api/shares", get(list_shares))
+        .route("/webshell/private/api/share/revoke", post(revoke_share))
         .route("/webshell/private/api/prefs", post(set_prefs))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -289,6 +300,14 @@ fn load_signing_key(secret_base64: Option<&str>) -> Key {
             Key::generate()
         }
     }
+}
+
+fn derive_key(master: &[u8], context: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(master).expect("HMAC accepts any key length");
+    mac.update(context);
+    mac.finalize().into_bytes().to_vec()
 }
 
 // ---- static assets ---------------------------------------------------------
@@ -566,7 +585,9 @@ async fn login_submit(
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
 
-    // Throttle: recent failures add delay before this attempt is processed.
+    // Serialize PAM calls before calculating the delay, so a burst cannot race
+    // past the failure counter and exhaust the blocking pool.
+    let _login_permit = state.login_guard.acquire().await;
     tokio::time::sleep(state.login_guard.delay()).await;
 
     // PAM auth may block; run it off the async runtime.
@@ -619,8 +640,8 @@ async fn logout(
         if !csrf_matches(&session.csrf, &form.csrf) {
             return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
         }
-        // Share links are decoupled from the session: they persist until their
-        // own TTL expires, so we intentionally do not revoke them here.
+        // Share grants remain independent of login sessions and can be revoked
+        // individually through the shares API.
         state.sessions.remove(&id);
     }
     let jar = jar.remove(Cookie::from(COOKIE_NAME));
@@ -632,7 +653,7 @@ async fn terminal_page(
     jar: SignedCookieJar,
     headers: HeaderMap,
 ) -> Response {
-    let Some(session) = authed_session(&state, &jar) else {
+    let Some((_, session)) = current_session(&state, &jar).filter(|(_, s)| s.authenticated) else {
         return Redirect::to("/webshell/login").into_response();
     };
     let nonce = config::random_token(16);
@@ -717,6 +738,7 @@ struct ShareForm {
 #[derive(serde::Serialize)]
 struct ShareResponse {
     url: String,
+    grant_id: String,
     expires_in_secs: u64,
 }
 
@@ -743,7 +765,7 @@ async fn create_share(
         return (StatusCode::BAD_REQUEST, "slot out of range").into_response();
     }
     let ttl_secs = form.ttl_secs.clamp(1, state.config.max_share_secs);
-    let token = state.shares.create(
+    let (token, grant_id) = state.shares.create(
         &session.username,
         form.index,
         std::time::Duration::from_secs(ttl_secs),
@@ -757,9 +779,41 @@ async fn create_share(
     };
     Json(ShareResponse {
         url,
+        grant_id,
         expires_in_secs: ttl_secs,
     })
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct RevokeShareForm {
+    csrf: String,
+    grant_id: String,
+}
+
+async fn list_shares(State(state): State<AppState>, jar: SignedCookieJar) -> Response {
+    let Some(session) = authed_session(&state, &jar) else {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    };
+    Json(state.shares.list(&session.username)).into_response()
+}
+
+async fn revoke_share(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Form(form): Form<RevokeShareForm>,
+) -> Response {
+    let Some(session) = authed_session(&state, &jar) else {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    };
+    if !csrf_matches(&session.csrf, &form.csrf) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    if state.shares.revoke(&session.username, &form.grant_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "share grant not found").into_response()
+    }
 }
 
 #[derive(Deserialize)]
@@ -882,7 +936,7 @@ async fn access_ws(
     ws: WebSocketUpgrade,
 ) -> Response {
     tracing::info!("access ws: upgrade request");
-    let Some((user, index)) = resolve_share(&state, &q.token) else {
+    let Some((user, index, revoked)) = state.shares.lease(&q.token) else {
         tracing::warn!("access ws: rejected — invalid or expired share token");
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
     };
@@ -911,7 +965,7 @@ async fn access_ws(
             // Bound what an unauthenticated share-link holder can make us buffer.
             ws.max_message_size(state.config.ws_message_limit)
                 .max_frame_size(state.config.ws_message_limit)
-                .on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline))
+                .on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline, Some(revoked)))
         }
         Err(e) => {
             tracing::warn!("access ws: attach_view failed user={user:?} term={index}: {e}");
@@ -956,9 +1010,11 @@ async fn ws_handler(
 
     let terminals = state.terminals.clone();
     let user = session.username;
+    let revoked = session.revocation();
+    let deadline = tokio::time::Instant::now() + session.remaining(state.sessions.ttl());
     ws.max_message_size(state.config.ws_message_limit)
         .max_frame_size(state.config.ws_message_limit)
-        .on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user))
+        .on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user, revoked, deadline))
 }
 
 fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {

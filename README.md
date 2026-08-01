@@ -120,9 +120,8 @@ You can even broadcast your live session in 1 to N multicasting.
 - **PAM authentication, single user.** Only the user the process runs as can log
   in, with their real system password (username + password). No app-specific
   accounts to manage.
-- **Genuine login shell.** Running as root, each session is spawned as the
-  authenticated user via `login -f` (real PAM session, correct uid/gid, groups,
-  `$HOME`, utmp). Running unprivileged, it opens the owner's own login shell.
+- **Genuine login shell.** Each session opens the process owner's configured
+  login shell with the correct home directory and identity environment.
 - **Persistent, resumable slots** (default 10). A slot's shell survives
   disconnects; reattaching replays recent scrollback. Switching between opened
   slots is **instant** — each is its own always-connected session, not a repaint.
@@ -153,7 +152,7 @@ You can even broadcast your live session in 1 to N multicasting.
 ```
 browser (xterm.js)  ──TLS──►  reverse proxy  ──►  webshell (axum)
   /webshell/login              (terminates TLS)     PAM auth, CSRF, session
-  /webshell/private/...  ◄── auth-gated ──►         persistent per-user slots
+  /webshell/private/...  ◄── auth-gated ──►         persistent owner-only slots
   /webshell/public/access  ◄── token, read-only ──► each slot = login shell / PTY
 ```
 
@@ -242,9 +241,8 @@ webshell run -c config.yaml
 # then browse to  https://<public_base_url>/webshell/
 ```
 
-For real multi-user shells (each person gets their own login shell as themselves),
-run as **root**; the owner-only single-user model applies when running
-unprivileged.
+Run `webshell` as the unprivileged account that will use it. The service is
+intentionally single-user and refuses to start as root.
 
 ## Security notes
 

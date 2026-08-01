@@ -87,7 +87,7 @@ impl Scrollback {
 
 /// A single live terminal (one running login shell).
 struct Terminal {
-    input_tx: std::sync::mpsc::Sender<PtyCmd>,
+    input_tx: std::sync::mpsc::SyncSender<PtyCmd>,
     output_tx: broadcast::Sender<Vec<u8>>,
     scrollback: Arc<Mutex<Scrollback>>,
     alive: Arc<AtomicBool>,
@@ -107,13 +107,13 @@ impl Terminal {
     /// Kill the shell and notify every attached bridge to disconnect.
     fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.input_tx.send(PtyCmd::Kill);
+        let _ = self.input_tx.try_send(PtyCmd::Kill);
     }
 }
 
 /// What a client needs to bridge a WebSocket to a terminal.
 pub struct Attachment {
-    pub input_tx: std::sync::mpsc::Sender<PtyCmd>,
+    pub input_tx: std::sync::mpsc::SyncSender<PtyCmd>,
     pub output_rx: broadcast::Receiver<Vec<u8>>,
     /// Fires when the terminal dies or is reset; the bridge should disconnect.
     pub shutdown_rx: watch::Receiver<bool>,
@@ -232,7 +232,7 @@ impl Terminals {
         }
 
         let term = guard.as_ref().unwrap();
-        let _ = term.input_tx.send(PtyCmd::Resize { cols, rows });
+        let _ = term.input_tx.try_send(PtyCmd::Resize { cols, rows });
 
         // Resume only against the same shell instance; a stale epoch means
         // the client's offset counts a different shell's stream.
@@ -338,7 +338,9 @@ fn spawn_terminal(
         pixel_height: 0,
     })?;
 
-    // Substitute {user} in the command template.
+    // Resolve the command template. The current configuration contains no
+    // user-controlled fields, but keeping substitution here makes Terminals
+    // independent of how a command template is assembled.
     let resolved: Vec<String> = login_cmd
         .iter()
         .map(|part| part.replace("{user}", user))
@@ -350,18 +352,13 @@ fn spawn_terminal(
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
     cmd.env("TERM", "xterm-256color");
-    // When we spawn the shell directly (non-root), fix up the environment and
-    // cwd to the real owner. The inherited env may come from a root supervisor
-    // (HOME=/root, USER=root) — chdir-ing into /root as the unprivileged owner
-    // fails with EACCES, which is what killed the spawn. `login` (root path)
-    // sets all of this itself, so leave it alone there.
-    let is_login = program.ends_with("login");
-    if !is_login {
-        cmd.env("HOME", owner_home);
-        cmd.env("USER", user);
-        cmd.env("LOGNAME", user);
-        cmd.cwd(owner_home);
-    }
+    // Do not trust the service manager's inherited identity environment. The
+    // process is already running as the owner, and these values come from that
+    // effective user's passwd entry.
+    cmd.env("HOME", owner_home);
+    cmd.env("USER", user);
+    cmd.env("LOGNAME", user);
+    cmd.cwd(owner_home);
 
     let child = pair
         .slave
@@ -378,16 +375,18 @@ fn spawn_terminal(
     // channel permanently retains capacity × chunk_size bytes per terminal
     // once output has flowed. At 8 KiB reads, 2048 slots meant ~16 MiB per
     // slot (128× the default 128 KiB scrollback) sitting resident forever.
-    // 256 caps that at ~2 MiB, and overrunning it is harmless: a lagged
+    // 64 caps that at ~512 KiB, and overrunning it is harmless: a lagged
     // receiver just re-opens and the scrollback ring heals it with a delta
     // or a full replay.
-    let (output_tx, _) = broadcast::channel::<Vec<u8>>(256);
+    let (output_tx, _) = broadcast::channel::<Vec<u8>>(64);
     let scrollback = Arc::new(Mutex::new(Scrollback::new(scrollback_cap)));
     let alive = Arc::new(AtomicBool::new(true));
     let size = Arc::new(Mutex::new((cols, rows)));
     let (shutdown_tx, _) = watch::channel(false);
 
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<PtyCmd>();
+    // Bound queued terminal input. Combined with the 64 KiB WebSocket message
+    // limit, this caps pending input near 8 MiB instead of allowing OOM growth.
+    let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<PtyCmd>(128);
 
     // Reader thread: shell output -> scrollback + live broadcast.
     {
@@ -420,7 +419,9 @@ fn spawn_terminal(
             // channel never closes — leaving a zombie and a blocked thread
             // until something re-attaches to this slot. For a background slot
             // the client deliberately does not re-open, so that could be days.
-            let _ = reap_tx.send(PtyCmd::Kill);
+            // The command thread will also observe the PTY failure while
+            // writing; avoid blocking this reader if the bounded queue is full.
+            let _ = reap_tx.try_send(PtyCmd::Kill);
         });
     }
 

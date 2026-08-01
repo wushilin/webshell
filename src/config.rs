@@ -103,7 +103,7 @@ pub struct Config {
     pub sharing_enabled: bool,
     /// Normalized (no trailing slash) external base URL, if set.
     pub public_base_url: Option<String>,
-    /// Login-shell command: `login -f {user}` as root, else `$SHELL -l`.
+    /// The process owner's login shell, invoked with `-l`.
     pub login_cmd: Vec<String>,
     pub scrollback_cap: usize,
     pub session_ttl: Duration,
@@ -115,22 +115,18 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// Drop the Origin-matches-Host fallback and accept only `allowed_origins`.
     pub strict_origin: bool,
-    /// Cap on a single WebSocket message, in bytes. Replaces tungstenite's
-    /// 64 MiB default so a client cannot make the server buffer megabytes per
-    /// frame — the share-link socket is reachable without a login. Derived
-    /// from `scrollback_cap`, since the replay blob is sent as one message.
+    /// Cap on a single inbound WebSocket message. Replay messages are outbound
+    /// and do not need to widen this attacker-controlled allocation limit.
     pub ws_message_limit: usize,
-    pub is_root: bool,
     pub secret_base64: Option<String>,
 }
 
 impl Config {
     pub fn from_settings(s: Settings) -> Self {
-        let is_root = unsafe { libc::geteuid() } == 0;
         // Resolve identity from the passwd DB, NOT from the environment: when a
-        // root supervisor (e.g. processmaster/systemd) setuids us to the owner,
-        // HOME/USER are still root's, and chdir-ing the shell into $HOME=/root
-        // fails with EACCES.
+        // supervisor starts the service with a stale environment, HOME/USER may
+        // still name another account. The shell must use the effective user's
+        // real passwd entry instead.
         let owner = owner_info();
 
         let public_base_url = s
@@ -155,22 +151,20 @@ impl Config {
                 acc
             });
 
-        let login_cmd = if is_root {
-            // A genuine pre-authenticated login shell as {user}.
-            vec!["/bin/login".into(), "-f".into(), "{user}".into()]
-        } else {
-            // The owner's actual login shell from the passwd DB.
-            vec![owner.shell.clone(), "-l".into()]
-        };
+        let login_cmd = vec![owner.shell.clone(), "-l".into()];
 
         let secret_base64 = env::var("WEBSHELL_SECRET").ok().or(s.secret_base64);
 
         // Bounded like every other sizing knob: this buffer is retained per
         // slot, so an unclamped value is an OOM waiting for a typo.
-        let scrollback_cap = s.scrollback_bytes.clamp(4 * 1024, 16 * 1024 * 1024);
-        // Room for the largest thing we legitimately send (a full replay)
-        // plus slack for a generous paste from the client.
-        let ws_message_limit = scrollback_cap.saturating_add(1024 * 1024);
+        let slots_per_user = s.max_sessions.clamp(1, 64);
+        let requested_scrollback = s.scrollback_bytes.clamp(4 * 1024, 16 * 1024 * 1024);
+        // Bound aggregate retained scrollback, not just each slot independently.
+        // This prevents a valid-looking max/max configuration from reserving
+        // roughly a GiB once all slots have produced output.
+        let aggregate_budget = 256 * 1024 * 1024;
+        let scrollback_cap = requested_scrollback.min(aggregate_budget / slots_per_user);
+        let ws_message_limit = 64 * 1024;
 
         Config {
             bind_addr: s.bind,
@@ -180,7 +174,7 @@ impl Config {
             // Load-bearing for the wire format, not just a sanity bound: the
             // mux protocol tags each frame with a ONE-BYTE slot index
             // (pty::tagged), so this must stay <= 255.
-            slots_per_user: s.max_sessions.clamp(1, 64),
+            slots_per_user,
             max_share_secs: s.max_sharing_duration_secs.max(1),
             sharing_enabled: s.sharing_enabled,
             public_base_url,
@@ -191,7 +185,6 @@ impl Config {
             allowed_origins,
             strict_origin: s.strict_origin,
             ws_message_limit,
-            is_root,
             secret_base64,
         }
     }
@@ -213,6 +206,22 @@ impl Config {
             }
         }
     }
+}
+
+/// Refuse the privileged execution mode before the server creates any state or
+/// starts listening. Webshell is deliberately a single-user service: the only
+/// account that may authenticate is the unprivileged account running it.
+pub fn ensure_unprivileged() -> anyhow::Result<()> {
+    ensure_unprivileged_uid(unsafe { libc::geteuid() })
+}
+
+fn ensure_unprivileged_uid(euid: libc::uid_t) -> anyhow::Result<()> {
+    if euid == 0 {
+        anyhow::bail!(
+            "refusing to run as root; run webshell as the unprivileged account that will use it"
+        );
+    }
+    Ok(())
 }
 
 /// Identity of the user running this process (euid), resolved from the passwd
@@ -288,6 +297,12 @@ pub fn random_token(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_execution_is_rejected() {
+        assert!(ensure_unprivileged_uid(0).is_err());
+        assert!(ensure_unprivileged_uid(1000).is_ok());
+    }
 
     #[test]
     fn normalize_strips_path_and_trailing_slash() {

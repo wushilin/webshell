@@ -28,7 +28,7 @@ enum MuxControl {
 
 /// One attached slot on a mux connection.
 struct Channel {
-    input_tx: std::sync::mpsc::Sender<PtyCmd>,
+    input_tx: std::sync::mpsc::SyncSender<PtyCmd>,
     read_only: bool,
     forward: tokio::task::JoinHandle<()>,
 }
@@ -123,7 +123,13 @@ fn spawn_forward(
 /// Multiplexed bridge: one WebSocket carrying every opened slot for `user`.
 /// Binary frames route by their slot-index prefix; JSON text frames carry
 /// control. Attachments drop when the connection dies; shells keep running.
-pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: String) {
+pub async fn mux_bridge(
+    socket: WebSocket,
+    terminals: Arc<Terminals>,
+    user: String,
+    mut revoked: tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(512);
 
@@ -138,7 +144,18 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
 
     let mut channels: HashMap<usize, Channel> = HashMap::new();
 
-    while let Some(msg) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            changed = revoked.changed() => {
+                if changed.is_err() || *revoked.borrow() { break; }
+                continue;
+            }
+            msg = stream.next() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
         match msg {
             Ok(Message::Binary(b)) => {
                 if b.is_empty() {
@@ -147,7 +164,10 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
                 let term = b[0] as usize;
                 if let Some(ch) = channels.get(&term) {
                     if !ch.read_only {
-                        let _ = ch.input_tx.send(PtyCmd::Input(b[1..].to_vec()));
+                        if ch.input_tx.try_send(PtyCmd::Input(b[1..].to_vec())).is_err() {
+                            tracing::warn!("mux: closing overloaded connection; terminal input queue is full");
+                            break;
+                        }
                     }
                 }
             }
@@ -182,6 +202,7 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
                             let terminals = terminals.clone();
                             let user = user.clone();
                             tokio::task::spawn_blocking(move || {
+                                let (cols, rows) = valid_size(cols, rows);
                                 terminals.attach(&user, term, cols, rows, resume)
                             })
                             .await
@@ -250,7 +271,8 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
                     MuxControl::Resize { term, cols, rows } => {
                         if let Some(ch) = channels.get(&term) {
                             if !ch.read_only {
-                                let _ = ch.input_tx.send(PtyCmd::Resize { cols, rows });
+                                let (cols, rows) = valid_size(cols, rows);
+                                let _ = ch.input_tx.try_send(PtyCmd::Resize { cols, rows });
                             }
                         }
                     }
@@ -285,6 +307,10 @@ enum ClientControl {
     Resize { cols: u16, rows: u16 },
 }
 
+fn valid_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(2, 500), rows.clamp(2, 300))
+}
+
 /// Bridge a WebSocket to ONE attached terminal (share viewers). Sends a
 /// hello text frame, then the replay/delta as the first binary frame (even
 /// if empty — this keeps the frame sequence uniform: hello, replay, live),
@@ -297,6 +323,7 @@ pub async fn bridge(
     attachment: Attachment,
     read_only: bool,
     deadline: Option<tokio::time::Instant>,
+    revoked: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
     let hello = hello_json(None, &attachment);
     let Attachment {
@@ -325,10 +352,27 @@ pub async fn bridge(
     };
     tokio::pin!(expiry);
 
+    let revocation = async move {
+        match revoked {
+            Some(mut rx) => {
+                if *rx.borrow() {
+                    return;
+                }
+                let _ = rx.changed().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(revocation);
+
     loop {
         tokio::select! {
             // Share token expired mid-session: disconnect the viewer.
             _ = &mut expiry => {
+                let _ = sink.send(Message::Close(None)).await;
+                break;
+            },
+            _ = &mut revocation => {
                 let _ = sink.send(Message::Close(None)).await;
                 break;
             },
@@ -360,7 +404,7 @@ pub async fn bridge(
             msg = stream.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if !read_only {
-                        let _ = input_tx.send(PtyCmd::Input(b));
+                        let _ = input_tx.try_send(PtyCmd::Input(b));
                     }
                 }
                 Some(Ok(Message::Text(t))) => {
@@ -368,7 +412,8 @@ pub async fn bridge(
                         if let Ok(ClientControl::Resize { cols, rows }) =
                             serde_json::from_str(&t)
                         {
-                            let _ = input_tx.send(PtyCmd::Resize { cols, rows });
+                            let (cols, rows) = valid_size(cols, rows);
+                            let _ = input_tx.try_send(PtyCmd::Resize { cols, rows });
                         }
                     }
                 }
