@@ -40,6 +40,8 @@
       border-radius: 6px; padding: .25rem .6rem; cursor: pointer; font: inherit;
     }
     button.action:hover { border-color: #4c8bf5; }
+    button.action.danger { color: #e58f8f; }
+    button.action.danger:hover { border-color: #ff6b6b; color: #ff6b6b; }
     #status { min-width: 6.5rem; text-align: right; color: #7ecb7e; }
     #status.down { color: #ff6b6b; }
     #status.wait { color: #e0b34c; }
@@ -136,6 +138,7 @@
     <label class="ro" id="roLabel"><input type="checkbox" id="ro" /> read-only</label>
     <button class="action" id="share" title="Create a read-only share link for this slot">share</button>
     <button class="action" id="reset" title="Kill and restart the selected slot">reset</button>
+    <button class="action danger" id="del" title="Close the selected slot's shell (no restart)">delete</button>
     <span class="grow" id="grow"></span>
     <span id="status">connecting…</span>
     <button class="action" id="more" title="Menu">⋯</button>
@@ -298,6 +301,14 @@
       } catch (_) { /* ignore */ }
     }
 
+    // Coalesced refresh: a reconnect re-opens every slot at once, so the
+    // per-slot hellos would otherwise fire one fetch each.
+    let slotsRefreshTimer = null;
+    function scheduleSlotsRefresh() {
+      clearTimeout(slotsRefreshTimer);
+      slotsRefreshTimer = setTimeout(refreshSlots, 50);
+    }
+
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       return `${proto}//${location.host}/webshell/private/ws?csrf=${encodeURIComponent(CSRF)}`;
@@ -409,6 +420,7 @@
         this.awaitingHello = false; // open sent; drop data frames until the hello
         this.expectFirst = false; // next data frame is the replay/delta blob
         this.reopenTimer = null;
+        this.closing = false;     // user asked to delete: no respawn on close
         // Suppress xterm report replies while the replay frame is parsed.
         this.suppressReports = false;
 
@@ -585,6 +597,9 @@
         // window — redraw from scratch.
         if (m.mode === "replay") this.term.reset();
         if (this.isActive()) refreshStatus();
+        // The slot is live as of this hello — paint it green now instead of
+        // waiting out the 5s poll.
+        scheduleSlotsRefresh();
       }
 
       onOutput(data) {
@@ -604,7 +619,29 @@
         }
       }
 
+      // Tear the slot down after a user-requested delete: drop the resume
+      // state so the next visit starts a clean shell, and clear `opened` so
+      // neither the reconnect loop nor activate() revives it behind the
+      // user's back. Idempotent — the closed frame and the POST reply race,
+      // and whichever lands second must not repeat the notice.
+      markClosed() {
+        clearTimeout(this.reopenTimer);
+        this.closing = false;
+        this.awaitingHello = false;
+        this.dead = true;
+        this.epoch = null;
+        this.offset = 0;
+        if (!this.opened) return;
+        this.opened = false;
+        this.term.reset();
+        this.term.write("\x1b[90m[terminal " + (this.index + 1) +
+          " closed — select this slot to start a new shell]\x1b[0m\r\n");
+        scheduleSlotsRefresh();
+      }
+
       onClosed(m) {
+        // Deleted on purpose: stay closed instead of respawning.
+        if (this.closing) { this.markClosed(); return; }
         // Shell exited / was reset ("exit") or attach failed ("error").
         // Keep epoch/offset: the next open carries them so the server can
         // decide delta vs. full replay via its epoch check. If the shell
@@ -644,16 +681,17 @@
     const roLabel = document.getElementById("roLabel");
     const shareBtn = document.getElementById("share");
     const resetBtn = document.getElementById("reset");
+    const delBtn = document.getElementById("del");
     const cogBtn = document.getElementById("cog");
     const logoutForm = document.getElementById("logoutForm");
     const narrow = window.matchMedia("(max-width: 640px)");
 
     function layoutBar() {
       if (narrow.matches) {
-        [roLabel, shareBtn, resetBtn, cogBtn, logoutForm].forEach((el) => morePanel.appendChild(el));
+        [roLabel, shareBtn, resetBtn, delBtn, cogBtn, logoutForm].forEach((el) => morePanel.appendChild(el));
       } else {
         morePanel.hidden = true;
-        [roLabel, shareBtn, resetBtn].forEach((el) => barEl.insertBefore(el, growEl));
+        [roLabel, shareBtn, resetBtn, delBtn].forEach((el) => barEl.insertBefore(el, growEl));
         barEl.appendChild(cogBtn);
         barEl.appendChild(logoutForm);
       }
@@ -871,6 +909,32 @@
       } catch (_) { /* ignore */ }
       // The server kills the shell; the resulting closed frame drives the
       // respawn (Session.onClosed). Nothing else to do here.
+    });
+
+    // Delete: same server call as reset — the slot's shell is killed — but the
+    // client stays closed afterwards instead of respawning.
+    delBtn.addEventListener("click", async () => {
+      morePanel.hidden = true;
+      const i = active;
+      const s = sessions[i];
+      if (!confirm("Close terminal " + (i + 1) + "? Its shell and anything running in it are killed.")) return;
+      if (s) s.closing = true;   // arm before the request: the closed frame can beat the reply
+      const body = new URLSearchParams({ csrf: CSRF, index: String(i) });
+      try {
+        const res = await fetch("/webshell/private/api/reset", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
+        });
+        if (!res.ok) { if (s) s.closing = false; return; }
+      } catch (_) {
+        if (s) s.closing = false;
+        return;
+      }
+      // An unattached slot never sends a closed frame, so tear down here too;
+      // markClosed() is idempotent when the frame already did it.
+      if (s) s.markClosed();
+      scheduleSlotsRefresh();
     });
 
     // ---- keyboard-aware layout: shift panes visually when the soft keyboard

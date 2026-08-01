@@ -683,10 +683,11 @@ async fn access_ws(
     };
     if !origin_allowed(&state, &headers) {
         tracing::warn!(
-            "access ws: rejected — origin not allowed: Origin={:?} Host={:?} allowed_origin={:?}",
+            "access ws: rejected — origin not allowed: Origin={:?} Host={:?} allowed_origins={:?} strict={}",
             header_str(&headers, ORIGIN),
             header_str(&headers, HOST),
-            state.config.allowed_origin
+            state.config.allowed_origins,
+            state.config.strict_origin
         );
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
@@ -738,8 +739,9 @@ async fn ws_handler(
         let origin = header_str(&headers, ORIGIN);
         let host = header_str(&headers, HOST);
         tracing::warn!(
-            "ws: rejected — origin not allowed: Origin={origin:?} Host={host:?} allowed_origin={:?}",
-            state.config.allowed_origin
+            "ws: rejected — origin not allowed: Origin={origin:?} Host={host:?} allowed_origins={:?} strict={}",
+            state.config.allowed_origins,
+            state.config.strict_origin
         );
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
@@ -757,14 +759,25 @@ fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
         .to_string()
 }
 
-/// Reject cross-site WebSocket upgrades: `Origin` must match the configured
-/// allowed origin, or the request `Host`. A missing `Origin` is rejected.
+/// Reject cross-site WebSocket upgrades. A missing `Origin` is rejected.
+///
+/// The default needs no configuration: the page's `Origin` must be the `Host`
+/// it asked for, which holds for every hostname the server is legitimately
+/// reached on, and never for a third-party page (the browser sends *its* origin
+/// with *our* host). `allowed_origins` only widens this, for proxies that
+/// rewrite `Host` and leave nothing to compare against. `strict_origin` drops
+/// the fallback to pin the accepted hostnames — ignored when no origin is
+/// configured, since that would reject every client.
 fn origin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    if let Some(allowed) = &state.config.allowed_origin {
-        return origin == allowed;
+    let allowed = &state.config.allowed_origins;
+    if allowed.iter().any(|a| config::origin_matches(a, origin)) {
+        return true;
+    }
+    if state.config.strict_origin && !allowed.is_empty() {
+        return false;
     }
     let origin_authority = origin.split("://").nth(1);
     let host = headers.get(HOST).and_then(|v| v.to_str().ok());

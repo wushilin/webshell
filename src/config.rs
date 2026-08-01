@@ -26,8 +26,8 @@ pub struct Settings {
     /// Master switch for read-only share links.
     pub sharing_enabled: bool,
     /// Externally-visible base URL, e.g. "https://shell.example.com". Used to
-    /// build absolute share links and (when allowed_origin is unset) to derive
-    /// the accepted WebSocket Origin. A trailing slash is optional.
+    /// build absolute share links, and accepted as a WebSocket Origin. A
+    /// trailing slash is optional.
     pub public_base_url: Option<String>,
     /// Bytes of recent output retained per slot for replay on reattach.
     pub scrollback_bytes: usize,
@@ -35,8 +35,19 @@ pub struct Settings {
     pub session_ttl_secs: u64,
     /// Mark the session cookie `Secure` (serve over HTTPS).
     pub cookie_secure: bool,
-    /// Exact WebSocket Origin to accept; overrides the public_base_url derivation.
+    /// *Extra* WebSocket Origins to accept, beyond the request's own Host and
+    /// public_base_url. Only needed when the browser-facing origin cannot be
+    /// recovered from the request — e.g. a reverse proxy that rewrites Host.
+    pub allowed_origins: Vec<String>,
+    /// Deprecated singular form of `allowed_origins`; still honoured so older
+    /// configs keep loading (deny_unknown_fields would reject them otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_origin: Option<String>,
+    /// Pin the accepted Origins to the configured set: drops the "Origin
+    /// matches the request's Host" fallback. Refuses to serve WebSockets
+    /// through any hostname not listed. Ignored when nothing is configured,
+    /// which would lock out every client.
+    pub strict_origin: bool,
     /// base64 cookie signing key (>=64 bytes). Empty = ephemeral (resets on restart).
     pub secret_base64: Option<String>,
 }
@@ -53,7 +64,9 @@ impl Default for Settings {
             scrollback_bytes: 128 * 1024,
             session_ttl_secs: 8 * 3600,
             cookie_secure: false,
+            allowed_origins: Vec::new(),
             allowed_origin: None,
+            strict_origin: false,
             secret_base64: None,
         }
     }
@@ -95,8 +108,13 @@ pub struct Config {
     pub scrollback_cap: usize,
     pub session_ttl: Duration,
     pub cookie_secure: bool,
-    /// Effective accepted Origin (explicit, or derived from public_base_url).
-    pub allowed_origin: Option<String>,
+    /// Origins accepted on top of the request's own Host: the configured
+    /// extras plus public_base_url. Normalized — no path, no trailing slash —
+    /// and each entry is either a full origin ("https://a.b", scheme must
+    /// match) or a bare authority ("a.b", any scheme).
+    pub allowed_origins: Vec<String>,
+    /// Drop the Origin-matches-Host fallback and accept only `allowed_origins`.
+    pub strict_origin: bool,
     pub is_root: bool,
     pub secret_base64: Option<String>,
 }
@@ -115,10 +133,22 @@ impl Config {
             .as_deref()
             .map(|u| u.trim_end_matches('/').to_string());
 
-        let allowed_origin = s
-            .allowed_origin
-            .clone()
-            .or_else(|| public_base_url.as_deref().map(origin_of));
+        // Additive: the configured extras, the deprecated singular key, and the
+        // public base URL all just widen what the Host fallback already allows.
+        let allowed_origins = s
+            .allowed_origins
+            .iter()
+            .map(String::as_str)
+            .chain(s.allowed_origin.as_deref())
+            .chain(public_base_url.as_deref())
+            .map(normalize_origin)
+            .filter(|o| !o.is_empty())
+            .fold(Vec::new(), |mut acc, o| {
+                if !acc.contains(&o) {
+                    acc.push(o);
+                }
+                acc
+            });
 
         let login_cmd = if is_root {
             // A genuine pre-authenticated login shell as {user}.
@@ -143,7 +173,8 @@ impl Config {
             scrollback_cap: s.scrollback_bytes,
             session_ttl: Duration::from_secs(s.session_ttl_secs.max(60)),
             cookie_secure: s.cookie_secure,
-            allowed_origin,
+            allowed_origins,
+            strict_origin: s.strict_origin,
             is_root,
             secret_base64,
         }
@@ -201,16 +232,34 @@ fn owner_info() -> OwnerInfo {
     }
 }
 
-/// Extract `scheme://authority` from a URL, dropping any path.
-fn origin_of(url: &str) -> String {
+/// Normalize a configured origin down to what an `Origin` header can carry:
+/// drop any path and trailing slash, keeping the scheme only if one was
+/// written. Both `https://shell.example.com/` and a bare `shell.example.com`
+/// are valid entries — see `origin_matches` for how each is compared.
+fn normalize_origin(url: &str) -> String {
+    let url = url.trim();
     match url.find("://") {
         Some(i) => {
             let after = &url[i + 3..];
             let end = after.find('/').unwrap_or(after.len());
             format!("{}://{}", &url[..i], &after[..end])
         }
-        None => url.to_string(),
+        None => {
+            let end = url.find('/').unwrap_or(url.len());
+            url[..end].to_string()
+        }
     }
+}
+
+/// Does a browser-sent `Origin` satisfy one configured entry? A full entry
+/// (`https://a.b`) must match scheme and authority; a bare authority (`a.b`)
+/// matches that host under any scheme, so writing the hostname alone is
+/// enough and works whether the site is reached over http or https.
+pub fn origin_matches(allowed: &str, origin: &str) -> bool {
+    if allowed == origin {
+        return true;
+    }
+    !allowed.contains("://") && origin.split("://").nth(1) == Some(allowed)
 }
 
 pub fn random_token(bytes: usize) -> String {
@@ -218,4 +267,54 @@ pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_path_and_trailing_slash() {
+        assert_eq!(normalize_origin("https://a.b/"), "https://a.b");
+        assert_eq!(normalize_origin(" https://a.b/webshell "), "https://a.b");
+        assert_eq!(normalize_origin("https://a.b:8443"), "https://a.b:8443");
+        assert_eq!(normalize_origin("a.b/webshell"), "a.b");
+        assert_eq!(normalize_origin("a.b:8443"), "a.b:8443");
+    }
+
+    #[test]
+    fn bare_authority_matches_any_scheme() {
+        assert!(origin_matches("a.b", "https://a.b"));
+        assert!(origin_matches("a.b", "http://a.b"));
+        // Ports are part of the authority: they must still agree.
+        assert!(!origin_matches("a.b", "https://a.b:8443"));
+        assert!(!origin_matches("a.b", "https://evil.a.b"));
+    }
+
+    #[test]
+    fn full_origin_pins_the_scheme() {
+        assert!(origin_matches("https://a.b", "https://a.b"));
+        assert!(!origin_matches("https://a.b", "http://a.b"));
+    }
+
+    #[test]
+    fn public_base_url_is_an_allowed_origin() {
+        let cfg = Config::from_settings(Settings {
+            public_base_url: Some("https://shell.example.com/".into()),
+            ..Settings::default()
+        });
+        assert_eq!(cfg.allowed_origins, vec!["https://shell.example.com"]);
+        assert_eq!(cfg.public_base_url.as_deref(), Some("https://shell.example.com"));
+    }
+
+    #[test]
+    fn deprecated_singular_key_still_counts_and_dedupes() {
+        let cfg = Config::from_settings(Settings {
+            public_base_url: Some("https://a.b".into()),
+            allowed_origin: Some("https://a.b/".into()),
+            allowed_origins: vec!["c.d".into(), "".into()],
+            ..Settings::default()
+        });
+        assert_eq!(cfg.allowed_origins, vec!["c.d", "https://a.b"]);
+    }
 }

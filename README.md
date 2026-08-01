@@ -129,20 +129,49 @@ Keys (all optional; `genconfig` writes the defaults):
 | `max_sessions` | `10` | Persistent slots for the user. |
 | `max_sharing_duration_secs` | `2592000` | Cap on a share link's lifetime. |
 | `sharing_enabled` | `true` | Master switch for share links. |
-| `public_base_url` | *(none)* | External base URL — builds absolute share links and derives the accepted WebSocket `Origin`. |
+| `public_base_url` | *(none)* | External base URL — builds absolute share links, and is accepted as a WebSocket `Origin`. |
 | `scrollback_bytes` | `131072` | Replay buffer per slot. |
 | `session_ttl_secs` | `28800` | Login-session lifetime. |
 | `cookie_secure` | `false` | Set `true` when served over HTTPS. |
-| `allowed_origin` | *(derived)* | Exact WebSocket `Origin` to accept. |
+| `allowed_origins` | *(empty)* | **Extra** WebSocket `Origin`s to accept, on top of the request's own `Host`. Rarely needed — see below. |
+| `strict_origin` | `false` | Accept only `allowed_origins` (+ `public_base_url`), refusing any other hostname. |
 | `secret_base64` | *(ephemeral)* | base64 signing key (≥64 bytes). Signs session cookies **and** share tokens; set a stable value so both survive restarts. Ephemeral resets both. |
 
 `WEBSHELL_SECRET` (base64 key) and `WEBSHELL_CONFIG` (config path) may also be set
 via the environment.
 
-Behind a **TLS reverse proxy**, set `public_base_url` (and thus `allowed_origin`)
-to the exact browser-facing origin — e.g. `https://shell.example.com` (include a
-non-default port if any). A mismatch here rejects the WebSocket upgrade and the
-terminal will just say "reconnecting".
+Behind a **TLS reverse proxy**, set `public_base_url` to the browser-facing base
+URL — e.g. `https://shell.example.com` — so share links come out absolute.
+
+### WebSocket `Origin`
+
+Every hostname the server is legitimately reached on is accepted out of the box,
+with nothing configured: the upgrade is allowed when the browser's `Origin`
+matches the `Host` it asked for. That holds for `localhost`, a LAN IP, a tailnet
+name and your public domain alike, while a third-party page still fails (it
+sends *its* origin with *your* host) — which is the whole point of the check.
+
+`allowed_origins` is only for the case where the browser-facing origin cannot be
+recovered from the request — typically a reverse proxy that rewrites `Host` to
+the upstream (`Host: 127.0.0.1:8080`), leaving nothing to compare against. Most
+proxies forward the original `Host` and need none of this. Symptom when you do
+need it: the page loads fine but the terminal sits at "reconnecting", with an
+`origin not allowed` warning in the log naming the `Origin` and `Host` it saw.
+
+Entries may be written with or without a scheme, and any path or trailing slash
+is stripped:
+
+```yaml
+allowed_origins:
+  - shell.example.com          # any scheme, this authority
+  - https://alt.example.com    # this scheme only
+  - https://a.example.com:8443 # non-default ports are part of the authority
+```
+
+Set `strict_origin: true` to turn the list into a pin instead of an addition:
+the `Host` fallback is dropped and only listed origins (plus `public_base_url`)
+are served, so the server refuses to work through an unexpected hostname. It is
+ignored while nothing is configured, which would reject every client.
 
 ## Run
 
