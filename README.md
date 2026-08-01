@@ -12,6 +12,68 @@ See https://github.com/wushilin/tlsproxy_rs
 
 You can proxy /webshell to this service by reverse proxy, or simply using SNI host.example.com to do TLS -> Plaintext to this service. Both OK.
 
+## Stateful: the shell outlives the connection
+
+This is the point of the project, so it is worth being explicit about.
+
+Most browser terminals hand you a **new shell on every page load**. Here a slot
+*is* a long-lived login shell process, and connecting **attaches** to it. Close
+the tab, drop off wifi, switch laptops, come back tomorrow — you reattach to the
+same process, not a replacement for it.
+
+Across a disconnect and reattach you keep:
+
+- **the same process** — same PID, same children, same jobs still running
+- **the working directory**, exported variables, activated virtualenv, `ssh-agent`
+  socket, sudo timestamp — everything a fresh `bash -l` would have thrown away
+- **whatever was running while you were gone.** A build started before the
+  disconnect keeps going with nothing attached; its output is buffered and
+  delivered when you return.
+
+Reattaching is **byte-exact, not a repaint**. Each shell instance has an `epoch`,
+and the client tracks a byte `offset` in that shell's output stream. On reconnect
+it sends both back, and the server replies with *exactly the bytes it missed* —
+or a full replay, but only if it fell outside the retained window. There is no
+screen-scraping, no redraw guesswork, no duplicated output.
+
+**The honest limits:**
+
+- Slots live in the server process. They survive dropped connections and
+  restarts of your *browser* — **not** a restart of `webshell` itself.
+- The replay window is a ring buffer per slot (`scrollback_bytes`, 128 KiB by
+  default). Miss more than that and you get a full replay of what is retained,
+  not the whole history.
+- The slot count is fixed (`max_sessions`, default 10).
+
+### Why this is agent friendly
+
+The same properties that make it pleasant for a human make it genuinely useful
+for an automated agent driving a shell:
+
+- **No re-establishing context.** An agent that reconnects is already in the
+  right directory with the right environment. No re-`cd`, no re-`export`, no
+  re-activating anything — the state it built up is still there.
+- **Long tasks don't need a babysitter.** Start a migration or a build, drop the
+  connection entirely, reattach later and collect the output. Nothing has to stay
+  connected for the work to continue.
+- **Deterministic resume.** The `(epoch, offset)` pair means an agent can know
+  precisely what it missed, and can tell "same shell, here's the delta" from
+  "this is a different shell now" — a distinction you cannot make by looking at
+  a repainted screen.
+- **Parallel workstreams.** Slots are independent shells on one connection: run
+  the build in one, tail logs in another, keep a REPL in a third.
+- **Supervision without interference.** A read-only share link lets a human watch
+  an agent work live, from a URL, with **no** ability to type into the session —
+  read-only is enforced server-side, not in the UI.
+- **Pollable state.** `GET /webshell/private/api/terminals` reports which slots
+  are live, so a supervisor can see what is running without attaching.
+
+The wire protocol is deliberately small — JSON control frames (`open`, `resize`,
+`mode`, `close`) and binary frames tagged with a one-byte slot index — so it is
+straightforward to drive programmatically. Note that authentication is still
+PAM + signed cookie + CSRF: an agent has to log in like anyone else, and there is
+no API-token path today.
+
 ## Screenshots
 
 **Login**

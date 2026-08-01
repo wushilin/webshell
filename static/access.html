@@ -21,6 +21,11 @@
       border-radius: 6px; padding: .1rem .45rem; font-size: .72rem;
     }
     #bar .grow { flex: 1; }
+    /* Which terminal this link points at — without it a viewer holding two
+       links has no way to tell the sessions apart. */
+    #which { color: #cbd0d8; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #which .owner { color: #9aa0aa; }
+    #which:empty { display: none; }
     #deadline { color: #9aa0aa; font-variant-numeric: tabular-nums; }
     #status { text-align: right; color: #7ecb7e; }
     #status.wait { color: #e0b34c; }
@@ -46,6 +51,7 @@
   <div id="bar">
     <strong>webshell</strong>
     <span class="tag">read-only · shared</span>
+    <span id="which"></span>
     <span class="grow"></span>
     <span id="deadline"></span>
     <span id="status">connecting…</span>
@@ -64,6 +70,7 @@
     const token = new URLSearchParams(location.search).get("token") || "";
     const statusEl = document.getElementById("status");
     const deadlineEl = document.getElementById("deadline");
+    const whichEl = document.getElementById("which");
     function setStatus(t, c) { statusEl.textContent = t; statusEl.className = c || ""; }
 
     // No font config here: the viewer mirrors the OWNER's font + grid so its
@@ -91,7 +98,28 @@
       screen.style.transform = "scale(" + Math.max(k, 0.05) + ")";
     }
 
+    // Label this viewer with the slot (and owner) the link points at. The
+    // server derives both from the token, so links minted before the API
+    // carried these fields still get labelled; an older server that omits them
+    // simply leaves the label empty rather than rendering "terminal undefined".
+    let labelled = false;
+    function applyLabel(m) {
+      if (labelled || m.slot == null) return;
+      labelled = true;
+      const n = m.slot + 1;
+      whichEl.textContent = "";
+      if (m.owner) {
+        const o = document.createElement("span");
+        o.className = "owner";
+        o.textContent = m.owner + " · ";
+        whichEl.appendChild(o);
+      }
+      whichEl.appendChild(document.createTextNode("terminal " + n));
+      document.title = `webshell · terminal ${n}${m.owner ? " (" + m.owner + ")" : ""} · read-only`;
+    }
+
     function applyMeta(m) {
+      applyLabel(m);
       let changed = false;
       if (m.font_size && term.options.fontSize !== m.font_size) { term.options.fontSize = m.font_size; changed = true; }
       if (m.font_family && term.options.fontFamily !== m.font_family) { term.options.fontFamily = m.font_family; changed = true; }

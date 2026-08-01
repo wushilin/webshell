@@ -809,14 +809,22 @@ async fn access_status(State(state): State<AppState>, Query(q): Query<AccessQuer
 
 #[derive(serde::Serialize)]
 struct AccessMeta {
+    /// Which slot this link points at, 0-based, so the viewer can say *which*
+    /// terminal it is watching instead of just "shared". It comes out of the
+    /// token itself, so every link minted before this field existed reports it
+    /// too — nothing about the token format changed.
+    slot: usize,
+    /// Owner of the shared slot, for the same reason. Not a disclosure: the
+    /// holder of the link already has read-only sight of that user's shell.
+    owner: String,
     cols: u16,
     rows: u16,
     font_size: u16,
     font_family: String,
 }
 
-/// Metadata a viewer needs to mirror the owner's terminal: the live PTY grid
-/// and the owner's font prefs.
+/// Metadata a viewer needs to mirror the owner's terminal: which slot it is,
+/// the live PTY grid, and the owner's font prefs.
 async fn access_meta(State(state): State<AppState>, Query(q): Query<AccessQuery>) -> Response {
     let Some((user, index)) = resolve_share(&state, &q.token) else {
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
@@ -828,6 +836,8 @@ async fn access_meta(State(state): State<AppState>, Query(q): Query<AccessQuery>
         None => (14, "ui-monospace, SFMono-Regular, Menlo, monospace".to_string()),
     };
     Json(AccessMeta {
+        slot: index,
+        owner: user,
         cols,
         rows,
         font_size,
