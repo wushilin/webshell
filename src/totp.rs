@@ -178,7 +178,10 @@ mod tests {
         let g = ReplayGuard::new();
         assert!(g.accept_at("123456", 1000));
         assert!(!g.accept_at("123456", 1000), "same code, same instant");
-        assert!(!g.accept_at(" 123456 ", 1030), "whitespace is not a new code");
+        assert!(
+            !g.accept_at(" 123456 ", 1030),
+            "whitespace is not a new code"
+        );
         assert!(g.accept_at("654321", 1030), "a different code still works");
     }
 

@@ -411,8 +411,7 @@ fn spawn_terminal(
             let _ = child.wait();
             let err = reader
                 .err()
-                .map(anyhow::Error::from)
-                .or_else(|| writer.err().map(anyhow::Error::from))
+                .or_else(|| writer.err())
                 .unwrap_or_else(|| anyhow::anyhow!("pty handle setup failed"));
             return Err(err);
         }

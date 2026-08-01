@@ -179,7 +179,10 @@ fn configrewrite(path: &std::path::Path) {
         Ok(()) => {
             println!("wrote {}", target.display());
             if target != path {
-                println!("{} is no longer used; delete it once you are happy.", path.display());
+                println!(
+                    "{} is no longer used; delete it once you are happy.",
+                    path.display()
+                );
             }
         }
         Err(e) => {

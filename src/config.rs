@@ -119,11 +119,11 @@ pub enum ConfigChoice {
 /// Decide which config to run from, converting or retiring a legacy file as
 /// needed. For a requested `config.toml` (the default) the cases are:
 ///
-/// * only `config.yaml`  — convert it, and stop so it can be reviewed
-/// * only `config.toml`  — use it
-/// * both                — the TOML wins; the YAML is retired so it cannot
-///                         drift into looking authoritative
-/// * neither             — nothing to serve; the caller reports it
+/// * only `config.yaml` — convert it, and stop so it can be reviewed
+/// * only `config.toml` — use it
+/// * both — the TOML wins; the YAML is retired so it cannot drift into
+///   looking authoritative
+/// * neither — nothing to serve; the caller reports it
 pub fn choose(requested: &Path) -> anyhow::Result<ConfigChoice> {
     let toml_path = if is_legacy(requested) {
         requested.with_extension("toml")
@@ -212,7 +212,10 @@ pub fn migration_hint(path: &Path) -> Option<String> {
         path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
     ));
     let converted = if retired.exists() {
-        format!(" It was converted by an earlier run; the original is {}.", retired.display())
+        format!(
+            " It was converted by an earlier run; the original is {}.",
+            retired.display()
+        )
     } else {
         String::new()
     };
@@ -263,7 +266,10 @@ impl Settings {
                 }
                 // Report the TOML error: that is the format the file should be
                 // in, so its message is the useful one.
-                Err(_) => Err(anyhow::anyhow!("parsing config {}: {toml_err}", p.display())),
+                Err(_) => Err(anyhow::anyhow!(
+                    "parsing config {}: {toml_err}",
+                    p.display()
+                )),
             },
         }
     }
