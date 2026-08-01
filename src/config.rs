@@ -129,6 +129,14 @@ pub struct TerminalSettings {
     pub max_sessions: usize,
     /// Bytes of recent output retained per slot for replay on reattach.
     pub scrollback_bytes: usize,
+    /// Login command override, as an argv array, e.g. ["/usr/bin/fish", "-l"].
+    /// Empty = the owner's passwd login shell, run with "-l".
+    pub login_cmd: Vec<String>,
+    /// Extra environment for every spawned shell, applied after the built-ins
+    /// (TERM, HOME, USER, LOGNAME) so a key here overrides them. Declared
+    /// last: this serializes as the [terminals.envs] sub-table, and TOML
+    /// wants scalar keys before sub-tables.
+    pub envs: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for TerminalSettings {
@@ -136,6 +144,8 @@ impl Default for TerminalSettings {
         TerminalSettings {
             max_sessions: 10,
             scrollback_bytes: 128 * 1024,
+            login_cmd: Vec::new(),
+            envs: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -252,8 +262,11 @@ pub struct Config {
     pub sharing_enabled: bool,
     /// Normalized (no trailing slash) external base URL, if set.
     pub public_base_url: Option<String>,
-    /// The process owner's login shell, invoked with `-l`.
+    /// The spawn command: `[terminals] login_cmd` when set, else the process
+    /// owner's passwd login shell invoked with `-l`.
     pub login_cmd: Vec<String>,
+    /// Extra environment seeded into every spawned shell ([terminals.envs]).
+    pub envs: std::collections::BTreeMap<String, String>,
     pub scrollback_cap: usize,
     pub session_ttl: Duration,
     pub cookie_secure: bool,
@@ -328,7 +341,12 @@ impl Config {
                 acc
             });
 
-        let login_cmd = vec![owner.shell.clone(), "-l".into()];
+        // The configured override wins verbatim; empty means the passwd shell.
+        let login_cmd = if s.terminals.login_cmd.is_empty() {
+            vec![owner.shell.clone(), "-l".into()]
+        } else {
+            s.terminals.login_cmd.clone()
+        };
 
         // Parse once, at load: an unknown method name should be a startup
         // error, not a login page that silently offers nothing.
@@ -386,6 +404,7 @@ impl Config {
             sharing_enabled: s.sharing.enabled,
             public_base_url,
             login_cmd,
+            envs: s.terminals.envs,
             scrollback_cap,
             session_ttl: Duration::from_secs(s.auth.session_ttl_secs.max(60)),
             cookie_secure: s.network.cookie_secure,
@@ -587,6 +606,36 @@ mod tests {
             cfg.public_base_url.as_deref(),
             Some("https://shell.example.com")
         );
+    }
+
+    #[test]
+    fn custom_login_cmd_and_envs_pass_through() {
+        let cfg = Config::from_settings(Settings {
+            terminals: TerminalSettings {
+                login_cmd: vec!["/usr/bin/fish".into(), "-l".into()],
+                envs: [("EDITOR".to_string(), "vim".to_string())].into(),
+                ..TerminalSettings::default()
+            },
+            ..Settings::default()
+        });
+        assert_eq!(cfg.login_cmd, vec!["/usr/bin/fish", "-l"]);
+        assert_eq!(cfg.envs.get("EDITOR").map(String::as_str), Some("vim"));
+    }
+
+    #[test]
+    fn unset_login_cmd_and_envs_keep_the_default_behavior() {
+        let cfg = Config::from_settings(Settings::default());
+        // The default is the runner's passwd shell (unknowable here) + "-l".
+        assert_eq!(cfg.login_cmd.len(), 2);
+        assert_eq!(cfg.login_cmd[1], "-l");
+        assert!(cfg.envs.is_empty());
+    }
+
+    #[test]
+    fn sample_config_documents_login_cmd_and_envs() {
+        let sample = Settings::sample_toml();
+        assert!(sample.contains("login_cmd = []"));
+        assert!(sample.contains("[terminals.envs]"));
     }
 
     #[test]
