@@ -10,6 +10,8 @@ You should put this behind tlsproxy which can manage tls proxying, with automati
 
 See https://github.com/wushilin/tlsproxy_rs
 
+You can proxy /webshell to this service by reverse proxy, or simply using SNI host.example.com to do TLS -> Plaintext to this service. Both OK.
+
 ## Screenshots
 
 **Login**
