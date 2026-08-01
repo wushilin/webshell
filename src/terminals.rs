@@ -99,6 +99,13 @@ struct Terminal {
     /// This is needed because `output_tx` living in this struct keeps the
     /// broadcast channel open, so `Closed` alone never reaches subscribers.
     shutdown_tx: watch::Sender<bool>,
+    /// Signals the child directly, bypassing the input queue. Reset/delete
+    /// exist to recover a *stuck* shell, which is exactly when that queue is
+    /// unusable: the command thread blocks in `write_all` whenever the PTY
+    /// buffer is full and the program is not reading, so a queued `Kill` is
+    /// never reached — and once the bounded queue fills, it is not even
+    /// accepted. Killing the process is what unblocks that write.
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     /// Identity of this spawn; see NEXT_EPOCH.
     epoch: u64,
 }
@@ -107,6 +114,9 @@ impl Terminal {
     /// Kill the shell and notify every attached bridge to disconnect.
     fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
+        let _ = lock(&self.killer).kill();
+        // Best-effort nudge so the command thread unwinds promptly when it is
+        // idle rather than blocked; the kill above is what guarantees death.
         let _ = self.input_tx.try_send(PtyCmd::Kill);
     }
 }
@@ -365,6 +375,9 @@ fn spawn_terminal(
         .spawn_command(cmd)
         .map_err(|e| anyhow::anyhow!("spawn {program:?} (cwd {owner_home}): {e}"))?;
     drop(pair.slave); // so the master sees EOF when the shell exits
+    // Taken before the child moves into the command thread: this is the only
+    // handle `stop()` can use without going through that thread.
+    let killer = child.clone_killer();
 
     let reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
@@ -463,6 +476,7 @@ fn spawn_terminal(
         alive,
         size,
         shutdown_tx,
+        killer: Mutex::new(killer),
         epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
     })
 }

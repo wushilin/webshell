@@ -29,9 +29,23 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Most active grants one user may hold. A grant is small, but nothing else
+/// bounds how many links a logged-in user can mint, and they are only dropped
+/// on expiry — so without a cap the map grows for as long as the process runs.
+/// Hitting the cap is reported to the caller rather than silently evicting a
+/// link someone may already be watching.
+pub const MAX_GRANTS_PER_USER: usize = 32;
+
+/// Longest note we store with a grant. Notes are a memory aid for the owner,
+/// not a document.
+const MAX_NOTE_LEN: usize = 120;
+
 /// Mints, verifies, lists, and revokes HMAC-signed share grants.
 pub struct ShareStore {
     key: Vec<u8>,
+    /// Keyed by grant id so resolving a token is a single hash lookup — the
+    /// token carries its own id, and this is on the path of every viewer
+    /// frame-zero and status poll.
     grants: Mutex<HashMap<String, Grant>>,
 }
 
@@ -41,8 +55,34 @@ pub struct Grant {
     pub username: String,
     pub index: usize,
     pub expires_at: u64,
+    /// Free-text reminder of what the link was for, shown when listing and
+    /// revoking. Owner-only: deliberately *not* part of the signed payload,
+    /// so it never travels to the viewer.
+    pub note: String,
     #[serde(skip_serializing)]
     revoked: tokio::sync::watch::Sender<bool>,
+}
+
+/// Why `create` refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CreateError {
+    /// The owner already holds `MAX_GRANTS_PER_USER` active links.
+    TooMany,
+}
+
+/// Trim a user-supplied note to something safe to store and redisplay:
+/// control characters (including newlines) collapse to spaces, and the result
+/// is bounded. Escaping is the renderer's job — the UI writes it via
+/// `textContent`, never as markup.
+pub fn sanitize_note(note: &str) -> String {
+    let cleaned: String = note
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+        .chars()
+        .take(MAX_NOTE_LEN)
+        .collect()
 }
 
 impl ShareStore {
@@ -60,26 +100,68 @@ impl ShareStore {
         mac.finalize().into_bytes().to_vec()
     }
 
-    /// Mint a token granting read-only access to `username`'s slot `index`,
-    /// valid for `ttl`. The token is `base64url(payload).base64url(hmac)`.
-    pub fn create(&self, username: &str, index: usize, ttl: Duration) -> (String, String) {
-        let exp = now_unix().saturating_add(ttl.as_secs());
-        let id = crate::config::random_token(18);
+    /// Encode a grant as `base64url(payload).base64url(hmac)`. The payload is
+    /// exactly what `verify` parses back out, so a token can be rebuilt from a
+    /// stored grant at any time — nothing has to keep the token itself around.
+    fn encode(&self, id: &str, index: usize, exp: u64, username: &str) -> String {
         let payload = format!("{id}:{index}:{exp}:{username}");
         let sig = self.mac(payload.as_bytes());
-        let token = format!("{}.{}", B64.encode(payload.as_bytes()), B64.encode(sig));
+        format!("{}.{}", B64.encode(payload.as_bytes()), B64.encode(sig))
+    }
+
+    /// Rebuild the token for a grant, so the owner can re-copy a link they
+    /// already made instead of minting a redundant one.
+    pub fn token_for(&self, grant: &Grant) -> String {
+        self.encode(
+            &grant.id,
+            grant.index,
+            grant.expires_at,
+            &grant.username,
+        )
+    }
+
+    /// Mint a token granting read-only access to `username`'s slot `index`,
+    /// valid for `ttl`. `note` is an owner-visible reminder of what it is for.
+    /// Fails once the owner is holding `MAX_GRANTS_PER_USER` live grants.
+    pub fn create(
+        &self,
+        username: &str,
+        index: usize,
+        ttl: Duration,
+        note: &str,
+    ) -> Result<(String, String), CreateError> {
+        let exp = now_unix().saturating_add(ttl.as_secs());
+        let id = crate::config::random_token(18);
+        let token = self.encode(&id, index, exp, username);
         let (revoked, _) = tokio::sync::watch::channel(false);
-        crate::util::lock(&self.grants).insert(
+
+        let mut grants = crate::util::lock(&self.grants);
+        // Reclaim expired entries first: the cap should reflect what is
+        // actually usable, not what has accumulated.
+        let now = now_unix();
+        grants.retain(|_, g| g.expires_at > now);
+        if grants.values().filter(|g| g.username == username).count() >= MAX_GRANTS_PER_USER {
+            return Err(CreateError::TooMany);
+        }
+        grants.insert(
             id.clone(),
             Grant {
                 id: id.clone(),
                 username: username.to_string(),
                 index,
                 expires_at: exp,
+                note: sanitize_note(note),
                 revoked,
             },
         );
-        (token, id)
+        Ok((token, id))
+    }
+
+    /// Drop expired grants. Called on a timer so a user who mints links and
+    /// never opens the manage dialog still gets the memory back.
+    pub fn sweep(&self) {
+        let now = now_unix();
+        crate::util::lock(&self.grants).retain(|_, g| g.expires_at > now);
     }
 
     /// Verify a token's signature and decode its payload (username, slot, expiry
@@ -175,7 +257,7 @@ mod tests {
     #[test]
     fn active_grant_round_trips() {
         let a = store();
-        let (token, _) = a.create("wushilin", 3, Duration::from_secs(3600));
+        let (token, _) = a.create("wushilin", 3, Duration::from_secs(3600), "").unwrap();
         assert_eq!(a.resolve(&token), Some(("wushilin".to_string(), 3)));
         assert!(a.remaining_secs(&token).unwrap() > 3500);
     }
@@ -183,14 +265,14 @@ mod tests {
     #[test]
     fn username_with_colons_is_preserved() {
         let s = store();
-        let (token, _) = s.create("a:b:c", 0, Duration::from_secs(60));
+        let (token, _) = s.create("a:b:c", 0, Duration::from_secs(60), "").unwrap();
         assert_eq!(s.resolve(&token), Some(("a:b:c".to_string(), 0)));
     }
 
     #[test]
     fn expired_token_is_rejected() {
         let s = store();
-        let (token, _) = s.create("u", 0, Duration::from_secs(0));
+        let (token, _) = s.create("u", 0, Duration::from_secs(0), "").unwrap();
         assert_eq!(s.resolve(&token), None);
         assert_eq!(s.remaining_secs(&token), None);
     }
@@ -198,7 +280,7 @@ mod tests {
     #[test]
     fn tampering_and_wrong_key_are_rejected() {
         let s = store();
-        let (token, _) = s.create("u", 2, Duration::from_secs(60));
+        let (token, _) = s.create("u", 2, Duration::from_secs(60), "").unwrap();
         // Flip a character in the payload segment.
         let (p, sig) = token.split_once('.').unwrap();
         let mut bad = p.to_string();
@@ -211,9 +293,60 @@ mod tests {
     }
 
     #[test]
+    fn note_is_sanitized_and_bounded() {
+        assert_eq!(sanitize_note("  demo \n for  bob\t"), "demo for bob");
+        assert_eq!(sanitize_note(&"x".repeat(500)).chars().count(), MAX_NOTE_LEN);
+        let s = store();
+        let (_, id) = s
+            .create("u", 0, Duration::from_secs(60), "line\u{1}one\nline two")
+            .unwrap();
+        let g = s.list("u").into_iter().find(|g| g.id == id).unwrap();
+        assert_eq!(g.note, "line one line two");
+    }
+
+    #[test]
+    fn a_token_can_be_rebuilt_from_its_grant() {
+        let s = store();
+        let (token, id) = s.create("u", 5, Duration::from_secs(60), "").unwrap();
+        let g = s.list("u").into_iter().find(|g| g.id == id).unwrap();
+        // Same token, so the owner can re-copy the link without minting a new one.
+        assert_eq!(s.token_for(&g), token);
+        assert_eq!(s.resolve(&s.token_for(&g)), Some(("u".to_string(), 5)));
+    }
+
+    #[test]
+    fn grants_are_capped_per_user_and_expired_ones_free_room() {
+        let s = store();
+        for _ in 0..MAX_GRANTS_PER_USER {
+            assert!(s.create("u", 0, Duration::from_secs(60), "").is_ok());
+        }
+        assert_eq!(
+            s.create("u", 0, Duration::from_secs(60), "").unwrap_err(),
+            CreateError::TooMany
+        );
+        // Another user is unaffected — the cap is per owner.
+        assert!(s.create("other", 0, Duration::from_secs(60), "").is_ok());
+        // Revoking one makes room again.
+        let victim = s.list("u")[0].id.clone();
+        assert!(s.revoke("u", &victim));
+        assert!(s.create("u", 0, Duration::from_secs(60), "").is_ok());
+    }
+
+    #[test]
+    fn sweep_drops_expired_grants_without_a_listing() {
+        let s = store();
+        s.create("u", 0, Duration::from_secs(0), "gone").unwrap();
+        s.create("u", 1, Duration::from_secs(600), "kept").unwrap();
+        s.sweep();
+        let left = crate::util::lock(&s.grants);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left.values().next().unwrap().note, "kept");
+    }
+
+    #[test]
     fn revoked_and_restarted_grants_are_rejected() {
         let s = store();
-        let (token, id) = s.create("u", 1, Duration::from_secs(60));
+        let (token, id) = s.create("u", 1, Duration::from_secs(60), "").unwrap();
         assert!(s.revoke("u", &id));
         assert_eq!(s.resolve(&token), None);
         assert_eq!(store().resolve(&token), None);

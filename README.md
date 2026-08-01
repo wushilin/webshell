@@ -128,12 +128,16 @@ You can even broadcast your live session in 1 to N multicasting.
 - **Reset / recycle** a slot from the toolbar to kill a stuck shell and start
   fresh; other viewers of that slot follow the reset automatically.
 - **Read-only share links.** Generate a login-free URL for a slot with a chosen
-  validity (1 day / 3 / 7 / 30, or custom seconds). Read-only and expiry are
-  **enforced server-side**; the link stops working exactly at expiry (the viewer
-  pops an "expired" notice), and dies immediately if sharing is disabled. Tokens
-  are **stateless and HMAC-signed** (they carry their own slot + expiry), so they
-  keep working **across server restarts** — provided a stable `secret_base64` is
-  set — with nothing stored server-side.
+  validity (1 day / 3 / 7 / 30, or custom seconds) and an optional note saying
+  what it is for. Read-only and expiry are **enforced server-side**; the link
+  stops working exactly at expiry (the viewer pops an "expired" notice), and
+  dies immediately if sharing is disabled.
+- **Revocable sharing.** Every link you hand out is listed under
+  *share → Manage existing links*, with its note, slot and time left. Revoke one
+  and it stops resolving **and disconnects anyone watching through it right
+  then** — not at their next reload. Links are HMAC-signed capabilities tracked
+  in memory, so they also all die when the server restarts, and one account may
+  hold at most 32 live links.
 - **Faithful viewer.** The read-only view mirrors the owner's terminal grid and
   font and scales to fit — no wrong-wrapping from size mismatches — and shows a
   live "expires in …" countdown.

@@ -115,6 +115,37 @@
       border-radius: 6px; background: #0f1115; color: #e6e6e6;
       font-family: ui-monospace, monospace; font-size: .8rem;
     }
+    #noteRow { margin: .7rem 0 0; }
+    #shareNote {
+      width: 100%; box-sizing: border-box; padding: .4rem .5rem; margin-top: .25rem;
+      border: 1px solid #2c313c; border-radius: 6px; background: #0f1115; color: #e6e6e6;
+      font: inherit;
+    }
+    .modal-link {
+      background: none; border: none; color: #7fa8f5; cursor: pointer;
+      font: inherit; padding: 0; text-decoration: underline;
+    }
+    .modal-foot { margin-top: .8rem; font-size: .78rem; color: #9aa0aa; }
+    /* Manage-links modal: a scrolling list of live grants. */
+    #linksModal .modal { width: min(94vw, 560px); }
+    #linksList { max-height: min(52vh, 380px); overflow-y: auto; margin: .2rem 0 0; }
+    .link-row {
+      display: flex; align-items: center; gap: .6rem; padding: .55rem .1rem;
+      border-top: 1px solid #262b34;
+    }
+    .link-row:first-child { border-top: none; }
+    .link-main { flex: 1 1 auto; min-width: 0; }
+    .link-note {
+      color: #e6e6e6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .link-note.none { color: #7a808a; font-style: italic; }
+    .link-meta { color: #9aa0aa; font-size: .75rem; margin-top: .15rem; }
+    .link-slot {
+      display: inline-block; padding: .05rem .4rem; border-radius: 5px;
+      background: #22304a; color: #cfe0ff; font-size: .72rem; margin-right: .4rem;
+    }
+    .link-row .action { flex: 0 0 auto; padding: .3rem .55rem; }
+    #linksEmpty { color: #9aa0aa; padding: .6rem 0; }
     /* Display-settings popover */
     .cog-panel {
       position: absolute; top: 44px; right: 8px; z-index: 40;
@@ -189,9 +220,16 @@
         <div id="customRow" hidden>
           <label>Seconds: <input type="number" id="customSecs" min="1" max="31536000" placeholder="e.g. 3600" /></label>
         </div>
+        <div id="noteRow">
+          <label for="shareNote">Note (optional)</label>
+          <input id="shareNote" maxlength="120" placeholder="e.g. pairing with Sam on the deploy" />
+        </div>
         <div class="modal-actions">
           <button type="button" class="action primary" id="shareCreate">Create link</button>
           <button type="button" class="action" id="shareCancel">Cancel</button>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="modal-link" id="manageLinks">Manage existing links</button>
         </div>
       </div>
       <div id="shareStep2" hidden>
@@ -201,6 +239,22 @@
           <button type="button" class="action primary" id="shareCopy">Copy link</button>
           <button type="button" class="action" id="shareDone">Done</button>
         </div>
+        <div class="modal-foot">
+          <button type="button" class="modal-link" id="manageLinks2">Manage existing links</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="linksModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h3>Share links</h3>
+      <p class="modal-sub">Every link you have handed out that is still live. Revoking one
+        disconnects anyone watching through it immediately.</p>
+      <div id="linksList"></div>
+      <p id="linksEmpty" hidden>No active share links.</p>
+      <div class="modal-actions">
+        <button type="button" class="action primary" id="linksClose">Done</button>
       </div>
     </div>
   </div>
@@ -951,6 +1005,7 @@
       document.getElementById("shareStep2").hidden = true;
       document.getElementById("customRow").hidden = true;
       document.getElementById("customSecs").value = "";
+      document.getElementById("shareNote").value = "";
       shareSecs = 86400;
       updateTtlSel();
       shareModal.hidden = false;
@@ -997,8 +1052,16 @@
         const res = await fetch("/webshell/private/api/share", {
           method: "POST", credentials: "same-origin",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ csrf: CSRF, index: String(idx), ttl_secs: String(secs) }),
+          body: new URLSearchParams({
+            csrf: CSRF, index: String(idx), ttl_secs: String(secs),
+            note: document.getElementById("shareNote").value,
+          }),
         });
+        if (res.status === 429) {
+          // The server caps how many live links one account may hold.
+          await Dialog.alert("Too many links", await res.text());
+          return;
+        }
         if (!res.ok) {
           await Dialog.alert("Share failed", "The server refused to create the link. Sharing may be disabled, or your session may have expired.");
           return;
@@ -1022,6 +1085,127 @@
       const u = document.getElementById("shareUrl");
       u.focus(); u.select();
       try { await navigator.clipboard.writeText(u.value); } catch (_) { document.execCommand("copy"); }
+    });
+
+    // ---- manage links modal ----
+    const linksModal = document.getElementById("linksModal");
+    const linksList = document.getElementById("linksList");
+    const linksEmpty = document.getElementById("linksEmpty");
+
+    // Coarse but readable: the exact second does not matter for a link that
+    // lives for days, and rounding down never overstates the time left.
+    function humanizeLeft(s) {
+      if (s >= 86400) { const d = Math.floor(s / 86400); return d + " day" + (d > 1 ? "s" : ""); }
+      if (s >= 3600) { const h = Math.floor(s / 3600); return h + " hour" + (h > 1 ? "s" : ""); }
+      if (s >= 60) { const m = Math.floor(s / 60); return m + " minute" + (m > 1 ? "s" : ""); }
+      return "under a minute";
+    }
+
+    async function copyText(text) {
+      try { await navigator.clipboard.writeText(text); return true; }
+      catch (_) { return false; }
+    }
+
+    function renderLinks(entries) {
+      linksList.replaceChildren();
+      linksEmpty.hidden = entries.length > 0;
+      for (const e of entries) {
+        const row = document.createElement("div");
+        row.className = "link-row";
+
+        const main = document.createElement("div");
+        main.className = "link-main";
+        const note = document.createElement("div");
+        note.className = "link-note" + (e.note ? "" : " none");
+        // textContent, never innerHTML: the note is free text the user typed.
+        note.textContent = e.note || "(no note)";
+        note.title = e.note || "";
+        const meta = document.createElement("div");
+        meta.className = "link-meta";
+        const slot = document.createElement("span");
+        slot.className = "link-slot";
+        slot.textContent = "Slot " + (e.index + 1);
+        meta.append(slot, document.createTextNode("expires in " + humanizeLeft(e.expires_in_secs)));
+        main.append(note, meta);
+
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "action";
+        copyBtn.textContent = "copy";
+        copyBtn.title = "Copy this link again";
+        const full = /^https?:\/\//i.test(e.url) ? e.url : location.origin + e.url;
+        copyBtn.addEventListener("click", async () => {
+          const ok = await copyText(full);
+          copyBtn.textContent = ok ? "copied" : "failed";
+          setTimeout(() => { copyBtn.textContent = "copy"; }, 1200);
+        });
+
+        const revokeBtn = document.createElement("button");
+        revokeBtn.type = "button";
+        revokeBtn.className = "action danger";
+        revokeBtn.textContent = "revoke";
+        revokeBtn.addEventListener("click", () => revokeLink(e));
+
+        row.append(main, copyBtn, revokeBtn);
+        linksList.append(row);
+      }
+    }
+
+    async function refreshLinks() {
+      try {
+        const res = await fetch("/webshell/private/api/shares", { credentials: "same-origin" });
+        if (!res.ok) throw new Error("http " + res.status);
+        renderLinks(await res.json());
+      } catch (_) {
+        linksList.replaceChildren();
+        linksEmpty.hidden = false;
+        linksEmpty.textContent = "Could not load your share links.";
+      }
+    }
+
+    async function revokeLink(entry) {
+      // Show the note in the confirmation: by the time you revoke, "which link
+      // was this?" is the whole question.
+      const what = entry.note ? "“" + entry.note + "” — slot " + (entry.index + 1)
+                              : "Slot " + (entry.index + 1) + " (no note)";
+      const ok = await Dialog.confirm({
+        title: "Revoke this share link?",
+        body: what + ". The link stops working immediately and anyone watching "
+              + "through it is disconnected. This cannot be undone.",
+        ok: "Revoke link",
+        destructive: true,
+      });
+      if (!ok) return;
+      try {
+        const res = await fetch("/webshell/private/api/share/revoke", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ csrf: CSRF, grant_id: entry.grant_id }),
+        });
+        if (!res.ok && res.status !== 404) {
+          await Dialog.alert("Revoke failed", "The server refused. Your session may have expired.");
+        }
+      } catch (_) {
+        await Dialog.alert("Revoke failed", "Could not reach the server. Check your connection and try again.");
+      }
+      await refreshLinks();
+    }
+
+    function openLinksModal() {
+      closeShareModal();
+      linksList.replaceChildren();
+      linksEmpty.hidden = true;
+      linksModal.hidden = false;
+      refreshLinks();
+    }
+    function closeLinksModal() { linksModal.hidden = true; }
+
+    document.getElementById("manageLinks").addEventListener("click", openLinksModal);
+    document.getElementById("manageLinks2").addEventListener("click", openLinksModal);
+    document.getElementById("linksClose").addEventListener("click", closeLinksModal);
+    linksModal.addEventListener("click", (e) => { if (e.target === linksModal) closeLinksModal(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !linksModal.hidden) closeLinksModal();
     });
 
     document.getElementById("reset").addEventListener("click", async () => {

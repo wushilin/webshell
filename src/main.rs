@@ -228,13 +228,16 @@ async fn run_server(config_path: &std::path::Path) {
         key,
     };
 
-    // Expire auth sessions (terminal slots are persistent by design). Share
-    // grants prune expired entries when listed or resolved.
+    // Expire auth sessions and share grants (terminal slots are persistent by
+    // design). Grants are also pruned when listed or resolved, but a user can
+    // mint links and never look at them again — this is what bounds the map
+    // over a long-running process.
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
             sessions.sweep();
+            shares.sweep();
         }
     });
 
@@ -293,9 +296,11 @@ fn load_signing_key(secret_base64: Option<&str>) -> Key {
                 .unwrap_or_else(|e| panic!("secret_base64 must decode to >=64 bytes: {e}"))
         }
         None => {
+            // Share links die on restart regardless of the key (grants are
+            // in-memory), so only sessions are worth mentioning here.
             tracing::warn!(
                 "no secret_base64 set; generating ephemeral key \
-                 (login sessions AND share links reset on restart)"
+                 (login sessions reset on restart)"
             );
             Key::generate()
         }
@@ -733,6 +738,10 @@ struct ShareForm {
     csrf: String,
     index: usize,
     ttl_secs: u64,
+    /// Owner-visible reminder of what the link is for. Optional so older
+    /// clients (and curl) keep working.
+    #[serde(default)]
+    note: String,
 }
 
 #[derive(serde::Serialize)]
@@ -765,18 +774,25 @@ async fn create_share(
         return (StatusCode::BAD_REQUEST, "slot out of range").into_response();
     }
     let ttl_secs = form.ttl_secs.clamp(1, state.config.max_share_secs);
-    let (token, grant_id) = state.shares.create(
+    let (token, grant_id) = match state.shares.create(
         &session.username,
         form.index,
         std::time::Duration::from_secs(ttl_secs),
-    );
-    let path = format!("/webshell/public/access?token={token}");
-    // Absolute URL when a public base URL is configured (correct behind a proxy);
-    // otherwise a path the page resolves against its own origin.
-    let url = match &state.config.public_base_url {
-        Some(base) => format!("{base}{path}"),
-        None => path,
+        &form.note,
+    ) {
+        Ok(v) => v,
+        Err(share::CreateError::TooMany) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "you already have {} active share links; revoke one first",
+                    share::MAX_GRANTS_PER_USER
+                ),
+            )
+                .into_response();
+        }
     };
+    let url = share_url(&state, &token);
     Json(ShareResponse {
         url,
         grant_id,
@@ -791,11 +807,56 @@ struct RevokeShareForm {
     grant_id: String,
 }
 
+/// Absolute when a public base URL is configured (correct behind a proxy);
+/// otherwise a path the page resolves against its own origin.
+fn share_url(state: &AppState, token: &str) -> String {
+    let path = format!("/webshell/public/access?token={token}");
+    match &state.config.public_base_url {
+        Some(base) => format!("{base}{path}"),
+        None => path,
+    }
+}
+
+/// One live share link, as the manage dialog needs it.
+#[derive(serde::Serialize)]
+struct ShareEntry {
+    grant_id: String,
+    index: usize,
+    expires_in_secs: u64,
+    note: String,
+    /// Rebuilt from the grant rather than stored — the owner can re-copy a
+    /// link instead of minting a duplicate one.
+    url: String,
+}
+
 async fn list_shares(State(state): State<AppState>, jar: SignedCookieJar) -> Response {
     let Some(session) = authed_session(&state, &jar) else {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     };
-    Json(state.shares.list(&session.username)).into_response()
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut entries: Vec<ShareEntry> = state
+        .shares
+        .list(&session.username)
+        .iter()
+        .map(|g| ShareEntry {
+            grant_id: g.id.clone(),
+            index: g.index,
+            expires_in_secs: g.expires_at.saturating_sub(now),
+            note: g.note.clone(),
+            url: share_url(&state, &state.shares.token_for(g)),
+        })
+        .collect();
+    // Soonest to expire first, then by slot, so the list is stable between
+    // polls instead of following HashMap iteration order.
+    entries.sort_by(|a, b| {
+        a.expires_in_secs
+            .cmp(&b.expires_in_secs)
+            .then(a.index.cmp(&b.index))
+    });
+    Json(entries).into_response()
 }
 
 async fn revoke_share(
@@ -936,6 +997,14 @@ async fn access_ws(
     ws: WebSocketUpgrade,
 ) -> Response {
     tracing::info!("access ws: upgrade request");
+    // The global switch gates the *data path*, not just the viewer page: this
+    // socket is the only thing that actually streams the terminal, and it is
+    // reachable without a login. `resolve_share` applies the same check on the
+    // page and status routes.
+    if !state.config.sharing_enabled {
+        tracing::warn!("access ws: rejected — sharing is disabled");
+        return (StatusCode::FORBIDDEN, "sharing is disabled").into_response();
+    }
     let Some((user, index, revoked)) = state.shares.lease(&q.token) else {
         tracing::warn!("access ws: rejected — invalid or expired share token");
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
