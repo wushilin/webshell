@@ -87,17 +87,16 @@ to log in like anyone else, and there is no API-token path today.
 <img width="401" height="228" alt="image" src="https://github.com/user-attachments/assets/8e876f46-8679-48e5-a643-e05dd0133cc7" />
 
 **Supports Google Login**
+
 <img width="416" height="392" alt="image" src="https://github.com/user-attachments/assets/d5ee2146-c5ee-48e9-b5ee-e192e443f512" />
 
 **Terminal with slot switcher**
 
-<!-- paste: main terminal + slot bar -->
 <img width="1728" height="366" alt="image" src="https://github.com/user-attachments/assets/bc9fe122-086d-4727-b1c6-e85cae20a0b7" />
 
 **Customizable Terminal Font**
 
 <img width="239" height="172" alt="image" src="https://github.com/user-attachments/assets/3de4a10b-b8bb-4ab6-b9a5-4c7d1e07822a" />
-
 
 
 **Create a share link**
