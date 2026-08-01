@@ -64,7 +64,11 @@ fn closed_json(term: usize, reason: &str) -> String {
 }
 
 /// Slot-tagged data frame: byte 0 = slot index, rest = payload.
+///
+/// The one-byte index is why `slots_per_user` is clamped (see Config): above
+/// 255 this cast would silently wrap and route a frame to the wrong terminal.
 fn tagged(term: usize, bytes: &[u8]) -> Vec<u8> {
+    debug_assert!(term <= u8::MAX as usize, "slot index must fit in the frame tag");
     let mut v = Vec::with_capacity(bytes.len() + 1);
     v.push(term as u8);
     v.extend_from_slice(bytes);
@@ -167,7 +171,28 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
                             (Some(e), Some(o)) => Some((e, o)),
                             _ => None,
                         };
-                        match terminals.attach(&user, term, cols, rows, resume) {
+                        // Off the runtime: a cold slot makes this openpty +
+                        // fork + exec (as root, /bin/login, which does PAM
+                        // session setup and utmp accounting), all while
+                        // holding the slot lock. On a reconnect the client
+                        // re-opens every slot it had, so those land here
+                        // back-to-back — enough to stall a worker for a
+                        // visible fraction of a second.
+                        let attached = {
+                            let terminals = terminals.clone();
+                            let user = user.clone();
+                            tokio::task::spawn_blocking(move || {
+                                terminals.attach(&user, term, cols, rows, resume)
+                            })
+                            .await
+                        };
+                        // A panic inside the spawn is reported like any other
+                        // attach failure rather than taking down the socket.
+                        let attached = match attached {
+                            Ok(r) => r,
+                            Err(e) => Err(format!("spawn task failed: {e}")),
+                        };
+                        match attached {
                             Ok(att) => {
                                 tracing::info!(
                                     "mux: open user={user:?} term={term} mode={:?}",
@@ -183,6 +208,14 @@ pub async fn mux_bridge(socket: WebSocket, terminals: Arc<Terminals>, user: Stri
                                 } = att;
                                 // hello + replay queue BEFORE the forward task
                                 // exists: FIFO ordering does the rest.
+                                //
+                                // Note this awaits the writer queue from the
+                                // MAIN loop: if a slow client has filled it,
+                                // this socket stops reading input for every
+                                // slot until it drains. Head-of-line blocking
+                                // is self-inflicted (the stalled client is the
+                                // one penalised), which is why it is accepted
+                                // rather than worked around with a side queue.
                                 if out_tx.send(Message::Text(hello)).await.is_err() {
                                     break;
                                 }

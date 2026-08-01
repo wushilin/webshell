@@ -115,6 +115,11 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// Drop the Origin-matches-Host fallback and accept only `allowed_origins`.
     pub strict_origin: bool,
+    /// Cap on a single WebSocket message, in bytes. Replaces tungstenite's
+    /// 64 MiB default so a client cannot make the server buffer megabytes per
+    /// frame — the share-link socket is reachable without a login. Derived
+    /// from `scrollback_cap`, since the replay blob is sent as one message.
+    pub ws_message_limit: usize,
     pub is_root: bool,
     pub secret_base64: Option<String>,
 }
@@ -160,21 +165,32 @@ impl Config {
 
         let secret_base64 = env::var("WEBSHELL_SECRET").ok().or(s.secret_base64);
 
+        // Bounded like every other sizing knob: this buffer is retained per
+        // slot, so an unclamped value is an OOM waiting for a typo.
+        let scrollback_cap = s.scrollback_bytes.clamp(4 * 1024, 16 * 1024 * 1024);
+        // Room for the largest thing we legitimately send (a full replay)
+        // plus slack for a generous paste from the client.
+        let ws_message_limit = scrollback_cap.saturating_add(1024 * 1024);
+
         Config {
             bind_addr: s.bind,
             pam_service: s.pam_service,
             owner_home: owner.home,
             owner: owner.name,
+            // Load-bearing for the wire format, not just a sanity bound: the
+            // mux protocol tags each frame with a ONE-BYTE slot index
+            // (pty::tagged), so this must stay <= 255.
             slots_per_user: s.max_sessions.clamp(1, 64),
             max_share_secs: s.max_sharing_duration_secs.max(1),
             sharing_enabled: s.sharing_enabled,
             public_base_url,
             login_cmd,
-            scrollback_cap: s.scrollback_bytes,
+            scrollback_cap,
             session_ttl: Duration::from_secs(s.session_ttl_secs.max(60)),
             cookie_secure: s.cookie_secure,
             allowed_origins,
             strict_origin: s.strict_origin,
+            ws_message_limit,
             is_root,
             secret_base64,
         }

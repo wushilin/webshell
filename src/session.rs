@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::random_token;
+use crate::util::lock;
 
 /// Unauthenticated (login-page) sessions only exist to hold a CSRF token, so
 /// they expire quickly — this bounds memory from anonymous session creation.
@@ -60,7 +61,7 @@ impl SessionStore {
             csrf: random_token(24),
             created: Instant::now(),
         };
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = lock(&self.inner);
         if guard.len() >= MAX_SESSIONS {
             // Evict the oldest anonymous session (fall back to oldest overall).
             let victim = guard
@@ -79,7 +80,7 @@ impl SessionStore {
 
     /// Fetch a non-expired session by id, evicting it if it has expired.
     pub fn get(&self, id: &str) -> Option<Session> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = lock(&self.inner);
         match guard.get(id) {
             Some(s) if !s.expired(self.ttl) => Some(s.clone()),
             Some(_) => {
@@ -91,14 +92,14 @@ impl SessionStore {
     }
 
     pub fn remove(&self, id: &str) {
-        self.inner.lock().unwrap().remove(id);
+        lock(&self.inner).remove(id);
     }
 
     /// Promote a session to authenticated under a *new* id (session-fixation
     /// defense). The old id is invalidated and a fresh CSRF token is issued.
     /// Returns the new session id.
     pub fn login(&self, old_id: &str, username: &str) -> String {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = lock(&self.inner);
         guard.remove(old_id);
         let new_id = random_token(24);
         guard.insert(
@@ -116,6 +117,6 @@ impl SessionStore {
     /// Drop every expired session. Intended to be called periodically.
     pub fn sweep(&self) {
         let ttl = self.ttl;
-        self.inner.lock().unwrap().retain(|_, s| !s.expired(ttl));
+        lock(&self.inner).retain(|_, s| !s.expired(ttl));
     }
 }

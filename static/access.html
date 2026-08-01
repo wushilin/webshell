@@ -7,7 +7,7 @@
   <meta name="referrer" content="no-referrer" />
   <title>webshell · shared (read-only)</title>
   <link rel="icon" href="/webshell/favicon.ico" sizes="any" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+  <link rel="stylesheet" href="/webshell/static/xterm.css" />
   <style>
     html, body { height: 100%; margin: 0; background: #000; color: #cbd0d8; }
     #bar {
@@ -59,8 +59,8 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-  <script>
+  <script src="/webshell/static/xterm.js"></script>
+  <script nonce="{{NONCE}}">
     const token = new URLSearchParams(location.search).get("token") || "";
     const statusEl = document.getElementById("status");
     const deadlineEl = document.getElementById("deadline");

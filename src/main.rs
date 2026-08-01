@@ -4,6 +4,7 @@ mod pty;
 mod session;
 mod share;
 mod terminals;
+mod util;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -60,15 +61,15 @@ impl LoginGuard {
     }
     /// Delay to impose before the next attempt (grows with recent failures).
     fn delay(&self) -> Duration {
-        let g = self.inner.lock().unwrap();
+        let g = util::lock(&self.inner);
         Duration::from_millis((Self::recent_failures(&g) as u64 * 300).min(5000))
     }
     fn record_failure(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = util::lock(&self.inner);
         *g = (Self::recent_failures(&g) + 1, Instant::now());
     }
     fn record_success(&self) {
-        *self.inner.lock().unwrap() = (0, Instant::now());
+        *util::lock(&self.inner) = (0, Instant::now());
     }
 }
 
@@ -252,6 +253,12 @@ async fn run_server(config_path: &std::path::Path) {
         .route("/webshell/login", get(login_page).post(login_submit))
         .route("/favicon.ico", get(favicon))
         .route("/webshell/favicon.ico", get(favicon))
+        // Vendored browser assets. Public by necessity — the share-link viewer
+        // page is unauthenticated. Separate routes rather than a path
+        // parameter, so there is no filename to traverse out of.
+        .route("/webshell/static/xterm.js", get(asset_xterm_js))
+        .route("/webshell/static/xterm.css", get(asset_xterm_css))
+        .route("/webshell/static/addon-fit.js", get(asset_addon_fit_js))
         .merge(public)
         .merge(private)
         .route("/webshell", get(|| async { Redirect::to("/webshell/private/") }))
@@ -298,6 +305,160 @@ async fn favicon() -> Response {
         FAVICON,
     )
         .into_response()
+}
+
+// Browser assets, compiled in. They are deliberately NOT loaded from a CDN:
+// this page is a root-capable terminal, so a third-party script tag on it is a
+// remote-code-execution dependency — one bad CDN response owns the shell. It
+// also keeps the binary genuinely self-contained (air-gapped installs work).
+// Refresh with ./update_js.sh, which pulls from the npm registry and verifies
+// each tarball against npm's published integrity hash.
+const XTERM_JS: &[u8] = include_bytes!("../static/vendor/xterm.js");
+const XTERM_CSS: &[u8] = include_bytes!("../static/vendor/xterm.css");
+const ADDON_FIT_JS: &[u8] = include_bytes!("../static/vendor/addon-fit.js");
+
+/// Serve an embedded asset with a content-derived ETag. `must-revalidate` with
+/// a zero lifetime keeps a stale xterm.js from surviving an upgrade, while the
+/// 304 path keeps the cost of that revalidation to a bare round trip.
+fn embedded_asset(
+    bytes: &'static [u8],
+    content_type: &'static str,
+    etag: &'static std::sync::OnceLock<String>,
+    headers: &HeaderMap,
+) -> Response {
+    use axum::http::header::{
+        CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, X_CONTENT_TYPE_OPTIONS,
+    };
+    const CACHE: &str = "public, max-age=0, must-revalidate";
+    let tag = etag.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let digest = Sha256::digest(bytes);
+        let mut s = String::with_capacity(34);
+        s.push('"');
+        for b in &digest[..16] {
+            let _ = write!(s, "{b:02x}");
+        }
+        s.push('"');
+        s
+    });
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == tag)
+    {
+        // A 304 must carry the same validators a 200 would (RFC 9110 §15.4.5);
+        // a bare 304 invites caches to drop the validator and refetch in full.
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (CACHE_CONTROL, CACHE),
+                (ETAG, tag.as_str()),
+                (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (CONTENT_TYPE, content_type),
+            (CACHE_CONTROL, CACHE),
+            (ETAG, tag.as_str()),
+            // This is the response that actually serves JavaScript — it wants
+            // nosniff more than the HTML pages do.
+            (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+const JS_TYPE: &str = "application/javascript; charset=utf-8";
+
+async fn asset_xterm_js(headers: HeaderMap) -> Response {
+    static ETAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    embedded_asset(XTERM_JS, JS_TYPE, &ETAG, &headers)
+}
+
+async fn asset_addon_fit_js(headers: HeaderMap) -> Response {
+    static ETAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    embedded_asset(ADDON_FIT_JS, JS_TYPE, &ETAG, &headers)
+}
+
+async fn asset_xterm_css(headers: HeaderMap) -> Response {
+    static ETAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    embedded_asset(XTERM_CSS, "text/css; charset=utf-8", &ETAG, &headers)
+}
+
+/// Same-origin WebSocket sources for `connect-src`.
+///
+/// CSP3 says `'self'` covers ws:/wss: on the page's own origin, and current
+/// browsers implement that — but this was CSP2-era breakage territory, and if
+/// the reading is wrong the terminal never connects at all. Naming the origin
+/// removes the interpretation. The `Host` header is attacker-controlled, so it
+/// is charset-checked before it can reach a response header; anything odd
+/// falls back to bare `'self'` rather than emitting an attacker's string.
+fn ws_sources(headers: &HeaderMap) -> String {
+    let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
+        return String::new();
+    };
+    let plausible = !host.is_empty()
+        && host.len() <= 255
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
+        });
+    if plausible {
+        format!(" ws://{host} wss://{host}")
+    } else {
+        String::new()
+    }
+}
+
+/// CSP for the HTML pages. Scripts are same-origin plus one per-response nonce
+/// for the page's own inline block, so an injected `<script>` cannot execute.
+/// Styles need 'unsafe-inline': xterm injects stylesheets at runtime.
+fn csp_header(nonce: &str, ws: &str) -> String {
+    format!(
+        "default-src 'none'; \
+         script-src 'self' 'nonce-{nonce}'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self'{ws}; \
+         form-action 'self'; \
+         base-uri 'none'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// Headers for an authenticated HTML page: no-store because the markup carries
+/// the CSRF token and username, plus the usual sniffing/framing/referrer set.
+fn html_headers(
+    nonce: &str,
+    no_store: bool,
+    req_headers: &HeaderMap,
+) -> [(axum::http::HeaderName, String); 5] {
+    use axum::http::header::{
+        CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+        X_FRAME_OPTIONS,
+    };
+    [
+        (
+            CONTENT_SECURITY_POLICY,
+            csp_header(nonce, &ws_sources(req_headers)),
+        ),
+        (X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        (X_FRAME_OPTIONS, "DENY".to_string()),
+        (REFERRER_POLICY, "no-referrer".to_string()),
+        (
+            CACHE_CONTROL,
+            if no_store {
+                "no-store".to_string()
+            } else {
+                "no-cache".to_string()
+            },
+        ),
+    ]
 }
 
 // ---- cookie / session helpers ---------------------------------------------
@@ -368,14 +529,21 @@ async fn require_auth(
 
 // ---- page handlers ---------------------------------------------------------
 
-async fn login_page(State(state): State<AppState>, jar: SignedCookieJar) -> Response {
+async fn login_page(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+) -> Response {
     if authed_session(&state, &jar).is_some() {
         return Redirect::to("/webshell/private/").into_response();
     }
     let (jar, id) = ensure_session(&state, jar);
     let csrf = state.sessions.get(&id).map(|s| s.csrf).unwrap_or_default();
-    let html = include_str!("../static/login.html").replace("{{CSRF}}", &html_escape(&csrf));
-    (jar, Html(html)).into_response()
+    let nonce = config::random_token(16);
+    let html = include_str!("../static/login.html")
+        .replace("{{CSRF}}", &html_escape(&csrf))
+        .replace("{{NONCE}}", &html_escape(&nonce));
+    (jar, html_headers(&nonce, true, &headers), Html(html)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -388,6 +556,7 @@ struct LoginForm {
 async fn login_submit(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
     let Some((id, session)) = current_session(&state, &jar) else {
@@ -412,13 +581,20 @@ async fn login_submit(
     let Some(canonical_user) = result else {
         state.login_guard.record_failure();
         tracing::warn!("failed login for user {:?}", form.username);
+        let nonce = config::random_token(16);
         let html = include_str!("../static/login.html")
             .replace("{{CSRF}}", &html_escape(&session.csrf))
+            .replace("{{NONCE}}", &html_escape(&nonce))
             .replace(
                 "<!--ERROR-->",
                 "<p class=\"error\">Invalid username or password.</p>",
             );
-        return (StatusCode::UNAUTHORIZED, Html(html)).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            html_headers(&nonce, true, &headers),
+            Html(html),
+        )
+            .into_response();
     };
 
     // Success: rotate the session id (fixation defense).
@@ -451,15 +627,22 @@ async fn logout(
     (jar, Redirect::to("/webshell/login")).into_response()
 }
 
-async fn terminal_page(State(state): State<AppState>, jar: SignedCookieJar) -> Response {
+async fn terminal_page(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+) -> Response {
     let Some(session) = authed_session(&state, &jar) else {
         return Redirect::to("/webshell/login").into_response();
     };
+    let nonce = config::random_token(16);
     let html = include_str!("../static/terminal.html")
         .replace("{{CSRF}}", &html_escape(&session.csrf))
         .replace("{{USER}}", &html_escape(&session.username))
-        .replace("{{SLOTS}}", &state.config.slots_per_user.to_string());
-    Html(html).into_response()
+        .replace("{{SLOTS}}", &state.config.slots_per_user.to_string())
+        .replace("{{NONCE}}", &html_escape(&nonce));
+    // no-store: this markup carries the CSRF token and the username.
+    (html_headers(&nonce, true, &headers), Html(html)).into_response()
 }
 
 // ---- terminal APIs ---------------------------------------------------------
@@ -512,7 +695,7 @@ async fn set_prefs(
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
     let font_family: String = form.font_family.chars().take(200).collect();
-    state.prefs.lock().unwrap().insert(
+    util::lock(&state.prefs).insert(
         session.username.clone(),
         ClientPrefs {
             font_size: form.font_size.clamp(8, 40),
@@ -639,7 +822,7 @@ async fn access_meta(State(state): State<AppState>, Query(q): Query<AccessQuery>
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
     };
     let (cols, rows) = state.terminals.current_size(&user, index).unwrap_or((80, 24));
-    let prefs = state.prefs.lock().unwrap().get(&user).cloned();
+    let prefs = util::lock(&state.prefs).get(&user).cloned();
     let (font_size, font_family) = match prefs {
         Some(p) => (p.font_size, p.font_family),
         None => (14, "ui-monospace, SFMono-Regular, Menlo, monospace".to_string()),
@@ -661,11 +844,23 @@ color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0\">\
 
 /// Serve the read-only viewer page (no login required); the token lives in the
 /// URL and is read by the page's script.
-async fn access_page(State(state): State<AppState>, Query(q): Query<AccessQuery>) -> Response {
+async fn access_page(
+    State(state): State<AppState>,
+    Query(q): Query<AccessQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let nonce = config::random_token(16);
     if resolve_share(&state, &q.token).is_none() {
-        return (StatusCode::GONE, Html(SHARE_INVALID_HTML)).into_response();
+        return (
+            StatusCode::GONE,
+            html_headers(&nonce, false, &headers),
+            Html(SHARE_INVALID_HTML.replace("{{NONCE}}", &html_escape(&nonce))),
+        )
+            .into_response();
     }
-    Html(include_str!("../static/access.html")).into_response()
+    let html = include_str!("../static/access.html").replace("{{NONCE}}", &html_escape(&nonce));
+    // no-store: the page is reached with a capability token in its URL.
+    (html_headers(&nonce, true, &headers), Html(html)).into_response()
 }
 
 /// Read-only WebSocket for a share link. The token is the credential (no cookie,
@@ -703,7 +898,10 @@ async fn access_ws(
     match state.terminals.attach_view(&user, index, resume) {
         Ok(attachment) => {
             tracing::info!("access ws: attached (viewer) user={user:?} term={index}");
-            ws.on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline))
+            // Bound what an unauthenticated share-link holder can make us buffer.
+            ws.max_message_size(state.config.ws_message_limit)
+                .max_frame_size(state.config.ws_message_limit)
+                .on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline))
         }
         Err(e) => {
             tracing::warn!("access ws: attach_view failed user={user:?} term={index}: {e}");
@@ -748,7 +946,9 @@ async fn ws_handler(
 
     let terminals = state.terminals.clone();
     let user = session.username;
-    ws.on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user))
+    ws.max_message_size(state.config.ws_message_limit)
+        .max_frame_size(state.config.ws_message_limit)
+        .on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user))
 }
 
 fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {

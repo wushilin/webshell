@@ -6,7 +6,7 @@
   <meta name="referrer" content="same-origin" />
   <title>webshell</title>
   <link rel="icon" href="/webshell/favicon.ico" sizes="any" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+  <link rel="stylesheet" href="/webshell/static/xterm.css" />
   <style>
     /* overscroll-behavior: kill pull-to-refresh / rubber-banding — a swipe
        must never reload the page, even on gestures the app doesn't own. */
@@ -66,10 +66,11 @@
     }
     @keyframes statusblink { 50% { opacity: .25; } }
 
-    /* Share modal */
+    /* Modals: the share flow and the generic confirm/alert dialog */
     .modal-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,.6);
       display: grid; place-items: center; z-index: 50;
+      animation: modalfade .12s ease-out;
     }
     .modal-overlay[hidden] { display: none; }
     .modal {
@@ -77,6 +78,12 @@
       padding: 1.2rem 1.4rem; width: min(92vw, 420px);
       font: .85rem system-ui, sans-serif; color: #e6e6e6;
       box-shadow: 0 12px 48px rgba(0,0,0,.55);
+      animation: modalpop .12s ease-out;
+    }
+    @keyframes modalfade { from { opacity: 0; } }
+    @keyframes modalpop { from { opacity: 0; transform: translateY(6px) scale(.98); } }
+    @media (prefers-reduced-motion: reduce) {
+      .modal-overlay, .modal { animation: none; }
     }
     .modal h3 { margin: 0 0 .3rem; font-size: 1rem; }
     .modal .modal-sub { color: #9aa0aa; margin: .2rem 0 .9rem; font-size: .8rem; }
@@ -95,6 +102,14 @@
     .modal-actions .action { flex: 1; padding: .5rem; text-align: center; }
     .action.primary { background: #4c8bf5; color: #fff; border-color: #4c8bf5; }
     .action.primary:hover { background: #3f7be0; }
+    /* Confirm button for an irreversible action (kill / close a shell). */
+    .action.destructive { background: #b3423c; color: #fff; border-color: #b3423c; }
+    .action.destructive:hover { background: #9c3833; border-color: #9c3833; }
+    .action:focus-visible { outline: 2px solid #7fa8f5; outline-offset: 2px; }
+    /* The generic dialog stacks above the share modal (it can be raised from it). */
+    #dialogModal { z-index: 60; }
+    #dialogBody { margin-bottom: 0; }
+    #dialogBody strong { color: #e6e6e6; }
     #shareUrl {
       width: 100%; box-sizing: border-box; padding: .5rem; border: 1px solid #2c313c;
       border-radius: 6px; background: #0f1115; color: #e6e6e6;
@@ -190,9 +205,21 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-  <script>
+  <div id="dialogModal" class="modal-overlay" hidden>
+    <div class="modal" role="alertdialog" aria-modal="true"
+         aria-labelledby="dialogTitle" aria-describedby="dialogBody">
+      <h3 id="dialogTitle"></h3>
+      <p class="modal-sub" id="dialogBody"></p>
+      <div class="modal-actions">
+        <button type="button" class="action primary" id="dialogOk">OK</button>
+        <button type="button" class="action" id="dialogCancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/webshell/static/xterm.js"></script>
+  <script src="/webshell/static/addon-fit.js"></script>
+  <script nonce="{{NONCE}}">
     const CSRF = "{{CSRF}}";
     const SLOTS = parseInt("{{SLOTS}}", 10) || 1;
     const MAX_FAILURES = 30;  // consecutive failed connects before giving up
@@ -388,13 +415,23 @@
       },
 
       sendJson(obj) { if (this.isOpen()) this.ws.send(JSON.stringify(obj)); },
+      // A paste reaches us from xterm as ONE onData string, so this is the only
+      // place a client frame gets big. Split it: the server bounds a single
+      // WebSocket message, and the PTY takes a byte stream anyway — the frames
+      // are written to the master in order, so splitting mid-character is
+      // harmless and the shell sees an identical byte sequence.
       sendInput(index, text) {
         if (!this.isOpen()) return;
         const b = enc.encode(text);
-        const f = new Uint8Array(b.length + 1);
-        f[0] = index;
-        f.set(b, 1);
-        this.ws.send(f);
+        const MAX = 32 * 1024;
+        for (let off = 0; off < b.length || off === 0; off += MAX) {
+          const part = b.subarray(off, Math.min(off + MAX, b.length));
+          const f = new Uint8Array(part.length + 1);
+          f[0] = index;
+          f.set(part, 1);
+          this.ws.send(f);
+          if (b.length === 0) break;   // keepalive/empty input: send one frame
+        }
       },
 
       drop() {
@@ -809,6 +846,86 @@
       refreshStatus();
     });
 
+    // ---- dialogs: one in-page modal in place of window.confirm/alert. The
+    // native ones are styled by the browser (jarring against the rest of the
+    // UI), can be suppressed entirely by the user or the embedder, and block
+    // the event loop — a suppressed confirm() silently returns false, which
+    // would make actions look like they simply do nothing. Promise-based:
+    // resolves true when confirmed. ----
+    const Dialog = (() => {
+      const overlay = document.getElementById("dialogModal");
+      const titleEl = document.getElementById("dialogTitle");
+      const bodyEl = document.getElementById("dialogBody");
+      const okBtn = document.getElementById("dialogOk");
+      const cancelBtn = document.getElementById("dialogCancel");
+      let resolve = null;        // non-null exactly while a dialog is open
+      let restoreFocus = null;
+
+      function close(result) {
+        if (!resolve) return;
+        const done = resolve;
+        resolve = null;
+        overlay.hidden = true;
+        document.removeEventListener("keydown", onKey, true);
+        // Hand focus back to whatever raised the dialog, else to the terminal
+        // so typing resumes without a click.
+        const back = restoreFocus;
+        restoreFocus = null;
+        if (back && back.isConnected && !overlay.contains(back)) back.focus();
+        else { const s = sessions[active]; if (s) s.term.focus(); }
+        done(result);
+      }
+
+      function onKey(e) {
+        if (e.key === "Escape") {
+          e.preventDefault(); e.stopPropagation();
+          close(false);
+          return;
+        }
+        if (e.key === "Enter") {
+          // Activate whatever is focused rather than always confirming: a
+          // destructive dialog opens on Cancel, so Enter backs out of it and
+          // confirming stays a deliberate click (or Tab, then Enter).
+          e.preventDefault(); e.stopPropagation();
+          close(document.activeElement !== cancelBtn);
+          return;
+        }
+        if (e.key !== "Tab") return;
+        // Focus trap — the dialog has at most these two controls.
+        const btns = cancelBtn.hidden ? [okBtn] : [okBtn, cancelBtn];
+        const i = btns.indexOf(document.activeElement);
+        e.preventDefault();
+        btns[((e.shiftKey ? i - 1 : i + 1) + btns.length) % btns.length].focus();
+      }
+
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) close(false); });
+      okBtn.addEventListener("click", () => close(true));
+      cancelBtn.addEventListener("click", () => close(false));
+
+      function open(opts) {
+        close(false);            // never stack two dialogs
+        titleEl.textContent = opts.title;
+        bodyEl.textContent = opts.body || "";
+        bodyEl.hidden = !opts.body;
+        okBtn.textContent = opts.ok || "OK";
+        okBtn.className = "action " + (opts.destructive ? "destructive" : "primary");
+        cancelBtn.hidden = !opts.cancel;
+        cancelBtn.textContent = opts.cancel || "Cancel";
+        restoreFocus = document.activeElement;
+        overlay.hidden = false;
+        document.addEventListener("keydown", onKey, true);
+        (opts.destructive ? cancelBtn : okBtn).focus();
+        return new Promise((r) => { resolve = r; });
+      }
+
+      return {
+        // {title, body, ok, cancel, destructive} -> Promise<boolean>
+        confirm: (opts) => open({ cancel: "Cancel", ...opts }),
+        // Single-button notice -> Promise<true> when dismissed.
+        alert: (title, body) => open({ title, body, ok: "OK", cancel: null }),
+      };
+    })();
+
     // ---- share modal ----
     const shareModal = document.getElementById("shareModal");
     let shareSecs = 86400;
@@ -844,6 +961,11 @@
     document.getElementById("shareCancel").addEventListener("click", closeShareModal);
     document.getElementById("shareDone").addEventListener("click", closeShareModal);
     shareModal.addEventListener("click", (e) => { if (e.target === shareModal) closeShareModal(); });
+    // Escape dismisses it, same as the confirm dialog. Skipped while a dialog
+    // sits on top — that one owns the key and closes itself first.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !shareModal.hidden) closeShareModal();
+    });
 
     document.querySelectorAll("#ttlOpts .ttl").forEach((b) => {
       b.addEventListener("click", () => {
@@ -862,8 +984,13 @@
     document.getElementById("shareCreate").addEventListener("click", async () => {
       let secs = shareSecs;
       if (secs === "custom") {
-        secs = parseInt(document.getElementById("customSecs").value, 10);
-        if (!secs || secs < 1) { alert("Enter a valid number of seconds."); return; }
+        const input = document.getElementById("customSecs");
+        secs = parseInt(input.value, 10);
+        if (!secs || secs < 1) {
+          await Dialog.alert("Invalid duration", "Enter a number of seconds — 1 or more.");
+          input.focus();
+          return;
+        }
       }
       const idx = active;
       try {
@@ -872,7 +999,10 @@
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({ csrf: CSRF, index: String(idx), ttl_secs: String(secs) }),
         });
-        if (!res.ok) { alert("Could not create share link."); return; }
+        if (!res.ok) {
+          await Dialog.alert("Share failed", "The server refused to create the link. Sharing may be disabled, or your session may have expired.");
+          return;
+        }
         const data = await res.json();
         // The server returns an absolute URL when public_base_url is configured;
         // otherwise a path to resolve against this origin.
@@ -884,7 +1014,7 @@
         try { await navigator.clipboard.writeText(full); } catch (_) { /* ignore */ }
         const u = document.getElementById("shareUrl"); u.focus(); u.select();
       } catch (_) {
-        alert("Could not create share link.");
+        await Dialog.alert("Share failed", "Could not reach the server. Check your connection and try again.");
       }
     });
 
@@ -896,10 +1026,16 @@
 
     document.getElementById("reset").addEventListener("click", async () => {
       morePanel.hidden = true;
-      const s = sessions[active];
-      if (!s) return;
-      if (!confirm("Kill and restart terminal " + (active + 1) + "?")) return;
-      const body = new URLSearchParams({ csrf: CSRF, index: String(active) });
+      const i = active;             // pinned across the await
+      if (!sessions[i]) return;
+      const ok = await Dialog.confirm({
+        title: "Restart terminal " + (i + 1) + "?",
+        body: "The running shell is killed and a fresh one starts in its place. Anything running in it is lost.",
+        ok: "Kill and restart",
+        destructive: true,
+      });
+      if (!ok) return;
+      const body = new URLSearchParams({ csrf: CSRF, index: String(i) });
       try {
         await fetch("/webshell/private/api/reset", {
           method: "POST", credentials: "same-origin",
@@ -917,7 +1053,13 @@
       morePanel.hidden = true;
       const i = active;
       const s = sessions[i];
-      if (!confirm("Close terminal " + (i + 1) + "? Its shell and anything running in it are killed.")) return;
+      const ok = await Dialog.confirm({
+        title: "Close terminal " + (i + 1) + "?",
+        body: "Its shell and anything running in it are killed. The slot stays empty until you select it again.",
+        ok: "Close terminal",
+        destructive: true,
+      });
+      if (!ok) return;
       if (s) s.closing = true;   // arm before the request: the closed frame can beat the reply
       const body = new URLSearchParams({ csrf: CSRF, index: String(i) });
       try {

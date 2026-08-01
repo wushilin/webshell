@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use crate::util::lock;
 use tokio::sync::{broadcast, watch};
 
 /// Commands to the blocking thread that owns the PTY master.
@@ -171,9 +172,7 @@ impl Terminals {
     }
 
     fn pool(&self, user: &str) -> Arc<UserPool> {
-        self.pools
-            .lock()
-            .unwrap()
+        lock(&self.pools)
             .entry(user.to_string())
             .or_insert_with(|| Arc::new(UserPool::new(self.slots_per_user)))
             .clone()
@@ -186,9 +185,7 @@ impl Terminals {
             .iter()
             .enumerate()
             .map(|(index, slot)| {
-                let running = slot
-                    .lock()
-                    .unwrap()
+                let running = lock(slot)
                     .as_ref()
                     .map(|t| t.alive.load(Ordering::Relaxed))
                     .unwrap_or(false);
@@ -212,7 +209,7 @@ impl Terminals {
         }
         let pool = self.pool(user);
         let slot = &pool.slots[index];
-        let mut guard = slot.lock().unwrap();
+        let mut guard = lock(slot);
 
         let need_spawn = match guard.as_ref() {
             None => true,
@@ -245,7 +242,7 @@ impl Terminals {
         };
         // Cut + subscribe under the same lock the reader thread uses, so
         // there is no gap/overlap at the cut point.
-        let sb = term.scrollback.lock().unwrap();
+        let sb = lock(&term.scrollback);
         let (mode, base_offset, replay) = sb.cut(client_offset);
         let output_rx = term.output_tx.subscribe();
         drop(sb);
@@ -270,7 +267,7 @@ impl Terminals {
             return Err("slot out of range".into());
         }
         let pool = self.pool(user);
-        let guard = pool.slots[index].lock().unwrap();
+        let guard = lock(&pool.slots[index]);
         let term = match guard.as_ref() {
             Some(t) if t.alive.load(Ordering::Relaxed) => t,
             _ => return Err("session not running".into()),
@@ -283,7 +280,7 @@ impl Terminals {
         };
         // Cut + subscribe under the same lock the reader thread uses, so
         // there is no gap/overlap at the cut point.
-        let sb = term.scrollback.lock().unwrap();
+        let sb = lock(&term.scrollback);
         let (mode, base_offset, replay) = sb.cut(client_offset);
         let output_rx = term.output_tx.subscribe();
         drop(sb);
@@ -304,9 +301,9 @@ impl Terminals {
             return None;
         }
         let pool = self.pool(user);
-        let guard = pool.slots[index].lock().unwrap();
+        let guard = lock(&pool.slots[index]);
         match guard.as_ref() {
-            Some(t) if t.alive.load(Ordering::Relaxed) => Some(*t.size.lock().unwrap()),
+            Some(t) if t.alive.load(Ordering::Relaxed) => Some(*lock(&t.size)),
             _ => None,
         }
     }
@@ -318,7 +315,7 @@ impl Terminals {
             return;
         }
         let pool = self.pool(user);
-        let taken = pool.slots[index].lock().unwrap().take();
+        let taken = lock(&pool.slots[index]).take();
         if let Some(term) = taken {
             term.stop();
         }
@@ -376,7 +373,15 @@ fn spawn_terminal(
     let writer = pair.master.take_writer()?;
     let master = pair.master;
 
-    let (output_tx, _) = broadcast::channel::<Vec<u8>>(2048);
+    // Tokio's broadcast is a ring of `capacity` slots and frees a value only
+    // when it is OVERWRITTEN, not when every receiver has read it — so the
+    // channel permanently retains capacity × chunk_size bytes per terminal
+    // once output has flowed. At 8 KiB reads, 2048 slots meant ~16 MiB per
+    // slot (128× the default 128 KiB scrollback) sitting resident forever.
+    // 256 caps that at ~2 MiB, and overrunning it is harmless: a lagged
+    // receiver just re-opens and the scrollback ring heals it with a delta
+    // or a full replay.
+    let (output_tx, _) = broadcast::channel::<Vec<u8>>(256);
     let scrollback = Arc::new(Mutex::new(Scrollback::new(scrollback_cap)));
     let alive = Arc::new(AtomicBool::new(true));
     let size = Arc::new(Mutex::new((cols, rows)));
@@ -390,6 +395,7 @@ fn spawn_terminal(
         let scrollback = scrollback.clone();
         let alive = alive.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let reap_tx = input_tx.clone();
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
@@ -399,7 +405,7 @@ fn spawn_terminal(
                     Ok(n) => {
                         let chunk = buf[..n].to_vec();
                         // Append + broadcast under one lock for a clean attach cut.
-                        let mut sb = scrollback.lock().unwrap();
+                        let mut sb = lock(&scrollback);
                         sb.push(&chunk);
                         let _ = output_tx.send(chunk);
                     }
@@ -409,6 +415,12 @@ fn spawn_terminal(
             // so they reconnect and get a fresh shell.
             alive.store(false, Ordering::Relaxed);
             let _ = shutdown_tx.send(true);
+            // Wake the command thread so it reaps the child NOW. Without this
+            // it stays parked on recv() — senders live in the Terminal, so the
+            // channel never closes — leaving a zombie and a blocked thread
+            // until something re-attaches to this slot. For a background slot
+            // the client deliberately does not re-open, so that could be days.
+            let _ = reap_tx.send(PtyCmd::Kill);
         });
     }
 
@@ -427,7 +439,7 @@ fn spawn_terminal(
                         let _ = writer.flush();
                     }
                     PtyCmd::Resize { cols, rows } => {
-                        *size.lock().unwrap() = (cols, rows);
+                        *lock(&size) = (cols, rows);
                         let _ = master.resize(PtySize {
                             rows,
                             cols,
