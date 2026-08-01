@@ -189,15 +189,22 @@ webshell validate -c config.toml    # check it
 webshell run -c config.toml         # run (this is also the default subcommand)
 ```
 
-**Coming from a YAML config?** The first `run` converts it for you: it writes
-`config.toml` beside it and retires the original as `config.yaml.old`. Your
-deployment upgrades itself once, without downtime, and every later start reads
-TOML. When the path you name is missing, a `.yaml`/`.yml` of the same name is
-used instead — which is why a command line with no `-c` (the default is
-`config.toml`) finds and converts an existing `config.yaml` on its own.
+**Coming from a YAML config?** On start, webshell looks at what is on disk and
+acts:
 
-The conversion is deliberately one-way. If your start command names the YAML
-file explicitly, it will fail the *next* time, saying:
+| On disk | What happens |
+|---|---|
+| `config.yaml` only | Converted to `config.toml`, original retired as `config.yaml.old`, **and the server stops** so you can review it. Start again to run. |
+| `config.toml` only | Runs. |
+| Both | `config.toml` wins; the YAML is retired as `config.yaml.old` so it cannot drift into looking authoritative. Runs. |
+| Neither | Refuses to start, and tells you to run `genconfig`. |
+
+Converting stops the server on purpose: a config that was rewritten a moment
+ago is worth a glance before it is served from. It happens once — the next start
+finds `config.toml` and runs normally.
+
+If your start command names the YAML file explicitly, it will fail after the
+conversion, saying:
 
 ```
 config error: config.yaml does not exist, but config.toml does. It was
@@ -205,9 +212,8 @@ converted by an earlier run; the original is config.yaml.old. Start with
 -c config.toml instead.
 ```
 
-That is the forcing function — update the flag and it never comes back. If you
-would rather convert on your own schedule, do it deliberately and leave the
-original in place:
+That is the forcing function — update the flag and it never comes back. To
+convert on your own schedule instead, without retiring the original:
 
 ```sh
 webshell configrewrite -c config.yaml   # writes config.toml, keeps config.yaml

@@ -102,6 +102,74 @@ pub fn resolve_path(path: &Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+/// What `run` should do about the config files it can see.
+pub enum ConfigChoice {
+    /// Load this file and start.
+    Use(std::path::PathBuf),
+    /// A legacy file was converted. The server does not start: a rewritten
+    /// config deserves a look before it is served from.
+    Converted {
+        converted: std::path::PathBuf,
+        retired: std::path::PathBuf,
+    },
+    /// Nothing usable on disk.
+    Missing(std::path::PathBuf),
+}
+
+/// Decide which config to run from, converting or retiring a legacy file as
+/// needed. For a requested `config.toml` (the default) the cases are:
+///
+/// * only `config.yaml`  — convert it, and stop so it can be reviewed
+/// * only `config.toml`  — use it
+/// * both                — the TOML wins; the YAML is retired so it cannot
+///                         drift into looking authoritative
+/// * neither             — nothing to serve; the caller reports it
+pub fn choose(requested: &Path) -> anyhow::Result<ConfigChoice> {
+    let toml_path = if is_legacy(requested) {
+        requested.with_extension("toml")
+    } else {
+        requested.to_path_buf()
+    };
+    let legacy = [
+        Some(requested.to_path_buf()).filter(|p| is_legacy(p)),
+        Some(requested.with_extension("yaml")),
+        Some(requested.with_extension("yml")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists());
+
+    match (toml_path.exists(), legacy) {
+        (true, Some(old)) => {
+            let retired = retire(&old)?;
+            tracing::warn!(
+                "{} is no longer used ({} takes precedence); it is now {}",
+                old.display(),
+                toml_path.display(),
+                retired.display()
+            );
+            Ok(ConfigChoice::Use(toml_path))
+        }
+        (true, None) => Ok(ConfigChoice::Use(toml_path)),
+        (false, Some(old)) => {
+            let (converted, retired) = migrate_legacy(&old)?;
+            Ok(ConfigChoice::Converted { converted, retired })
+        }
+        (false, None) => Ok(ConfigChoice::Missing(toml_path)),
+    }
+}
+
+/// Move a superseded config aside as `<name>.old`.
+fn retire(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let retired = path.with_extension(format!(
+        "{}.old",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
+    ));
+    std::fs::rename(path, &retired)
+        .map_err(|e| anyhow::anyhow!("moving {} aside: {e}", path.display()))?;
+    Ok(retired)
+}
+
 pub fn is_legacy(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
@@ -110,33 +178,21 @@ pub fn is_legacy(path: &Path) -> bool {
 }
 
 /// Convert a legacy YAML config to TOML and move the original aside, returning
-/// the path now in force.
+/// `(converted, retired)`.
 ///
-/// This is a one-way door by design: the next start with `-c config.yaml` finds
-/// nothing and fails, which is what forces the flag to be updated. A start that
-/// names the TOML file — including the default, which is why `run.sh` needs no
-/// `-c` — keeps working across the conversion without interruption.
-pub fn migrate_legacy(path: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let settings = Settings::load(Some(path))?;
+/// This is a one-way door by design. The caller converts and then *stops*
+/// rather than starting on the result: a config rewrite is exactly the moment
+/// an operator should look at what was produced, and stopping guarantees they
+/// do instead of discovering the change weeks later. The following start reads
+/// the TOML normally.
+pub fn migrate_legacy(path: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let settings = Settings::load_quiet(path)?;
     let target = path.with_extension("toml");
     if !target.exists() {
         settings.save(&target)?;
     }
-    let retired = path.with_extension(format!(
-        "{}.old",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
-    ));
-    std::fs::rename(path, &retired)
-        .map_err(|e| anyhow::anyhow!("moving {} aside: {e}", path.display()))?;
-    tracing::warn!(
-        "converted {} to {}; the original is now {}. \
-         Update your start command to use {} — the old path will not work again.",
-        path.display(),
-        target.display(),
-        retired.display(),
-        target.display()
-    );
-    Ok(target)
+    let retired = retire(path)?;
+    Ok((target, retired))
 }
 
 /// Explain a missing config when the TOML replacement is sitting right there,
@@ -174,6 +230,17 @@ impl Settings {
     /// existing deployment keeps working, with a warning pointing at
     /// `configrewrite`. YAML support exists only for that migration.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Settings> {
+        Self::load_inner(path, true)
+    }
+
+    /// As `load`, but silent about the file being YAML — for callers that are
+    /// already converting it and would otherwise advise the very thing they
+    /// are doing.
+    fn load_quiet(path: &Path) -> anyhow::Result<Settings> {
+        Self::load_inner(Some(path), false)
+    }
+
+    fn load_inner(path: Option<&Path>, warn_on_yaml: bool) -> anyhow::Result<Settings> {
         let Some(p) = path else {
             return Ok(Settings::default());
         };
@@ -183,12 +250,15 @@ impl Settings {
             Ok(settings) => Ok(settings),
             Err(toml_err) => match serde_yaml_ng::from_str(&text) {
                 Ok(settings) => {
-                    tracing::warn!(
-                        "{} is YAML; webshell now uses TOML. Run \
-                         `webshell configrewrite -c {}` to convert it — YAML support will go away.",
-                        p.display(),
-                        p.display()
-                    );
+                    if warn_on_yaml {
+                        tracing::warn!(
+                            "{} is YAML; webshell now uses TOML. Run \
+                             `webshell configrewrite -c {}` to convert it — \
+                             YAML support will go away.",
+                            p.display(),
+                            p.display()
+                        );
+                    }
                     Ok(settings)
                 }
                 // Report the TOML error: that is the format the file should be

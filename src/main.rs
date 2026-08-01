@@ -221,39 +221,55 @@ async fn run_server(config_path: &std::path::Path) {
         std::process::exit(1);
     }
 
-    // A legacy YAML config is converted on the spot and retired, so a running
-    // deployment upgrades itself exactly once and every later start reads TOML.
-    let mut config_path = config_path.to_path_buf();
-    if config_path.exists() && config::is_legacy(&config_path) {
-        match config::migrate_legacy(&config_path) {
-            Ok(converted) => config_path = converted,
-            // Not fatal: an unwritable directory should not stop the server
-            // from starting on a config it can already read.
-            Err(e) => tracing::error!("could not convert {}: {e}", config_path.display()),
+    // A command line that names a YAML file which is already gone gets the
+    // migration story rather than a bare "not found" — this is the start
+    // command that has to be updated.
+    if config::is_legacy(config_path) && !config_path.exists() {
+        if let Some(hint) = config::migration_hint(config_path) {
+            eprintln!("config error: {hint}");
+            std::process::exit(1);
         }
     }
+
+    let config_path = match config::choose(config_path) {
+        Ok(config::ConfigChoice::Use(p)) => p,
+        // Converted: stop rather than serve from a file written moments ago.
+        Ok(config::ConfigChoice::Converted { converted, retired }) => {
+            eprintln!(
+                "converted {} to {}\n\
+                 the original is kept as {}\n\n\
+                 not starting the server: review {}, then start again",
+                config_path.display(),
+                converted.display(),
+                retired.display(),
+                converted.display()
+            );
+            std::process::exit(1);
+        }
+        Ok(config::ConfigChoice::Missing(looked_for)) => {
+            eprintln!(
+                "no config found at {}\n\nwrite one with: webshell genconfig -c {}",
+                looked_for.display(),
+                looked_for.display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("config error: {e}");
+            std::process::exit(1);
+        }
+    };
     let config_path = config_path.as_path();
 
-    let settings = if config_path.exists() {
-        match Settings::load(Some(config_path)) {
-            Ok(s) => {
-                tracing::info!("loaded config {}", config_path.display());
-                s
-            }
-            Err(e) => {
-                eprintln!("config error: {e}");
-                std::process::exit(1);
-            }
+    let settings = match Settings::load(Some(config_path)) {
+        Ok(s) => {
+            tracing::info!("loaded config {}", config_path.display());
+            s
         }
-    } else if let Some(hint) = config::migration_hint(config_path) {
-        eprintln!("config error: {hint}");
-        std::process::exit(1);
-    } else {
-        tracing::warn!(
-            "config {} not found; using built-in defaults",
-            config_path.display()
-        );
-        Settings::default()
+        Err(e) => {
+            eprintln!("config error: {e}");
+            std::process::exit(1);
+        }
     };
 
     let config = Config::from_settings(settings);
