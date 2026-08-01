@@ -82,26 +82,35 @@ to log in like anyone else, and there is no API-token path today.
 **Login**
 
 <!-- paste: login screen -->
-<img width="447" height="331" alt="image" src="https://github.com/user-attachments/assets/0d5a4457-2bdd-4ca7-9e4c-cb5261e47532" />
+<img width="414" height="393" alt="image" src="https://github.com/user-attachments/assets/c7be480e-75c0-456e-be13-a3f8a2ee74e4" />
 
+<img width="401" height="228" alt="image" src="https://github.com/user-attachments/assets/8e876f46-8679-48e5-a643-e05dd0133cc7" />
+
+**Supports Google Login**
+<img width="416" height="392" alt="image" src="https://github.com/user-attachments/assets/d5ee2146-c5ee-48e9-b5ee-e192e443f512" />
 
 **Terminal with slot switcher**
 
 <!-- paste: main terminal + slot bar -->
-<img width="1725" height="839" alt="image" src="https://github.com/user-attachments/assets/78ce8119-8f5a-4fa7-961f-87e2b3482633" />
+<img width="1728" height="366" alt="image" src="https://github.com/user-attachments/assets/bc9fe122-086d-4727-b1c6-e85cae20a0b7" />
+
+**Customizable Terminal Font**
+
+<img width="239" height="172" alt="image" src="https://github.com/user-attachments/assets/3de4a10b-b8bb-4ab6-b9a5-4c7d1e07822a" />
+
 
 
 **Create a share link**
 
-<img width="481" height="207" alt="image" src="https://github.com/user-attachments/assets/2339a997-5a00-40f9-b098-4367a40485c9" />
+<img width="470" height="284" alt="image" src="https://github.com/user-attachments/assets/2dd06b7f-12e8-46bd-80c4-c4714adce794" />
 
 
-<img width="487" height="252" alt="image" src="https://github.com/user-attachments/assets/b3427b65-6a3a-4a1a-bdf1-3f174d937b68" />
+<img width="468" height="253" alt="image" src="https://github.com/user-attachments/assets/a319f25f-8b24-4d88-8c47-7076fc3f7f6e" />
 
 **Read-only shared view (with expiry countdown)**
 
 <!-- paste: read-only viewer -->
-<img width="1728" height="457" alt="image" src="https://github.com/user-attachments/assets/d8f918ca-ab98-4673-87e3-c924f7382801" />
+<img width="1728" height="367" alt="image" src="https://github.com/user-attachments/assets/920699e5-4793-4321-9bd1-8a0ea73117f5" />
 
 
 ## What it does
