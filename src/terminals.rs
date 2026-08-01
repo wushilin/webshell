@@ -11,8 +11,8 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use crate::util::lock;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::{broadcast, watch};
 
 /// Commands to the blocking thread that owns the PTY master.
@@ -104,8 +104,14 @@ struct Terminal {
     /// unusable: the command thread blocks in `write_all` whenever the PTY
     /// buffer is full and the program is not reading, so a queued `Kill` is
     /// never reached — and once the bounded queue fills, it is not even
-    /// accepted. Killing the process is what unblocks that write.
-    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    /// accepted. Hanging the shell up is what unblocks that write.
+    ///
+    /// `None` once the command thread is about to reap the child. This is not
+    /// bookkeeping: a `ChildKiller` is a bare pid, so signalling after `wait()`
+    /// could hit an unrelated process that inherited the number. Both sides go
+    /// through this mutex, so the child is either still unreaped when we
+    /// signal it, or already cleared and we do nothing.
+    killer: Arc<Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>>,
     /// Identity of this spawn; see NEXT_EPOCH.
     epoch: u64,
 }
@@ -114,9 +120,15 @@ impl Terminal {
     /// Kill the shell and notify every attached bridge to disconnect.
     fn stop(&self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = lock(&self.killer).kill();
+        // SIGHUP, which is the right signal for a login shell going away: it
+        // runs exit traps and terminates anything that does not handle it.
+        // The command thread follows up with SIGKILL as it unwinds.
+        if let Some(killer) = lock(&self.killer).as_mut() {
+            let _ = killer.kill();
+        }
         // Best-effort nudge so the command thread unwinds promptly when it is
-        // idle rather than blocked; the kill above is what guarantees death.
+        // idle rather than blocked; the hangup above is what reaches a shell
+        // whose input queue is unusable.
         let _ = self.input_tx.try_send(PtyCmd::Kill);
     }
 }
@@ -272,7 +284,12 @@ impl Terminals {
     /// slot. Unlike `attach`, this never spawns a shell and never resizes the
     /// owner's PTY, so a viewer cannot affect the session. Errors if the slot
     /// is not currently running.
-    pub fn attach_view(&self, user: &str, index: usize, resume: Option<(u64, u64)>) -> Result<Attachment, String> {
+    pub fn attach_view(
+        &self,
+        user: &str,
+        index: usize,
+        resume: Option<(u64, u64)>,
+    ) -> Result<Attachment, String> {
         if index >= self.slots_per_user {
             return Err("slot out of range".into());
         }
@@ -375,12 +392,31 @@ fn spawn_terminal(
         .spawn_command(cmd)
         .map_err(|e| anyhow::anyhow!("spawn {program:?} (cwd {owner_home}): {e}"))?;
     drop(pair.slave); // so the master sees EOF when the shell exits
-    // Taken before the child moves into the command thread: this is the only
-    // handle `stop()` can use without going through that thread.
-    let killer = child.clone_killer();
 
-    let reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
+    // Taken before the child moves into the command thread: this is the only
+    // handle `stop()` can use without going through that thread. The thread
+    // clears it before reaping, so it never outlives the pid it names.
+    let killer = Arc::new(Mutex::new(Some(child.clone_killer())));
+
+    // From here the child is ours to clean up. Returning early with `?` would
+    // drop it without killing or reaping it: `Child`'s drop does neither, and
+    // the command thread that normally does the reaping is not spawned yet, so
+    // the shell would survive as an orphan and stay a zombie of this process
+    // for as long as it runs.
+    let mut child = child;
+    let (reader, writer) = match (pair.master.try_clone_reader(), pair.master.take_writer()) {
+        (Ok(reader), Ok(writer)) => (reader, writer),
+        (reader, writer) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let err = reader
+                .err()
+                .map(anyhow::Error::from)
+                .or_else(|| writer.err().map(anyhow::Error::from))
+                .unwrap_or_else(|| anyhow::anyhow!("pty handle setup failed"));
+            return Err(err);
+        }
+    };
     let master = pair.master;
 
     // Tokio's broadcast is a ring of `capacity` slots and frees a value only
@@ -441,6 +477,7 @@ fn spawn_terminal(
     // Command thread: owns master (input + resize) and reaps the child.
     {
         let size = size.clone();
+        let killer = killer.clone();
         std::thread::spawn(move || {
             let mut writer = writer;
             let mut child = child;
@@ -465,6 +502,10 @@ fn spawn_terminal(
                 }
             }
             let _ = child.kill();
+            // Retire the shared killer BEFORE reaping: once wait() collects the
+            // child, its pid is free to be reused, and a stale killer would
+            // signal whoever gets it next.
+            lock(&killer).take();
             let _ = child.wait();
         });
     }
@@ -476,7 +517,7 @@ fn spawn_terminal(
         alive,
         size,
         shutdown_tx,
-        killer: Mutex::new(killer),
+        killer,
         epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
     })
 }
@@ -554,7 +595,7 @@ mod tests {
         s.push(b"cc");
         let (mode, base, bytes) = s.cut(None);
         assert_eq!(mode, AttachMode::Replay);
-        assert_eq!(base, 6);              // total 10 − ring 4
+        assert_eq!(base, 6); // total 10 − ring 4
         assert_eq!(bytes, b"bbcc");
     }
 }

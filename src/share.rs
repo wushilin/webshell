@@ -79,7 +79,10 @@ pub fn sanitize_note(note: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .chars()
         .take(MAX_NOTE_LEN)
         .collect()
@@ -112,12 +115,7 @@ impl ShareStore {
     /// Rebuild the token for a grant, so the owner can re-copy a link they
     /// already made instead of minting a redundant one.
     pub fn token_for(&self, grant: &Grant) -> String {
-        self.encode(
-            &grant.id,
-            grant.index,
-            grant.expires_at,
-            &grant.username,
-        )
+        self.encode(&grant.id, grant.index, grant.expires_at, &grant.username)
     }
 
     /// Mint a token granting read-only access to `username`'s slot `index`,
@@ -257,7 +255,9 @@ mod tests {
     #[test]
     fn active_grant_round_trips() {
         let a = store();
-        let (token, _) = a.create("wushilin", 3, Duration::from_secs(3600), "").unwrap();
+        let (token, _) = a
+            .create("wushilin", 3, Duration::from_secs(3600), "")
+            .unwrap();
         assert_eq!(a.resolve(&token), Some(("wushilin".to_string(), 3)));
         assert!(a.remaining_secs(&token).unwrap() > 3500);
     }
@@ -295,7 +295,10 @@ mod tests {
     #[test]
     fn note_is_sanitized_and_bounded() {
         assert_eq!(sanitize_note("  demo \n for  bob\t"), "demo for bob");
-        assert_eq!(sanitize_note(&"x".repeat(500)).chars().count(), MAX_NOTE_LEN);
+        assert_eq!(
+            sanitize_note(&"x".repeat(500)).chars().count(),
+            MAX_NOTE_LEN
+        );
         let s = store();
         let (_, id) = s
             .create("u", 0, Duration::from_secs(60), "line\u{1}one\nline two")

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>webshell · set up MFA</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: system-ui,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; background:#0f1115; color:#e6e6e6; }
+    .card { background:#1a1d24; padding:1.5rem; border-radius:12px; width:min(90vw,380px); text-align:center; }
+    .qr { background:white; padding:.6rem; display:inline-block; border-radius:8px; }
+    .qr svg { display:block; width:240px; height:240px; }
+    .seed { font: .78rem ui-monospace,monospace; overflow-wrap:anywhere; color:#b7bdc8; }
+    .manual { margin:.9rem 0; padding:.75rem; background:#0f1115; border:1px solid #2c313c; border-radius:8px; text-align:left; }
+    .manual p { margin:.2rem 0 .55rem; font-size:.82rem; color:#b7bdc8; }
+    .seed-row { display:flex; gap:.5rem; align-items:center; }
+    .seed-row code { flex:1; min-width:0; padding:.55rem; background:#090b0e; border-radius:6px; user-select:all; }
+    .seed-row button { width:auto; margin:0; white-space:nowrap; }
+    #copyStatus { min-height:1.2em; margin:.35rem 0 0; font-size:.78rem; color:#7ecb7e; }
+    label { display:block; text-align:left; font-size:.8rem; color:#9aa0aa; margin:.8rem 0 .25rem; }
+    input,button { width:100%; box-sizing:border-box; padding:.65rem; border-radius:8px; font-size:1rem; }
+    input { border:1px solid #2c313c; background:#0f1115; color:#e6e6e6; }
+    button { margin-top:1rem; border:0; background:#4c8bf5; color:white; font-weight:600; }
+    button:disabled { background:#39414f; color:#b7bdc8; cursor:progress; }
+    .error { color:#ff6b6b; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/webshell/mfa" autocomplete="off">
+    <div id="scanStep">
+      <h2>Set up authenticator</h2>
+      <p>Open <strong>Google Authenticator</strong> or <strong>Microsoft Authenticator</strong>, add a new account, and scan this QR code.</p>
+      <div class="qr">{{QR}}</div>
+      <div class="manual">
+        <p><strong>Cannot scan the QR code?</strong> In your authenticator app, choose the option to enter a setup key manually. Use account name <strong>webshell</strong>, select a time-based key, and paste this secret:</p>
+        <div class="seed-row">
+          <code class="seed" id="seed">{{SEED}}</code>
+          <button type="button" id="copySeed">Copy</button>
+        </div>
+        <p id="copyStatus" role="status" aria-live="polite"></p>
+      </div>
+      <button type="button" id="next">Next: verify code</button>
+    </div>
+    <div id="verifyStep" hidden>
+      <h2>Verify authenticator</h2>
+      <p>Enter the current six-digit code shown by your authenticator app.</p>
+      <!--ERROR-->
+      <label for="otp">Authenticator code</label>
+      <input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required />
+      <button id="verify" type="submit">Verify and continue</button>
+      <button type="button" id="back">Back</button>
+    </div>
+    <input type="hidden" name="csrf" value="{{CSRF}}" />
+  </form>
+  <script nonce="{{NONCE}}">
+    const scan = document.getElementById("scanStep");
+    const verify = document.getElementById("verifyStep");
+    const otp = document.getElementById("otp");
+    const seed = document.getElementById("seed");
+    const copyStatus = document.getElementById("copyStatus");
+    document.getElementById("copySeed").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(seed.textContent.trim());
+        copyStatus.textContent = "Setup key copied.";
+      } catch (_) {
+        const range = document.createRange();
+        range.selectNodeContents(seed);
+        const selection = window.getSelection();
+        selection.removeAllRanges(); selection.addRange(range);
+        copyStatus.textContent = "Key selected. Copy it using your browser's Copy command.";
+      }
+    });
+    document.getElementById("next").addEventListener("click", () => {
+      scan.hidden = true; verify.hidden = false; otp.focus();
+    });
+    document.getElementById("back").addEventListener("click", () => {
+      verify.hidden = true; scan.hidden = false;
+    });
+    if (document.querySelector(".error")) {
+      scan.hidden = true; verify.hidden = false; otp.focus();
+    }
+    // Same reason as the login form: verification runs behind the serialized
+    // tarpit, and a second click would resubmit a code the server has already
+    // consumed. One submission per page.
+    (function () {
+      const form = document.querySelector("form");
+      const btn = document.getElementById("verify");
+      const LABEL = "Verify and continue";
+      let sent = false;
+      let watchdog = null;
+      function rearm() {
+        clearTimeout(watchdog);
+        watchdog = null;
+        sent = false;
+        btn.disabled = false;
+        btn.textContent = LABEL;
+      }
+      form.addEventListener("submit", (e) => {
+        if (sent) { e.preventDefault(); return; }
+        if (!form.checkValidity()) return;
+        sent = true;
+        setTimeout(() => { btn.disabled = true; btn.textContent = "Verifying…"; }, 0);
+        // Never latch: a dropped submission must not leave a dead form.
+        watchdog = setTimeout(rearm, 12000);
+      });
+      window.addEventListener("pagehide", () => clearTimeout(watchdog));
+      window.addEventListener("pageshow", rearm);
+    })();
+  </script>
+</body>
+</html>

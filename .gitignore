@@ -26,3 +26,6 @@ target
 webshell.pid
 .claude/
 *.local.*
+
+# vim swap files
+*.swp

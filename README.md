@@ -120,6 +120,10 @@ You can even broadcast your live session in 1 to N multicasting.
 - **PAM authentication, single user.** Only the user the process runs as can log
   in, with their real system password (username + password). No app-specific
   accounts to manage.
+- **Optional TOTP second factor.** Turn on `mfa_enabled` and the first login
+  walks you through enrolling an authenticator app (QR code or a setup key you
+  can type). Codes are **single-use** — an accepted code is remembered and
+  refused if it is presented again inside its validity window.
 - **Genuine login shell.** Each session opens the process owner's configured
   login shell with the correct home directory and identity environment.
 - **Persistent, resumable slots** (default 10). A slot's shell survives
@@ -191,6 +195,8 @@ Keys (all optional; `genconfig` writes the defaults):
 |---|---|---|
 | `bind` | `127.0.0.1:8080` | Listen address. |
 | `pam_service` | `login` | PAM service under `/etc/pam.d`. |
+| `mfa_enabled` | `false` | Require application-managed TOTP after PAM password authentication. |
+| `mfa_token_seed` | *(none)* | Base32 TOTP seed generated and saved after successful first-login enrollment. Do not set manually or disclose it. |
 | `max_sessions` | `10` | Persistent slots for the user. |
 | `max_sharing_duration_secs` | `2592000` | Cap on a share link's lifetime. |
 | `sharing_enabled` | `true` | Master switch for share links. |
@@ -200,13 +206,35 @@ Keys (all optional; `genconfig` writes the defaults):
 | `cookie_secure` | `false` | Set `true` when served over HTTPS. |
 | `allowed_origins` | *(empty)* | **Extra** WebSocket `Origin`s to accept, on top of the request's own `Host`. Rarely needed — see below. |
 | `strict_origin` | `false` | Accept only `allowed_origins` (+ `public_base_url`), refusing any other hostname. |
-| `secret_base64` | *(ephemeral)* | base64 signing key (≥64 bytes). Signs session cookies **and** share tokens; set a stable value so both survive restarts. Ephemeral resets both. |
+| `secret_base64` | *(ephemeral)* | base64 cookie master key (≥64 bytes); a separate share-token key is derived from it. Ephemeral keys reset login sessions on restart. |
 
 `WEBSHELL_SECRET` (base64 key) and `WEBSHELL_CONFIG` (config path) may also be set
 via the environment.
 
 Behind a **TLS reverse proxy**, set `public_base_url` to the browser-facing base
 URL — e.g. `https://shell.example.com` — so share links come out absolute.
+
+### TOTP MFA
+
+Set `mfa_enabled: true` to require a six-digit authenticator code in addition to
+the system username and password. On the first successful password login,
+webshell shows a provisioning QR code. The session is not authenticated until a
+valid code from that QR is submitted. Only then is `mfa_token_seed` written to
+the configuration file; subsequent logins require username, password, and OTP.
+
+The configuration file contains the TOTP secret and must remain private.
+Webshell writes an enrolled configuration through a mode-0600 temporary file.
+Initialize MFA promptly after enabling it: until enrollment is complete, anyone
+who knows the system password can claim the initial authenticator enrollment.
+
+**Codes are single-use.** A TOTP code stays valid for its whole time step (plus
+one step either side), so without this the same six digits would authenticate
+more than once — which is exactly the property a one-time password is meant not
+to have. Webshell remembers the last few accepted codes and refuses a repeat for
+as long as that code could still verify, on both the login form and enrollment.
+If you resubmit one you get "that code has already been used"; wait for your
+authenticator to roll over. The memory lives in the process, so a restart clears
+it — harmless, since a code from before a restart is almost certainly expired.
 
 ### WebSocket `Origin`
 

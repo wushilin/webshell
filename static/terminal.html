@@ -1108,6 +1108,9 @@
 
     function renderLinks(entries) {
       linksList.replaceChildren();
+      // Reset the text: a failed refresh leaves an error message in here, and
+      // it must not survive into the next successful load.
+      linksEmpty.textContent = "No active share links.";
       linksEmpty.hidden = entries.length > 0;
       for (const e of entries) {
         const row = document.createElement("div");
@@ -1189,6 +1192,9 @@
         await Dialog.alert("Revoke failed", "Could not reach the server. Check your connection and try again.");
       }
       await refreshLinks();
+      // The row that had focus is gone with the re-render, which would drop
+      // focus to the body and strand a keyboard user inside an open modal.
+      if (!linksModal.hidden) document.getElementById("linksClose").focus();
     }
 
     function openLinksModal() {

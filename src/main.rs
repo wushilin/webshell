@@ -4,6 +4,7 @@ mod pty;
 mod session;
 mod share;
 mod terminals;
+mod totp;
 mod util;
 
 use std::collections::HashMap;
@@ -91,6 +92,11 @@ struct AppState {
     prefs: Arc<Mutex<HashMap<String, ClientPrefs>>>,
     /// Brute-force throttle for the login endpoint.
     login_guard: Arc<LoginGuard>,
+    mfa_seed: Arc<Mutex<Option<String>>>,
+    mfa_initialized: Arc<std::sync::atomic::AtomicBool>,
+    /// Makes each accepted OTP single-use; see `totp::ReplayGuard`.
+    otp_used: Arc<totp::ReplayGuard>,
+    config_path: Arc<std::path::PathBuf>,
     key: Key,
 }
 
@@ -165,10 +171,7 @@ fn genconfig(path: &std::path::Path) {
 /// Load and validate a config file, echoing the normalized settings.
 fn validate(path: &std::path::Path) {
     match Settings::load(Some(path)) {
-        Ok(s) => {
-            println!("OK: {} is valid\n", path.display());
-            print!("{}", serde_yaml::to_string(&s).unwrap_or_default());
-        }
+        Ok(_) => println!("OK: {} is valid", path.display()),
         Err(e) => {
             eprintln!("INVALID: {e}");
             std::process::exit(1);
@@ -202,6 +205,19 @@ async fn run_server(config_path: &std::path::Path) {
     };
 
     let config = Config::from_settings(settings);
+    if config.mfa_enabled
+        && config
+            .mfa_token_seed
+            .as_deref()
+            .is_some_and(|seed| !totp::valid_seed(seed))
+    {
+        eprintln!("startup error: mfa_token_seed is not a valid base32 TOTP seed");
+        std::process::exit(1);
+    }
+    let mfa_initialized = Arc::new(std::sync::atomic::AtomicBool::new(
+        config.mfa_token_seed.is_some(),
+    ));
+    let mfa_seed = Arc::new(Mutex::new(config.mfa_token_seed.clone()));
     let sessions = Arc::new(SessionStore::new(config.session_ttl));
     let terminals = Arc::new(Terminals::new(
         config.slots_per_user,
@@ -225,6 +241,10 @@ async fn run_server(config_path: &std::path::Path) {
         shares: shares.clone(),
         prefs: Arc::new(Mutex::new(HashMap::new())),
         login_guard: Arc::new(LoginGuard::new()),
+        mfa_seed,
+        mfa_initialized,
+        otp_used: Arc::new(totp::ReplayGuard::new()),
+        config_path: Arc::new(config_path.to_path_buf()),
         key,
     };
 
@@ -265,6 +285,7 @@ async fn run_server(config_path: &std::path::Path) {
 
     let app = Router::new()
         .route("/webshell/login", get(login_page).post(login_submit))
+        .route("/webshell/mfa", get(mfa_setup_page).post(mfa_setup_submit))
         .route("/favicon.ico", get(favicon))
         .route("/webshell/favicon.ico", get(favicon))
         // Vendored browser assets. Public by necessity — the share-link viewer
@@ -275,8 +296,14 @@ async fn run_server(config_path: &std::path::Path) {
         .route("/webshell/static/addon-fit.js", get(asset_addon_fit_js))
         .merge(public)
         .merge(private)
-        .route("/webshell", get(|| async { Redirect::to("/webshell/private/") }))
-        .route("/webshell/", get(|| async { Redirect::to("/webshell/private/") }))
+        .route(
+            "/webshell",
+            get(|| async { Redirect::to("/webshell/private/") }),
+        )
+        .route(
+            "/webshell/",
+            get(|| async { Redirect::to("/webshell/private/") }),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -428,9 +455,9 @@ fn ws_sources(headers: &HeaderMap) -> String {
     };
     let plausible = !host.is_empty()
         && host.len() <= 255
-        && host.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
-        });
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
     if plausible {
         format!(" ws://{host} wss://{host}")
     } else {
@@ -564,9 +591,7 @@ async fn login_page(
     let (jar, id) = ensure_session(&state, jar);
     let csrf = state.sessions.get(&id).map(|s| s.csrf).unwrap_or_default();
     let nonce = config::random_token(16);
-    let html = include_str!("../static/login.html")
-        .replace("{{CSRF}}", &html_escape(&csrf))
-        .replace("{{NONCE}}", &html_escape(&nonce));
+    let html = render_login(&state, &csrf, &nonce, "");
     (jar, html_headers(&nonce, true, &headers), Html(html)).into_response()
 }
 
@@ -574,6 +599,8 @@ async fn login_page(
 struct LoginForm {
     username: String,
     password: String,
+    #[serde(default)]
+    otp: String,
     csrf: String,
 }
 
@@ -584,9 +611,27 @@ async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let Some((id, session)) = current_session(&state, &jar) else {
-        return Redirect::to("/webshell/login").into_response();
+        // The pre-auth session expired (PREAUTH_TTL) or its cookie was lost.
+        // This used to bounce back to the login page with no log line and no
+        // message, which reads as "the button did nothing" — and the retry
+        // only worked because the reload minted a fresh session. Hand back a
+        // usable form with a new session and say what happened, so the very
+        // next attempt succeeds.
+        tracing::info!("login: submit with no live session (expired or missing cookie)");
+        let (jar, id) = ensure_session(&state, jar);
+        let csrf = state.sessions.get(&id).map(|s| s.csrf).unwrap_or_default();
+        let nonce = config::random_token(16);
+        let html = render_login(
+            &state,
+            &csrf,
+            &nonce,
+            "<p class=\"error\">This page had been open too long, so the login form expired. \
+             Please enter your details again — including a fresh authenticator code.</p>",
+        );
+        return (jar, html_headers(&nonce, true, &headers), Html(html)).into_response();
     };
     if !csrf_matches(&session.csrf, &form.csrf) {
+        tracing::warn!("login: rejected — CSRF mismatch");
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
 
@@ -608,13 +653,12 @@ async fn login_submit(
         state.login_guard.record_failure();
         tracing::warn!("failed login for user {:?}", form.username);
         let nonce = config::random_token(16);
-        let html = include_str!("../static/login.html")
-            .replace("{{CSRF}}", &html_escape(&session.csrf))
-            .replace("{{NONCE}}", &html_escape(&nonce))
-            .replace(
-                "<!--ERROR-->",
-                "<p class=\"error\">Invalid username or password.</p>",
-            );
+        let html = render_login(
+            &state,
+            &session.csrf,
+            &nonce,
+            "<p class=\"error\">Invalid username or password.</p>",
+        );
         return (
             StatusCode::UNAUTHORIZED,
             html_headers(&nonce, true, &headers),
@@ -623,11 +667,180 @@ async fn login_submit(
             .into_response();
     };
 
+    if state.config.mfa_enabled {
+        let initialized = state
+            .mfa_initialized
+            .load(std::sync::atomic::Ordering::Acquire);
+        let existing_seed = util::lock(&state.mfa_seed).clone();
+        if initialized {
+            let Some(seed) = existing_seed else {
+                tracing::error!("MFA is initialized but its seed is unavailable");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "MFA configuration error")
+                    .into_response();
+            };
+            // Evaluate once: the time window can roll between two calls, and
+            // re-checking after consuming the code could reject a login whose
+            // code has already been spent. Short-circuit order also means only
+            // a code that verified is consumed, so a wrong guess cannot evict
+            // the record of a real one.
+            let verified = totp::verify(&seed, &form.otp);
+            let accepted = verified && state.otp_used.accept(&form.otp);
+            if !accepted {
+                state.login_guard.record_failure();
+                let nonce = config::random_token(16);
+                // A replay is named explicitly: the holder already had a valid
+                // code, so this tells them nothing they did not know, and it is
+                // the difference between "try again" and "wait 30 seconds".
+                let message = if verified {
+                    "<p class=\"error\">That code has already been used. \
+                     Wait for your authenticator to show the next one.</p>"
+                } else {
+                    "<p class=\"error\">Invalid username, password, or OTP.</p>"
+                };
+                let html = render_login(&state, &session.csrf, &nonce, message);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    html_headers(&nonce, true, &headers),
+                    Html(html),
+                )
+                    .into_response();
+            }
+        } else {
+            if existing_seed.is_none() {
+                *util::lock(&state.mfa_seed) = Some(totp::generate_seed());
+            }
+            let new_id = state.sessions.begin_mfa(&id, &canonical_user);
+            let jar = jar.add(session_cookie(&state, new_id));
+            return (jar, Redirect::to("/webshell/mfa")).into_response();
+        }
+    }
+
     // Success: rotate the session id (fixation defense).
     state.login_guard.record_success();
     let new_id = state.sessions.login(&id, &canonical_user);
     let jar = jar.add(session_cookie(&state, new_id));
     tracing::info!("login success for user {:?}", canonical_user);
+    (jar, Redirect::to("/webshell/private/")).into_response()
+}
+
+fn otp_field(show: bool) -> &'static str {
+    if show {
+        "<label for=\"otp\">Authenticator code</label>\
+         <input id=\"otp\" name=\"otp\" type=\"text\" inputmode=\"numeric\" \
+         autocomplete=\"one-time-code\" pattern=\"[0-9]{6}\" maxlength=\"6\" required />"
+    } else {
+        ""
+    }
+}
+
+fn render_login(state: &AppState, csrf: &str, nonce: &str, error: &str) -> String {
+    let initialized = state
+        .mfa_initialized
+        .load(std::sync::atomic::Ordering::Acquire);
+    include_str!("../static/login.html")
+        .replace("{{CSRF}}", &html_escape(csrf))
+        .replace("{{NONCE}}", &html_escape(nonce))
+        .replace(
+            "{{OTP_FIELD}}",
+            otp_field(state.config.mfa_enabled && initialized),
+        )
+        .replace("<!--ERROR-->", error)
+}
+
+#[derive(Deserialize)]
+struct MfaSetupForm {
+    csrf: String,
+    otp: String,
+}
+
+async fn mfa_setup_page(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let Some((_, session)) = current_session(&state, &jar).filter(|(_, s)| s.mfa_pending) else {
+        return Redirect::to("/webshell/login").into_response();
+    };
+    render_mfa_setup(&state, &session, &headers, "")
+}
+
+fn render_mfa_setup(
+    state: &AppState,
+    session: &session::Session,
+    headers: &HeaderMap,
+    error: &str,
+) -> Response {
+    let Some(seed) = util::lock(&state.mfa_seed).clone() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "MFA seed unavailable").into_response();
+    };
+    let uri = totp::provisioning_uri(&seed, &session.username);
+    let qr = match totp::qr_svg(&uri) {
+        Ok(qr) => qr,
+        Err(e) => {
+            tracing::error!("could not render MFA QR: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not render MFA QR").into_response();
+        }
+    };
+    let nonce = config::random_token(16);
+    let html = include_str!("../static/mfa.html")
+        .replace("{{CSRF}}", &html_escape(&session.csrf))
+        .replace("{{NONCE}}", &html_escape(&nonce))
+        .replace("{{QR}}", &qr)
+        .replace("{{SEED}}", &html_escape(&seed))
+        .replace("<!--ERROR-->", error);
+    (html_headers(&nonce, true, headers), Html(html)).into_response()
+}
+
+async fn mfa_setup_submit(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<MfaSetupForm>,
+) -> Response {
+    let Some((id, session)) = current_session(&state, &jar).filter(|(_, s)| s.mfa_pending) else {
+        return Redirect::to("/webshell/login").into_response();
+    };
+    if !csrf_matches(&session.csrf, &form.csrf) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    // Enrollment verification has the same online-guessing risk as normal OTP
+    // login, so it shares the serialized tarpit instead of exposing an
+    // unthrottled six-digit endpoint.
+    let _login_permit = state.login_guard.acquire().await;
+    tokio::time::sleep(state.login_guard.delay()).await;
+    let verified = util::lock(&state.mfa_seed)
+        .as_deref()
+        .is_some_and(|seed| totp::verify(seed, &form.otp));
+    // Enrollment consumes the code too: the seed is live from here on, so a
+    // code proven here must not also work on the login form.
+    if !(verified && state.otp_used.accept(&form.otp)) {
+        state.login_guard.record_failure();
+        let message = if verified {
+            "<p class=\"error\">That code has already been used. \
+             Wait for a new code and try again.</p>"
+        } else {
+            "<p class=\"error\">Invalid code. Wait for a new code and try again.</p>"
+        };
+        return render_mfa_setup(&state, &session, &headers, message);
+    }
+    let seed = util::lock(&state.mfa_seed)
+        .clone()
+        .expect("verified seed exists");
+    if let Err(e) = Settings::persist_mfa_seed(&state.config_path, &seed) {
+        tracing::error!("could not persist MFA seed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not save MFA configuration",
+        )
+            .into_response();
+    }
+    state
+        .mfa_initialized
+        .store(true, std::sync::atomic::Ordering::Release);
+    state.login_guard.record_success();
+    let new_id = state.sessions.login(&id, &session.username);
+    let jar = jar.add(session_cookie(&state, new_id));
+    tracing::info!("MFA enrollment completed for user {:?}", session.username);
     (jar, Redirect::to("/webshell/private/")).into_response()
 }
 
@@ -944,11 +1157,17 @@ async fn access_meta(State(state): State<AppState>, Query(q): Query<AccessQuery>
     let Some((user, index)) = resolve_share(&state, &q.token) else {
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
     };
-    let (cols, rows) = state.terminals.current_size(&user, index).unwrap_or((80, 24));
+    let (cols, rows) = state
+        .terminals
+        .current_size(&user, index)
+        .unwrap_or((80, 24));
     let prefs = util::lock(&state.prefs).get(&user).cloned();
     let (font_size, font_family) = match prefs {
         Some(p) => (p.font_size, p.font_family),
-        None => (14, "ui-monospace, SFMono-Regular, Menlo, monospace".to_string()),
+        None => (
+            14,
+            "ui-monospace, SFMono-Regular, Menlo, monospace".to_string(),
+        ),
     };
     Json(AccessMeta {
         slot: index,
@@ -1034,7 +1253,9 @@ async fn access_ws(
             // Bound what an unauthenticated share-link holder can make us buffer.
             ws.max_message_size(state.config.ws_message_limit)
                 .max_frame_size(state.config.ws_message_limit)
-                .on_upgrade(move |socket| pty::bridge(socket, attachment, true, deadline, Some(revoked)))
+                .on_upgrade(move |socket| {
+                    pty::bridge(socket, attachment, true, deadline, Some(revoked))
+                })
         }
         Err(e) => {
             tracing::warn!("access ws: attach_view failed user={user:?} term={index}: {e}");
@@ -1063,7 +1284,10 @@ async fn ws_handler(
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     };
     if !csrf_matches(&session.csrf, &q.csrf) {
-        tracing::warn!("ws: rejected — CSRF mismatch for user {:?}", session.username);
+        tracing::warn!(
+            "ws: rejected — CSRF mismatch for user {:?}",
+            session.username
+        );
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
     if !origin_allowed(&state, &headers) {

@@ -21,9 +21,18 @@ enum MuxControl {
         #[serde(default)]
         ro: bool,
     },
-    Resize { term: usize, cols: u16, rows: u16 },
-    Mode { term: usize, ro: bool },
-    Close { term: usize },
+    Resize {
+        term: usize,
+        cols: u16,
+        rows: u16,
+    },
+    Mode {
+        term: usize,
+        ro: bool,
+    },
+    Close {
+        term: usize,
+    },
 }
 
 /// One attached slot on a mux connection.
@@ -50,17 +59,25 @@ fn hello_json(term: Option<usize>, a: &Attachment) -> String {
     match term {
         Some(t) => format!(
             r#"{{"type":"hello","term":{},"mode":"{}","epoch":{},"offset":{}}}"#,
-            t, mode_str(a.mode), a.epoch, a.base_offset
+            t,
+            mode_str(a.mode),
+            a.epoch,
+            a.base_offset
         ),
         None => format!(
             r#"{{"type":"hello","mode":"{}","epoch":{},"offset":{}}}"#,
-            mode_str(a.mode), a.epoch, a.base_offset
+            mode_str(a.mode),
+            a.epoch,
+            a.base_offset
         ),
     }
 }
 
 fn closed_json(term: usize, reason: &str) -> String {
-    format!(r#"{{"type":"closed","term":{},"reason":"{}"}}"#, term, reason)
+    format!(
+        r#"{{"type":"closed","term":{},"reason":"{}"}}"#,
+        term, reason
+    )
 }
 
 /// Slot-tagged data frame: byte 0 = slot index, rest = payload.
@@ -68,7 +85,10 @@ fn closed_json(term: usize, reason: &str) -> String {
 /// The one-byte index is why `slots_per_user` is clamped (see Config): above
 /// 255 this cast would silently wrap and route a frame to the wrong terminal.
 fn tagged(term: usize, bytes: &[u8]) -> Vec<u8> {
-    debug_assert!(term <= u8::MAX as usize, "slot index must fit in the frame tag");
+    debug_assert!(
+        term <= u8::MAX as usize,
+        "slot index must fit in the frame tag"
+    );
     let mut v = Vec::with_capacity(bytes.len() + 1);
     v.push(term as u8);
     v.extend_from_slice(bytes);
@@ -163,11 +183,16 @@ pub async fn mux_bridge(
                 }
                 let term = b[0] as usize;
                 if let Some(ch) = channels.get(&term) {
-                    if !ch.read_only {
-                        if ch.input_tx.try_send(PtyCmd::Input(b[1..].to_vec())).is_err() {
-                            tracing::warn!("mux: closing overloaded connection; terminal input queue is full");
-                            break;
-                        }
+                    if !ch.read_only
+                        && ch
+                            .input_tx
+                            .try_send(PtyCmd::Input(b[1..].to_vec()))
+                            .is_err()
+                    {
+                        tracing::warn!(
+                            "mux: closing overloaded connection; terminal input queue is full"
+                        );
+                        break;
                     }
                 }
             }
@@ -178,7 +203,14 @@ pub async fn mux_bridge(
                     continue;
                 };
                 match ctl {
-                    MuxControl::Open { term, cols, rows, epoch, offset, ro } => {
+                    MuxControl::Open {
+                        term,
+                        cols,
+                        rows,
+                        epoch,
+                        offset,
+                        ro,
+                    } => {
                         // Last open wins: a re-open replaces the old channel.
                         if let Some(old) = channels.remove(&term) {
                             old.forward.abort();
@@ -192,8 +224,7 @@ pub async fn mux_bridge(
                             _ => None,
                         };
                         // Off the runtime: a cold slot makes this openpty +
-                        // fork + exec (as root, /bin/login, which does PAM
-                        // session setup and utmp accounting), all while
+                        // fork + exec of the owner's login shell, all while
                         // holding the slot lock. On a reconnect the client
                         // re-opens every slot it had, so those land here
                         // back-to-back — enough to stall a worker for a
@@ -251,13 +282,15 @@ pub async fn mux_bridge(
                                     spawn_forward(term, (output_rx, shutdown_rx), out_tx.clone());
                                 channels.insert(
                                     term,
-                                    Channel { input_tx, read_only: ro, forward },
+                                    Channel {
+                                        input_tx,
+                                        read_only: ro,
+                                        forward,
+                                    },
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "mux: attach failed user={user:?} term={term}: {e}"
-                                );
+                                tracing::warn!("mux: attach failed user={user:?} term={term}: {e}");
                                 if out_tx
                                     .send(Message::Text(closed_json(term, "error")))
                                     .await

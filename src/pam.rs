@@ -32,12 +32,8 @@ struct PamResponse {
 
 #[repr(C)]
 struct PamConv {
-    conv: extern "C" fn(
-        c_int,
-        *const *const PamMessage,
-        *mut *mut PamResponse,
-        *mut c_void,
-    ) -> c_int,
+    conv:
+        extern "C" fn(c_int, *const *const PamMessage, *mut *mut PamResponse, *mut c_void) -> c_int,
     appdata_ptr: *mut c_void,
 }
 
@@ -61,8 +57,7 @@ extern "C" fn conversation(
     let n = num_msg as usize;
     let ad = unsafe { &*(appdata as *const AppData) };
 
-    let arr =
-        unsafe { libc::calloc(n, std::mem::size_of::<PamResponse>()) as *mut PamResponse };
+    let arr = unsafe { libc::calloc(n, std::mem::size_of::<PamResponse>()) as *mut PamResponse };
     if arr.is_null() {
         return PAM_BUF_ERR;
     }
@@ -87,12 +82,8 @@ extern "C" fn conversation(
     PAM_SUCCESS
 }
 
-type PamStart = unsafe extern "C" fn(
-    *const c_char,
-    *const c_char,
-    *const PamConv,
-    *mut *mut c_void,
-) -> c_int;
+type PamStart =
+    unsafe extern "C" fn(*const c_char, *const c_char, *const PamConv, *mut *mut c_void) -> c_int;
 type PamAuth = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type PamEnd = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
@@ -125,8 +116,7 @@ pub fn authenticate(service: &str, user: &str, password: &str) -> Result<(), Str
     };
 
     unsafe {
-        let pam_start: Symbol<PamStart> =
-            lib.get(b"pam_start\0").map_err(|e| e.to_string())?;
+        let pam_start: Symbol<PamStart> = lib.get(b"pam_start\0").map_err(|e| e.to_string())?;
         let pam_authenticate: Symbol<PamAuth> =
             lib.get(b"pam_authenticate\0").map_err(|e| e.to_string())?;
         let pam_acct_mgmt: Symbol<PamAuth> =
@@ -153,7 +143,9 @@ pub fn authenticate(service: &str, user: &str, password: &str) -> Result<(), Str
         if auth_rc == PAM_SUCCESS && acct_rc == PAM_SUCCESS {
             Ok(())
         } else {
-            Err(format!("authentication failed (auth={auth_rc}, acct={acct_rc})"))
+            Err(format!(
+                "authentication failed (auth={auth_rc}, acct={acct_rc})"
+            ))
         }
     }
 }

@@ -8,7 +8,13 @@ use crate::util::lock;
 
 /// Unauthenticated (login-page) sessions only exist to hold a CSRF token, so
 /// they expire quickly — this bounds memory from anonymous session creation.
-const PREAUTH_TTL: Duration = Duration::from_secs(5 * 60);
+///
+/// Not *too* quickly, though: with MFA the user opens this page, walks to their
+/// phone, and comes back. At five minutes that round trip routinely expired the
+/// form, and the failure looked like a dead button. Thirty still bounds the
+/// anonymous-session pool (which is capped by MAX_SESSIONS anyway) while
+/// comfortably covering a human fetching a code.
+const PREAUTH_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Hard ceiling on stored sessions, so a flood of anonymous requests cannot
 /// exhaust memory no matter the rate. Authenticated sessions are few (one user).
@@ -19,6 +25,7 @@ const MAX_SESSIONS: usize = 10_000;
 #[derive(Clone)]
 pub struct Session {
     pub authenticated: bool,
+    pub mfa_pending: bool,
     pub username: String,
     /// Synchronizer token embedded in forms and required on the WebSocket.
     pub csrf: String,
@@ -72,6 +79,7 @@ impl SessionStore {
         let (revoked, _) = watch::channel(false);
         let session = Session {
             authenticated: false,
+            mfa_pending: false,
             username: String::new(),
             csrf: random_token(24),
             created: Instant::now(),
@@ -131,6 +139,28 @@ impl SessionStore {
             new_id.clone(),
             Session {
                 authenticated: true,
+                mfa_pending: false,
+                username: username.to_string(),
+                csrf: random_token(24),
+                created: Instant::now(),
+                revoked,
+            },
+        );
+        new_id
+    }
+
+    pub fn begin_mfa(&self, old_id: &str, username: &str) -> String {
+        let mut guard = lock(&self.inner);
+        if let Some(session) = guard.remove(old_id) {
+            session.revoke();
+        }
+        let new_id = random_token(24);
+        let (revoked, _) = watch::channel(false);
+        guard.insert(
+            new_id.clone(),
+            Session {
+                authenticated: false,
+                mfa_pending: true,
                 username: username.to_string(),
                 csrf: random_token(24),
                 created: Instant::now(),
@@ -151,7 +181,6 @@ impl SessionStore {
             keep
         });
     }
-
 
     pub fn ttl(&self) -> Duration {
         self.ttl

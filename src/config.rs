@@ -12,13 +12,18 @@ use subtle::ConstantTimeEq;
 ///
 /// Authentication is always PAM, and only the **process owner** may log in
 /// (with both their username and system password).
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Listen address, e.g. "0.0.0.0:9023".
     pub bind: String,
     /// PAM service name (file under /etc/pam.d).
     pub pam_service: String,
+    /// Enable application-managed TOTP MFA.
+    pub mfa_enabled: bool,
+    /// Base32 TOTP seed. Generated after the first successful password login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mfa_token_seed: Option<String>,
     /// Persistent terminal slots for the user.
     pub max_sessions: usize,
     /// Upper bound a share link may be valid for.
@@ -57,6 +62,8 @@ impl Default for Settings {
         Settings {
             bind: "127.0.0.1:8080".into(),
             pam_service: "login".into(),
+            mfa_enabled: false,
+            mfa_token_seed: None,
             max_sessions: 10,
             max_sharing_duration_secs: 30 * 24 * 3600,
             sharing_enabled: true,
@@ -88,12 +95,49 @@ impl Settings {
     pub fn sample_yaml() -> String {
         serde_yaml::to_string(&Settings::default()).unwrap_or_default()
     }
+
+    pub fn persist_mfa_seed(path: &Path, seed: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut settings = if path.exists() {
+            Self::load(Some(path))?
+        } else {
+            Self::default()
+        };
+        settings.mfa_enabled = true;
+        settings.mfa_token_seed = Some(seed.to_string());
+        let yaml = serde_yaml::to_string(&settings)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config.yaml");
+        let tmp = parent.join(format!(".{name}.{}.tmp", random_token(8)));
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(yaml.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
 }
 
 /// Fully-resolved runtime configuration.
 pub struct Config {
     pub bind_addr: String,
     pub pam_service: String,
+    pub mfa_enabled: bool,
+    pub mfa_token_seed: Option<String>,
     /// The only account permitted to log in: the user running this process.
     pub owner: String,
     /// The owner's home directory (from the passwd DB), for the spawned shell.
@@ -169,6 +213,8 @@ impl Config {
         Config {
             bind_addr: s.bind,
             pam_service: s.pam_service,
+            mfa_enabled: s.mfa_enabled,
+            mfa_token_seed: s.mfa_token_seed,
             owner_home: owner.home,
             owner: owner.name,
             // Load-bearing for the wire format, not just a sanity bound: the
@@ -243,15 +289,24 @@ fn owner_info() -> OwnerInfo {
                 shell: "/bin/sh".to_string(),
             };
         }
-        let cstr = |p: *const std::os::raw::c_char| CStr::from_ptr(p).to_string_lossy().into_owned();
+        let cstr =
+            |p: *const std::os::raw::c_char| CStr::from_ptr(p).to_string_lossy().into_owned();
         let name = cstr((*pw).pw_name);
         let home = {
             let h = cstr((*pw).pw_dir);
-            if h.is_empty() { "/".to_string() } else { h }
+            if h.is_empty() {
+                "/".to_string()
+            } else {
+                h
+            }
         };
         let shell = {
             let s = cstr((*pw).pw_shell);
-            if s.is_empty() { "/bin/sh".to_string() } else { s }
+            if s.is_empty() {
+                "/bin/sh".to_string()
+            } else {
+                s
+            }
         };
         OwnerInfo { name, home, shell }
     }
@@ -335,7 +390,10 @@ mod tests {
             ..Settings::default()
         });
         assert_eq!(cfg.allowed_origins, vec!["https://shell.example.com"]);
-        assert_eq!(cfg.public_base_url.as_deref(), Some("https://shell.example.com"));
+        assert_eq!(
+            cfg.public_base_url.as_deref(),
+            Some("https://shell.example.com")
+        );
     }
 
     #[test]
