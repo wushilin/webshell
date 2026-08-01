@@ -84,6 +84,8 @@ to log in like anyone else, and there is no API-token path today.
 <!-- paste: login screen -->
 <img width="414" height="393" alt="image" src="https://github.com/user-attachments/assets/c7be480e-75c0-456e-be13-a3f8a2ee74e4" />
 
+**Supports MFA**
+
 <img width="401" height="228" alt="image" src="https://github.com/user-attachments/assets/8e876f46-8679-48e5-a643-e05dd0133cc7" />
 
 **Supports Google Login**
