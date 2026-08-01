@@ -1009,9 +1009,9 @@ async fn ws_handler(
     }
 
     let terminals = state.terminals.clone();
-    let user = session.username;
     let revoked = session.revocation();
     let deadline = tokio::time::Instant::now() + session.remaining(state.sessions.ttl());
+    let user = session.username;
     ws.max_message_size(state.config.ws_message_limit)
         .max_frame_size(state.config.ws_message_limit)
         .on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user, revoked, deadline))
