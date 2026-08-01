@@ -6,6 +6,10 @@ system password), opens a genuine login shell, and gives you persistent,
 resumable terminal slots — like an always-attached `tmux`, in the browser — plus
 read-only share links so others can watch a session live.
 
+You should put this behind tlsproxy which can manage tls proxying, with automatic ACME (let's encrypt) certificate management.
+
+See https://github.com/wushilin/tlsproxy_rs
+
 ## Screenshots
 
 **Login**
