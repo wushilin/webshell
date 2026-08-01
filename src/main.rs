@@ -122,12 +122,15 @@ enum Command {
     Genconfig(ConfigArgs),
     /// Load a config file and report whether it is valid.
     Validate(ConfigArgs),
+    /// Rewrite a config file as TOML (converts a legacy YAML one).
+    Configrewrite(ConfigArgs),
 }
 
 #[derive(clap::Args)]
 struct ConfigArgs {
-    /// Path to the YAML config file.
-    #[arg(short, long, default_value = "config.yaml", env = "WEBSHELL_CONFIG")]
+    /// Path to the TOML config file. If it is missing, a legacy `.yaml`/`.yml`
+    /// file of the same name is used instead.
+    #[arg(short, long, default_value = config::DEFAULT_CONFIG, env = "WEBSHELL_CONFIG")]
     config: std::path::PathBuf,
 }
 
@@ -143,13 +146,46 @@ async fn main() {
     use clap::Parser;
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Run(ConfigArgs {
-        config: "config.yaml".into(),
+        config: config::DEFAULT_CONFIG.into(),
     }));
 
     match command {
+        // genconfig writes a NEW file, so it takes the path literally: falling
+        // back to an existing legacy name would be a request to overwrite it.
         Command::Genconfig(a) => genconfig(&a.config),
-        Command::Validate(a) => validate(&a.config),
-        Command::Run(a) => run_server(&a.config).await,
+        Command::Validate(a) => validate(&config::resolve_path(&a.config)),
+        Command::Configrewrite(a) => configrewrite(&config::resolve_path(&a.config)),
+        Command::Run(a) => run_server(&config::resolve_path(&a.config)).await,
+    }
+}
+
+/// Read a config in either format and write it back out as TOML. The source is
+/// left alone: converting is not the moment to delete the only copy of a file
+/// holding the cookie key and TOTP seed.
+fn configrewrite(path: &std::path::Path) {
+    let settings = match Settings::load(Some(path)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("INVALID: {e}");
+            std::process::exit(1);
+        }
+    };
+    let target = path.with_extension("toml");
+    if target != path && target.exists() {
+        eprintln!("refusing to overwrite existing {}", target.display());
+        std::process::exit(1);
+    }
+    match settings.save(&target) {
+        Ok(()) => {
+            println!("wrote {}", target.display());
+            if target != path {
+                println!("{} is no longer used; delete it once you are happy.", path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("could not write {}: {e}", target.display());
+            std::process::exit(1);
+        }
     }
 }
 
@@ -159,7 +195,7 @@ fn genconfig(path: &std::path::Path) {
         eprintln!("refusing to overwrite existing {}", path.display());
         std::process::exit(1);
     }
-    match std::fs::write(path, Settings::sample_yaml()) {
+    match std::fs::write(path, Settings::sample_toml()) {
         Ok(()) => println!("wrote default config to {}", path.display()),
         Err(e) => {
             eprintln!("could not write {}: {e}", path.display());
@@ -185,6 +221,19 @@ async fn run_server(config_path: &std::path::Path) {
         std::process::exit(1);
     }
 
+    // A legacy YAML config is converted on the spot and retired, so a running
+    // deployment upgrades itself exactly once and every later start reads TOML.
+    let mut config_path = config_path.to_path_buf();
+    if config_path.exists() && config::is_legacy(&config_path) {
+        match config::migrate_legacy(&config_path) {
+            Ok(converted) => config_path = converted,
+            // Not fatal: an unwritable directory should not stop the server
+            // from starting on a config it can already read.
+            Err(e) => tracing::error!("could not convert {}: {e}", config_path.display()),
+        }
+    }
+    let config_path = config_path.as_path();
+
     let settings = if config_path.exists() {
         match Settings::load(Some(config_path)) {
             Ok(s) => {
@@ -196,6 +245,9 @@ async fn run_server(config_path: &std::path::Path) {
                 std::process::exit(1);
             }
         }
+    } else if let Some(hint) = config::migration_hint(config_path) {
+        eprintln!("config error: {hint}");
+        std::process::exit(1);
     } else {
         tracing::warn!(
             "config {} not found; using built-in defaults",

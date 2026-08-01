@@ -153,7 +153,7 @@ You can even broadcast your live session in 1 to N multicasting.
   `Origin` check on WS upgrades, session-id rotation on login, short-lived
   pre-auth sessions, and a login brute-force tarpit.
 - **Single static binary.** All HTML/JS is embedded (`include_str!`); deploy just
-  the binary + a small YAML config.
+  the binary + a small TOML config.
 
 ## How it works
 
@@ -181,13 +181,41 @@ runtime with `dlopen("libpam.so.0")`, which a static musl binary can't do).
 
 ## Configure
 
-Configuration is a YAML file (default `config.yaml`):
+Configuration is a TOML file (default `config.toml`):
 
 ```sh
-webshell genconfig -c config.yaml   # write a default config
-webshell validate -c config.yaml    # check it
-webshell run -c config.yaml         # run (this is also the default subcommand)
+webshell genconfig -c config.toml   # write a default config
+webshell validate -c config.toml    # check it
+webshell run -c config.toml         # run (this is also the default subcommand)
 ```
+
+**Coming from a YAML config?** The first `run` converts it for you: it writes
+`config.toml` beside it and retires the original as `config.yaml.old`. Your
+deployment upgrades itself once, without downtime, and every later start reads
+TOML. When the path you name is missing, a `.yaml`/`.yml` of the same name is
+used instead — which is why a command line with no `-c` (the default is
+`config.toml`) finds and converts an existing `config.yaml` on its own.
+
+The conversion is deliberately one-way. If your start command names the YAML
+file explicitly, it will fail the *next* time, saying:
+
+```
+config error: config.yaml does not exist, but config.toml does. It was
+converted by an earlier run; the original is config.yaml.old. Start with
+-c config.toml instead.
+```
+
+That is the forcing function — update the flag and it never comes back. If you
+would rather convert on your own schedule, do it deliberately and leave the
+original in place:
+
+```sh
+webshell configrewrite -c config.yaml   # writes config.toml, keeps config.yaml
+```
+
+Nothing is ever deleted: these files hold your cookie key and TOTP seed, so
+removing the last copy is your call. YAML is read-only and transitional —
+support for it will be dropped, and the `serde_yaml_ng` dependency with it.
 
 Keys (all optional; `genconfig` writes the defaults):
 
@@ -254,11 +282,12 @@ need it: the page loads fine but the terminal sits at "reconnecting", with an
 Entries may be written with or without a scheme, and any path or trailing slash
 is stripped:
 
-```yaml
-allowed_origins:
-  - shell.example.com          # any scheme, this authority
-  - https://alt.example.com    # this scheme only
-  - https://a.example.com:8443 # non-default ports are part of the authority
+```toml
+allowed_origins = [
+  "shell.example.com",          # any scheme, this authority
+  "https://alt.example.com",    # this scheme only
+  "https://a.example.com:8443", # non-default ports are part of the authority
+]
 ```
 
 Set `strict_origin: true` to turn the list into a pin instead of an addition:
@@ -269,7 +298,7 @@ ignored while nothing is configured, which would reject every client.
 ## Run
 
 ```sh
-webshell run -c config.yaml
+webshell run -c config.toml
 # then browse to  https://<public_base_url>/webshell/
 ```
 

@@ -7,7 +7,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-/// User-facing configuration, loaded from a YAML file (all fields optional —
+/// User-facing configuration, loaded from a TOML file (all fields optional —
 /// missing ones fall back to the documented defaults).
 ///
 /// Authentication is always PAM, and only the **process owner** may log in
@@ -33,6 +33,7 @@ pub struct Settings {
     /// Externally-visible base URL, e.g. "https://shell.example.com". Used to
     /// build absolute share links, and accepted as a WebSocket Origin. A
     /// trailing slash is optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
     /// Bytes of recent output retained per slot for replay on reattach.
     pub scrollback_bytes: usize,
@@ -54,6 +55,7 @@ pub struct Settings {
     /// which would lock out every client.
     pub strict_origin: bool,
     /// base64 cookie signing key (>=64 bytes). Empty = ephemeral (resets on restart).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_base64: Option<String>,
 }
 
@@ -79,40 +81,140 @@ impl Default for Settings {
     }
 }
 
+/// Preferred config filename. A sibling `config.yaml` is still accepted; see
+/// `resolve_path`.
+pub const DEFAULT_CONFIG: &str = "config.toml";
+
+/// Pick the config file to use. An explicit path that exists always wins; if it
+/// does not, and a same-named legacy YAML file sits beside it, use that. This
+/// is what lets an existing deployment keep starting after the switch to TOML
+/// without its command line or working directory changing.
+pub fn resolve_path(path: &Path) -> std::path::PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    for legacy in ["yaml", "yml"] {
+        let candidate = path.with_extension(legacy);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
+pub fn is_legacy(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml")
+    )
+}
+
+/// Convert a legacy YAML config to TOML and move the original aside, returning
+/// the path now in force.
+///
+/// This is a one-way door by design: the next start with `-c config.yaml` finds
+/// nothing and fails, which is what forces the flag to be updated. A start that
+/// names the TOML file — including the default, which is why `run.sh` needs no
+/// `-c` — keeps working across the conversion without interruption.
+pub fn migrate_legacy(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let settings = Settings::load(Some(path))?;
+    let target = path.with_extension("toml");
+    if !target.exists() {
+        settings.save(&target)?;
+    }
+    let retired = path.with_extension(format!(
+        "{}.old",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
+    ));
+    std::fs::rename(path, &retired)
+        .map_err(|e| anyhow::anyhow!("moving {} aside: {e}", path.display()))?;
+    tracing::warn!(
+        "converted {} to {}; the original is now {}. \
+         Update your start command to use {} — the old path will not work again.",
+        path.display(),
+        target.display(),
+        retired.display(),
+        target.display()
+    );
+    Ok(target)
+}
+
+/// Explain a missing config when the TOML replacement is sitting right there,
+/// so the failure says what to do instead of just "not found". Covers both the
+/// automatic conversion and a manual `configrewrite` where the YAML was
+/// deleted afterwards.
+pub fn migration_hint(path: &Path) -> Option<String> {
+    if !is_legacy(path) {
+        return None;
+    }
+    let target = path.with_extension("toml");
+    if !target.exists() {
+        return None;
+    }
+    let retired = path.with_extension(format!(
+        "{}.old",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
+    ));
+    let converted = if retired.exists() {
+        format!(" It was converted by an earlier run; the original is {}.", retired.display())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} does not exist, but {} does.{} Start with -c {} instead.",
+        path.display(),
+        target.display(),
+        converted,
+        target.display()
+    ))
+}
+
 impl Settings {
+    /// Parse a config file. TOML is the format; YAML is still read so an
+    /// existing deployment keeps working, with a warning pointing at
+    /// `configrewrite`. YAML support exists only for that migration.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Settings> {
-        match path {
-            Some(p) => {
-                let text = std::fs::read_to_string(p)
-                    .map_err(|e| anyhow::anyhow!("reading config {}: {e}", p.display()))?;
-                serde_yaml::from_str(&text)
-                    .map_err(|e| anyhow::anyhow!("parsing config {}: {e}", p.display()))
-            }
-            None => Ok(Settings::default()),
+        let Some(p) = path else {
+            return Ok(Settings::default());
+        };
+        let text = std::fs::read_to_string(p)
+            .map_err(|e| anyhow::anyhow!("reading config {}: {e}", p.display()))?;
+        match toml::from_str(&text) {
+            Ok(settings) => Ok(settings),
+            Err(toml_err) => match serde_yaml_ng::from_str(&text) {
+                Ok(settings) => {
+                    tracing::warn!(
+                        "{} is YAML; webshell now uses TOML. Run \
+                         `webshell configrewrite -c {}` to convert it — YAML support will go away.",
+                        p.display(),
+                        p.display()
+                    );
+                    Ok(settings)
+                }
+                // Report the TOML error: that is the format the file should be
+                // in, so its message is the useful one.
+                Err(_) => Err(anyhow::anyhow!("parsing config {}: {toml_err}", p.display())),
+            },
         }
     }
 
-    pub fn sample_yaml() -> String {
-        serde_yaml::to_string(&Settings::default()).unwrap_or_default()
+    pub fn sample_toml() -> String {
+        toml::to_string_pretty(&Settings::default()).unwrap_or_default()
     }
 
-    pub fn persist_mfa_seed(path: &Path, seed: &str) -> anyhow::Result<()> {
+    /// Write these settings to `path` as TOML, atomically and mode-0600. The
+    /// file carries the cookie key and TOTP seed, so it is never world-readable
+    /// and never a partially-written file another process could load.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
-        let mut settings = if path.exists() {
-            Self::load(Some(path))?
-        } else {
-            Self::default()
-        };
-        settings.mfa_enabled = true;
-        settings.mfa_token_seed = Some(seed.to_string());
-        let yaml = serde_yaml::to_string(&settings)?;
+        let text = toml::to_string_pretty(self)?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("config.yaml");
+            .unwrap_or(DEFAULT_CONFIG);
         let tmp = parent.join(format!(".{name}.{}.tmp", random_token(8)));
         let result = (|| -> anyhow::Result<()> {
             let mut file = std::fs::OpenOptions::new()
@@ -120,7 +222,7 @@ impl Settings {
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            file.write_all(yaml.as_bytes())?;
+            file.write_all(text.as_bytes())?;
             file.sync_all()?;
             std::fs::rename(&tmp, path)?;
             Ok(())
@@ -129,6 +231,39 @@ impl Settings {
             let _ = std::fs::remove_file(&tmp);
         }
         result
+    }
+
+    /// Record a completed MFA enrollment. Always written as TOML: if the file
+    /// on disk is still legacy YAML, rewriting it in place would leave a
+    /// `.yaml` holding TOML, so the seed goes to the `.toml` name instead and
+    /// the stale YAML is left for the operator to delete.
+    pub fn persist_mfa_seed(path: &Path, seed: &str) -> anyhow::Result<()> {
+        let mut settings = if path.exists() {
+            Self::load(Some(path))?
+        } else {
+            Self::default()
+        };
+        settings.mfa_enabled = true;
+        settings.mfa_token_seed = Some(seed.to_string());
+
+        let is_legacy = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yaml") | Some("yml")
+        );
+        let target = if is_legacy {
+            path.with_extension("toml")
+        } else {
+            path.to_path_buf()
+        };
+        settings.save(&target)?;
+        if is_legacy {
+            tracing::warn!(
+                "MFA enrollment written to {} (TOML). {} is now stale — delete it.",
+                target.display(),
+                path.display()
+            );
+        }
+        Ok(())
     }
 }
 
