@@ -267,6 +267,8 @@ Every table and key is optional; a missing one falls back to the default.
 | | `client_secret` | *(none)* | OAuth client secret. |
 | `[terminals]` | `max_sessions` | `10` | Persistent slots per identity. |
 | | `scrollback_bytes` | `131072` | Replay buffer per slot. |
+| | `login_cmd` | *(passwd shell + `-l`)* | Shell override, as an argv array — see below. |
+| | `envs` | *(empty)* | Extra environment for every shell — see below. |
 | `[sharing]` | `enabled` | `true` | Master switch for share links. |
 | | `max_duration_secs` | `2592000` | Cap on a link's lifetime. |
 | `[local_passwords]` | *(per identity)* | — | Password per `local:` identity. **Must be last** — see below. |
@@ -296,6 +298,27 @@ hash. There is no fallback to a plaintext comparison, so someone who can read
 the config cannot log in by typing the hash itself. A value that is *not* hash
 shaped is treated as a literal password, which is convenient for a first run and
 compared in constant time. Prefer hashes.
+
+### Custom shell & environment
+
+By default every slot runs your login shell from the passwd database, as
+`<shell> -l`. To run a different shell (say fish while your passwd entry
+still says bash) and seed extra environment variables:
+
+```toml
+[terminals]
+login_cmd = ["/usr/bin/fish", "-l"]
+
+[terminals.envs]
+EDITOR = "vim"
+LANG = "en_US.UTF-8"
+```
+
+`login_cmd` is an argv array, used verbatim — no shell quoting or PATH
+tricks. `envs` is applied after the built-ins (`TERM`, `HOME`, `USER`,
+`LOGNAME`), so it can override them. Leave both out to keep the default
+behavior. Note `[terminals.envs]` is a sub-table: plain `[terminals]` keys
+must be written above it.
 
 ### Typical scenarios
 
