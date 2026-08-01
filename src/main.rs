@@ -359,9 +359,11 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
     tracing::info!("enrollment state: {}", enrollment_path.display());
 
     let sessions = Arc::new(SessionStore::new(config.session_ttl));
+    tracing::info!("login command: {:?}", config.login_cmd);
     let terminals = Arc::new(Terminals::new(
         config.slots_per_user,
         config.login_cmd.clone(),
+        config.envs.clone(),
         config.owner.clone(),
         config.owner_home.clone(),
         config.scrollback_cap,

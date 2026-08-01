@@ -166,6 +166,8 @@ pub struct Terminals {
     slots_per_user: usize,
     /// Login command template; `{user}` is substituted per user.
     login_cmd: Vec<String>,
+    /// Config-seeded extra environment for every spawn.
+    envs: std::collections::BTreeMap<String, String>,
     /// The OS account every shell runs as (login identities all share it).
     owner: String,
     /// The owner's home directory, for the spawned shell's cwd/$HOME.
@@ -183,6 +185,7 @@ impl Terminals {
     pub fn new(
         slots_per_user: usize,
         login_cmd: Vec<String>,
+        envs: std::collections::BTreeMap<String, String>,
         owner: String,
         owner_home: String,
         scrollback_cap: usize,
@@ -191,6 +194,7 @@ impl Terminals {
             pools: Mutex::new(HashMap::new()),
             slots_per_user,
             login_cmd,
+            envs,
             owner,
             owner_home,
             scrollback_cap,
@@ -250,6 +254,7 @@ impl Terminals {
                 user,
                 &self.owner,
                 &self.owner_home,
+                &self.envs,
                 cols,
                 rows,
                 self.scrollback_cap,
@@ -354,23 +359,16 @@ impl Terminals {
     }
 }
 
-fn spawn_terminal(
+/// Assemble the spawn command: resolved argv template plus environment.
+/// Split from `spawn_terminal` so the env/argv logic is testable without
+/// opening a PTY.
+fn build_command(
     login_cmd: &[String],
     user: &str,
     owner: &str,
     owner_home: &str,
-    cols: u16,
-    rows: u16,
-    scrollback_cap: usize,
-) -> anyhow::Result<Terminal> {
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-
+    envs: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<CommandBuilder> {
     // Resolve the command template. The current configuration contains no
     // user-controlled fields, but keeping substitution here makes Terminals
     // independent of how a command template is assembled.
@@ -395,6 +393,33 @@ fn spawn_terminal(
     cmd.env("USER", owner);
     cmd.env("LOGNAME", owner);
     cmd.cwd(owner_home);
+    // Config-seeded environment last, so it can override the built-ins.
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    Ok(cmd)
+}
+
+fn spawn_terminal(
+    login_cmd: &[String],
+    user: &str,
+    owner: &str,
+    owner_home: &str,
+    envs: &std::collections::BTreeMap<String, String>,
+    cols: u16,
+    rows: u16,
+    scrollback_cap: usize,
+) -> anyhow::Result<Terminal> {
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let cmd = build_command(login_cmd, user, owner, owner_home, envs)?;
+    let program = cmd.get_argv()[0].to_string_lossy().into_owned();
 
     let child = pair
         .slave
@@ -605,5 +630,37 @@ mod tests {
         assert_eq!(mode, AttachMode::Replay);
         assert_eq!(base, 6); // total 10 − ring 4
         assert_eq!(bytes, b"bbcc");
+    }
+
+    #[test]
+    fn build_command_seeds_and_overrides_env() {
+        let envs = [
+            ("EDITOR".to_string(), "vim".to_string()),
+            ("TERM".to_string(), "screen-256color".to_string()),
+        ]
+        .into();
+        let cmd = build_command(
+            &["/bin/sh".to_string(), "-l".to_string()],
+            "google:x@example.com",
+            "alice",
+            "/home/alice",
+            &envs,
+        )
+        .unwrap();
+        // Config wins over the built-in TERM; new keys are added.
+        assert_eq!(
+            cmd.get_env("TERM"),
+            Some(std::ffi::OsStr::new("screen-256color"))
+        );
+        assert_eq!(cmd.get_env("EDITOR"), Some(std::ffi::OsStr::new("vim")));
+        // Built-ins survive when not overridden.
+        assert_eq!(cmd.get_env("HOME"), Some(std::ffi::OsStr::new("/home/alice")));
+        assert_eq!(cmd.get_env("USER"), Some(std::ffi::OsStr::new("alice")));
+        assert_eq!(cmd.get_env("LOGNAME"), Some(std::ffi::OsStr::new("alice")));
+    }
+
+    #[test]
+    fn build_command_rejects_an_empty_command() {
+        assert!(build_command(&[], "u", "o", "/", &Default::default()).is_err());
     }
 }
