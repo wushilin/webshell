@@ -31,113 +31,22 @@
     button:hover { background: #3f7be0; }
     button:disabled { background: #39414f; color: #b7bdc8; cursor: progress; }
     .error { color: #ff6b6b; font-size: .85rem; margin: .75rem 0 0; }
+    .lead { color: #9aa0aa; font-size: .85rem; margin: .4rem 0 0; }
+    .or { text-align: center; color: #6b7280; font-size: .78rem; margin: 1rem 0 .2rem; }
+    button.google { background: #22262f; border: 1px solid #2c313c; }
+    button.google:hover { background: #2a2f39; }
+    .g { display: inline-block; width: 1.15rem; height: 1.15rem; line-height: 1.15rem;
+         border-radius: 50%; background: #fff; color: #4285f4; font-weight: 700;
+         text-align: center; margin-right: .5rem; vertical-align: -.15rem; }
   </style>
 </head>
 <body>
-  <form class="card" method="post" action="/webshell/login" autocomplete="off">
+  <div class="card">
     <h1>webshell</h1>
     <!--ERROR-->
-    <label for="username">Username</label>
-    <input id="username" name="username" type="text" autocomplete="username" autofocus required />
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required />
-    {{OTP_FIELD}}
-    <input type="hidden" name="csrf" value="{{CSRF}}" />
-    <p class="error" id="clientError" hidden></p>
-    <button id="signin" type="submit">Sign in</button>
-  </form>
-  <script nonce="{{NONCE}}">
-    // Sign-in is deliberately slow — PAM runs serialized behind a tarpit delay
-    // — so without feedback the button looks dead and gets clicked again. The
-    // second click resubmits the same one-time code, which the server now
-    // refuses as a replay. Show the request is in flight and allow only one.
-    // A native form POST that is written into a keep-alive socket the network
-    // has already dropped is simply lost: the browser will not retry a POST,
-    // so it sits "pending" until it times out, and the page looks dead. That
-    // is the "click twice" behaviour — the second click opened a fresh
-    // connection. Owning the request lets us retry it on a new one instead.
-    (function () {
-      const form = document.querySelector("form");
-      const btn = document.getElementById("signin");
-      const clientError = document.getElementById("clientError");
-      const LABEL = "Sign in";
-      let sent = false;
-
-      function rearm() {
-        sent = false;
-        btn.disabled = false;
-        btn.textContent = LABEL;
-      }
-
-      function fail(message) {
-        clientError.textContent = message;
-        clientError.hidden = false;
-        rearm();
-      }
-
-      // A rejected fetch means no response was received at all, so the request
-      // almost certainly never reached the server — safe to send again. A
-      // response of any status is final: retrying it could spend a second
-      // one-time code.
-      async function post(body) {
-        try {
-          return await fetch(form.action, {
-            method: "POST", body, credentials: "same-origin",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          });
-        } catch (_) {
-          return await fetch(form.action, {
-            method: "POST", body, credentials: "same-origin",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          });
-        }
-      }
-
-      form.addEventListener("submit", async (e) => {
-        if (sent) { e.preventDefault(); return; }
-        if (!form.checkValidity()) return;   // let the browser report it; stay armed
-        e.preventDefault();                  // from here the fetch owns it
-        sent = true;
-        clientError.hidden = true;
-        btn.disabled = true;
-        btn.textContent = "Signing in…";
-
-        let res;
-        try {
-          res = await post(new URLSearchParams(new FormData(form)));
-        } catch (_) {
-          fail("Could not reach the server. Check your connection and try again.");
-          return;
-        }
-        // Authenticated: fetch followed the redirect, so go where it landed.
-        if (res.redirected) {
-          window.location.assign(res.url);
-          return;
-        }
-        // A stale CSRF (an old tab, or a session that rotated underneath us)
-        // is answered as plain text; only a reload can supply a fresh one.
-        if (res.status === 403) {
-          window.location.reload();
-          return;
-        }
-        // Otherwise the server re-rendered the form with an error. Adopt its
-        // message and its new CSRF in place, rather than replacing the
-        // document — this page's script nonce belongs to *this* response.
-        try {
-          const doc = new DOMParser().parseFromString(await res.text(), "text/html");
-          const message = doc.querySelector(".error");
-          const csrf = doc.querySelector('input[name="csrf"]');
-          if (csrf) form.querySelector('input[name="csrf"]').value = csrf.value;
-          fail(message ? message.textContent.trim() : "Sign-in failed. Please try again.");
-        } catch (_) {
-          fail("Sign-in failed. Please try again.");
-        }
-        form.querySelector("#otp")?.focus();
-      });
-
-      // Back-navigation can restore this page from the bfcache mid-submit.
-      window.addEventListener("pageshow", rearm);
-    })();
-  </script>
+    <!--LOCALFORM-->
+    <!--OR-->
+    <!--GOOGLEFORM-->
+  </div>
 </body>
 </html>

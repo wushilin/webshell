@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="same-origin" />
+  <title>webshell · verify</title>
+  <link rel="icon" href="/webshell/favicon.ico" sizes="any" />
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: system-ui,sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; background:#0f1115; color:#e6e6e6; }
+    .card { background:#1a1d24; padding:1.6rem 1.8rem; border-radius:12px; width:min(90vw,340px); box-shadow:0 10px 40px rgba(0,0,0,.5); }
+    h1 { font-size:1.1rem; margin:0 0 .3rem; }
+    .who { color:#9aa0aa; font-size:.82rem; margin:0 0 1.1rem; overflow-wrap:anywhere; }
+    label { display:block; font-size:.8rem; color:#9aa0aa; margin:.75rem 0 .25rem; }
+    input { width:100%; box-sizing:border-box; padding:.6rem .7rem; border-radius:8px; border:1px solid #2c313c; background:#0f1115; color:#e6e6e6; font-size:1rem; letter-spacing:.15em; }
+    input:focus { outline:2px solid #4c8bf5; border-color:transparent; }
+    button { margin-top:1.2rem; width:100%; padding:.65rem; border:0; border-radius:8px; background:#4c8bf5; color:#fff; font-size:.95rem; font-weight:600; cursor:pointer; }
+    button:hover { background:#3f7be0; }
+    button:disabled { background:#39414f; color:#b7bdc8; cursor:progress; }
+    .error { color:#ff6b6b; font-size:.85rem; margin:.75rem 0 0; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/webshell/mfa" autocomplete="off">
+    <h1>Two-factor</h1>
+    <p class="who">Signed in as {{USER}}</p>
+    <!--ERROR-->
+    <label for="otp">Authenticator code</label>
+    <input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code"
+           pattern="[0-9]{6}" maxlength="6" required autofocus />
+    <input type="hidden" name="csrf" value="{{CSRF}}" />
+    <p class="error" id="clientError" hidden></p>
+    <button id="verify" type="submit">Verify</button>
+  </form>
+  <script nonce="{{NONCE}}">
+    // Same one-submission guard as the login form: verification runs behind a
+    // serialized tarpit, and a second click would resubmit a code the server
+    // has already consumed.
+    (function () {
+      const form = document.querySelector("form");
+      const btn = document.getElementById("verify");
+      let sent = false;
+      function rearm() { sent = false; btn.disabled = false; btn.textContent = "Verify"; }
+      form.addEventListener("submit", (e) => {
+        if (sent) { e.preventDefault(); return; }
+        if (!form.checkValidity()) return;
+        sent = true;
+        setTimeout(() => { btn.disabled = true; btn.textContent = "Verifying…"; }, 0);
+        setTimeout(rearm, 12000);          // never latch
+      });
+      window.addEventListener("pageshow", rearm);
+    })();
+  </script>
+</body>
+</html>

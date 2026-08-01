@@ -166,6 +166,8 @@ pub struct Terminals {
     slots_per_user: usize,
     /// Login command template; `{user}` is substituted per user.
     login_cmd: Vec<String>,
+    /// The OS account every shell runs as (login identities all share it).
+    owner: String,
     /// The owner's home directory, for the spawned shell's cwd/$HOME.
     owner_home: String,
     scrollback_cap: usize,
@@ -181,6 +183,7 @@ impl Terminals {
     pub fn new(
         slots_per_user: usize,
         login_cmd: Vec<String>,
+        owner: String,
         owner_home: String,
         scrollback_cap: usize,
     ) -> Self {
@@ -188,6 +191,7 @@ impl Terminals {
             pools: Mutex::new(HashMap::new()),
             slots_per_user,
             login_cmd,
+            owner,
             owner_home,
             scrollback_cap,
         }
@@ -244,6 +248,7 @@ impl Terminals {
             let term = spawn_terminal(
                 &self.login_cmd,
                 user,
+                &self.owner,
                 &self.owner_home,
                 cols,
                 rows,
@@ -352,6 +357,7 @@ impl Terminals {
 fn spawn_terminal(
     login_cmd: &[String],
     user: &str,
+    owner: &str,
     owner_home: &str,
     cols: u16,
     rows: u16,
@@ -382,9 +388,12 @@ fn spawn_terminal(
     // Do not trust the service manager's inherited identity environment. The
     // process is already running as the owner, and these values come from that
     // effective user's passwd entry.
+    // These name the OS account the shell actually runs as. `user` is the
+    // login identity (google:someone@example.com) and only keys the slot pool
+    // — putting it in $USER would disagree with `whoami`, which reads the uid.
     cmd.env("HOME", owner_home);
-    cmd.env("USER", user);
-    cmd.env("LOGNAME", user);
+    cmd.env("USER", owner);
+    cmd.env("LOGNAME", owner);
     cmd.cwd(owner_home);
 
     let child = pair

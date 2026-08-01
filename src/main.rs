@@ -1,5 +1,8 @@
 mod config;
-mod pam;
+mod enrollment;
+mod identity;
+mod localauth;
+mod oidc;
 mod pty;
 mod session;
 mod share;
@@ -25,6 +28,8 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
 use config::{Config, Settings};
+use enrollment::EnrollmentStore;
+use identity::Identity;
 use session::SessionStore;
 use share::ShareStore;
 use terminals::Terminals;
@@ -92,10 +97,15 @@ struct AppState {
     prefs: Arc<Mutex<HashMap<String, ClientPrefs>>>,
     /// Brute-force throttle for the login endpoint.
     login_guard: Arc<LoginGuard>,
-    mfa_seed: Arc<Mutex<Option<String>>>,
-    mfa_initialized: Arc<std::sync::atomic::AtomicBool>,
-    /// Makes each accepted OTP single-use; see `totp::ReplayGuard`.
-    otp_used: Arc<totp::ReplayGuard>,
+    /// Per-identity `sub` pin and TOTP secret.
+    enrollment: Arc<EnrollmentStore>,
+    /// Outbound client for the Google token exchange. Reused so TLS sessions
+    /// and connections are pooled across logins.
+    http: reqwest::Client,
+    /// One replay guard per identity. A single shared guard would let one
+    /// user's spent code reject another user whose authenticator happens to
+    /// show the same six digits — a false denial, and a cross-user leak.
+    otp_used: Arc<Mutex<HashMap<String, Arc<totp::ReplayGuard>>>>,
     config_path: Arc<std::path::PathBuf>,
     key: Key,
 }
@@ -122,14 +132,16 @@ enum Command {
     Genconfig(ConfigArgs),
     /// Load a config file and report whether it is valid.
     Validate(ConfigArgs),
-    /// Rewrite a config file as TOML (converts a legacy YAML one).
-    Configrewrite(ConfigArgs),
+    /// Hash a password for a local identity, to paste into the config.
+    Passwd {
+        /// The identity, e.g. local:alice
+        id: String,
+    },
 }
 
 #[derive(clap::Args)]
 struct ConfigArgs {
-    /// Path to the TOML config file. If it is missing, a legacy `.yaml`/`.yml`
-    /// file of the same name is used instead.
+    /// Path to the TOML config file.
     #[arg(short, long, default_value = config::DEFAULT_CONFIG, env = "WEBSHELL_CONFIG")]
     config: std::path::PathBuf,
 }
@@ -153,40 +165,45 @@ async fn main() {
         // genconfig writes a NEW file, so it takes the path literally: falling
         // back to an existing legacy name would be a request to overwrite it.
         Command::Genconfig(a) => genconfig(&a.config),
-        Command::Validate(a) => validate(&config::resolve_path(&a.config)),
-        Command::Configrewrite(a) => configrewrite(&config::resolve_path(&a.config)),
-        Command::Run(a) => run_server(&config::resolve_path(&a.config)).await,
+        Command::Validate(a) => validate(&a.config.clone()),
+        Command::Passwd { id } => passwd(&id),
+        Command::Run(a) => run_server(&a.config.clone()).await,
     }
 }
 
-/// Read a config in either format and write it back out as TOML. The source is
-/// left alone: converting is not the moment to delete the only copy of a file
-/// holding the cookie key and TOTP seed.
-fn configrewrite(path: &std::path::Path) {
-    let settings = match Settings::load(Some(path)) {
-        Ok(s) => s,
+/// Hash a password and print the config line for it. The plaintext is read
+/// from stdin and never written anywhere — the operator pastes only the hash.
+fn passwd(id: &str) {
+    let identity: Identity = match id.parse() {
+        Ok(i) => i,
         Err(e) => {
-            eprintln!("INVALID: {e}");
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    let target = path.with_extension("toml");
-    if target != path && target.exists() {
-        eprintln!("refusing to overwrite existing {}", target.display());
+    if identity.provider() != identity::Provider::Local {
+        eprintln!("only local: identities have a webshell-managed password");
         std::process::exit(1);
     }
-    match settings.save(&target) {
-        Ok(()) => {
-            println!("wrote {}", target.display());
-            if target != path {
-                println!(
-                    "{} is no longer used; delete it once you are happy.",
-                    path.display()
-                );
-            }
+    eprint!("password for {identity}: ");
+    let mut password = String::new();
+    if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut password).is_err() {
+        eprintln!("could not read the password");
+        std::process::exit(1);
+    }
+    let password = password.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        eprintln!("refusing to set an empty password");
+        std::process::exit(1);
+    }
+    match localauth::hash(password) {
+        Ok(hash) => {
+            eprintln!();
+            println!("[local_passwords]");
+            println!("\"{identity}\" = \"{hash}\"");
         }
         Err(e) => {
-            eprintln!("could not write {}: {e}", target.display());
+            eprintln!("{e}");
             std::process::exit(1);
         }
     }
@@ -227,28 +244,8 @@ async fn run_server(config_path: &std::path::Path) {
     // A command line that names a YAML file which is already gone gets the
     // migration story rather than a bare "not found" — this is the start
     // command that has to be updated.
-    if config::is_legacy(config_path) && !config_path.exists() {
-        if let Some(hint) = config::migration_hint(config_path) {
-            eprintln!("config error: {hint}");
-            std::process::exit(1);
-        }
-    }
-
     let config_path = match config::choose(config_path) {
         Ok(config::ConfigChoice::Use(p)) => p,
-        // Converted: stop rather than serve from a file written moments ago.
-        Ok(config::ConfigChoice::Converted { converted, retired }) => {
-            eprintln!(
-                "converted {} to {}\n\
-                 the original is kept as {}\n\n\
-                 not starting the server: review {}, then start again",
-                config_path.display(),
-                converted.display(),
-                retired.display(),
-                converted.display()
-            );
-            std::process::exit(1);
-        }
         Ok(config::ConfigChoice::Missing(looked_for)) => {
             eprintln!(
                 "no config found at {}\n\nwrite one with: webshell genconfig -c {}",
@@ -276,23 +273,82 @@ async fn run_server(config_path: &std::path::Path) {
     };
 
     let config = Config::from_settings(settings);
-    if config.mfa_enabled
-        && config
-            .mfa_token_seed
-            .as_deref()
-            .is_some_and(|seed| !totp::valid_seed(seed))
-    {
-        eprintln!("startup error: mfa_token_seed is not a valid base32 TOTP seed");
+
+    // Everything a login depends on is checked here, at startup, rather than
+    // discovered by the first person who tries to sign in.
+    if let Err(e) = identity::validate(&config.users) {
+        eprintln!("startup error: {e}");
         std::process::exit(1);
     }
-    let mfa_initialized = Arc::new(std::sync::atomic::AtomicBool::new(
-        config.mfa_token_seed.is_some(),
-    ));
-    let mfa_seed = Arc::new(Mutex::new(config.mfa_token_seed.clone()));
+    // A method is "usable" only if it is both enabled AND configured. Listing
+    // it without the pieces it needs would show a button that cannot work.
+    let google_enabled = config.login_methods.contains(&identity::Provider::Google);
+    if !config.local_usable() && !config.google_usable() {
+        eprintln!("invalid config: No login methods possible.");
+        eprintln!("  local:  needs \"local\" in login_methods and at least one local: user");
+        eprintln!(
+            "  google: needs \"google\" in login_methods, google_client_id, \
+             google_client_secret and public_base_url"
+        );
+        std::process::exit(1);
+    }
+    if google_enabled
+        && (config.google_client_id.is_none() || config.google_client_secret.is_none())
+    {
+        eprintln!(
+            "startup error: google_client_id and google_client_secret are required \n\
+             (Cloud Console -> APIs & Services -> Credentials -> OAuth client ID -> Web application)"
+        );
+        std::process::exit(1);
+    }
+    let redirect = config.redirect_uri();
+    if google_enabled && redirect.is_none() {
+        eprintln!(
+            "startup error: public_base_url is required — it is what the Google \n\
+             redirect URI is derived from, and it must match the one registered \n\
+             in the Cloud Console"
+        );
+        std::process::exit(1);
+    }
+    if let Some(uri) = &redirect {
+        tracing::info!("google sign-in redirect URI: {uri}");
+    }
+    tracing::info!(
+        "login methods: {}",
+        config
+            .login_methods
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for user in &config.users {
+        tracing::info!("permitted user: {user}");
+    }
+
+    // Enrollment lives beside the config unless an absolute path is given.
+    let enrollment_path = if config.mfa_enrollment_path.is_absolute() {
+        config.mfa_enrollment_path.clone()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(&config.mfa_enrollment_path)
+    };
+    let enrollment = match EnrollmentStore::load(&enrollment_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            eprintln!("startup error: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("enrollment state: {}", enrollment_path.display());
+
     let sessions = Arc::new(SessionStore::new(config.session_ttl));
     let terminals = Arc::new(Terminals::new(
         config.slots_per_user,
         config.login_cmd.clone(),
+        config.owner.clone(),
         config.owner_home.clone(),
         config.scrollback_cap,
     ));
@@ -312,9 +368,12 @@ async fn run_server(config_path: &std::path::Path) {
         shares: shares.clone(),
         prefs: Arc::new(Mutex::new(HashMap::new())),
         login_guard: Arc::new(LoginGuard::new()),
-        mfa_seed,
-        mfa_initialized,
-        otp_used: Arc::new(totp::ReplayGuard::new()),
+        enrollment,
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("building the HTTP client"),
+        otp_used: Arc::new(Mutex::new(HashMap::new())),
         config_path: Arc::new(config_path.to_path_buf()),
         key,
     };
@@ -355,8 +414,11 @@ async fn run_server(config_path: &std::path::Path) {
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let app = Router::new()
-        .route("/webshell/login", get(login_page).post(login_submit))
-        .route("/webshell/mfa", get(mfa_setup_page).post(mfa_setup_submit))
+        .route("/webshell/login", get(login_page))
+        .route("/webshell/login/local", post(local_login))
+        .route("/webshell/oauth/start", post(oauth_start))
+        .route("/webshell/oauth/callback", get(oauth_callback))
+        .route("/webshell/mfa", get(mfa_page).post(mfa_submit))
         .route("/favicon.ico", get(favicon))
         .route("/webshell/favicon.ico", get(favicon))
         // Vendored browser assets. Public by necessity — the share-link viewer
@@ -539,6 +601,10 @@ fn ws_sources(headers: &HeaderMap) -> String {
 /// CSP for the HTML pages. Scripts are same-origin plus one per-response nonce
 /// for the page's own inline block, so an injected `<script>` cannot execute.
 /// Styles need 'unsafe-inline': xterm injects stylesheets at runtime.
+/// `form-action` is enforced across the whole redirect chain, not just a
+/// form's immediate target. The sign-in POST goes to us, but our 303 hands the
+/// browser to Google — without naming Google here, browsers block that redirect
+/// silently and the button simply appears dead.
 fn csp_header(nonce: &str, ws: &str) -> String {
     format!(
         "default-src 'none'; \
@@ -547,7 +613,7 @@ fn csp_header(nonce: &str, ws: &str) -> String {
          img-src 'self' data:; \
          font-src 'self'; \
          connect-src 'self'{ws}; \
-         form-action 'self'; \
+         form-action 'self' https://accounts.google.com; \
          base-uri 'none'; \
          frame-ancestors 'none'"
     )
@@ -585,11 +651,20 @@ fn html_headers(
 
 // ---- cookie / session helpers ---------------------------------------------
 
+/// `Lax`, not `Strict`, and that is forced by the OIDC callback: Google sends
+/// the browser back to us as a cross-site top-level navigation, and `Strict`
+/// withholds the cookie on exactly that, so the login would arrive with no
+/// session and no way to reach its own `state`/`nonce`.
+///
+/// Lax still withholds the cookie on cross-site POSTs and subresource requests,
+/// which is where CSRF lives — and every state-changing route here carries an
+/// explicit CSRF token besides, so the token is the real defence and SameSite
+/// is defence in depth.
 fn session_cookie(state: &AppState, id: String) -> Cookie<'static> {
     Cookie::build((COOKIE_NAME, id))
         .path(BASE_PATH)
         .http_only(true)
-        .same_site(SameSite::Strict)
+        .same_site(SameSite::Lax)
         .secure(state.config.cookie_secure)
         .build()
 }
@@ -667,164 +742,348 @@ async fn login_page(
 }
 
 #[derive(Deserialize)]
-struct LoginForm {
+struct LocalLoginForm {
+    csrf: String,
     username: String,
     password: String,
-    #[serde(default)]
-    otp: String,
-    csrf: String,
 }
 
-async fn login_submit(
+/// Log in with a system account's password, verified by `su` on a pty. Nothing
+/// here links to PAM, which is what lets this binary be statically linked.
+async fn local_login(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     headers: HeaderMap,
-    Form(form): Form<LoginForm>,
+    Form(form): Form<LocalLoginForm>,
 ) -> Response {
     let Some((id, session)) = current_session(&state, &jar) else {
-        // The pre-auth session expired (PREAUTH_TTL) or its cookie was lost.
-        // This used to bounce back to the login page with no log line and no
-        // message, which reads as "the button did nothing" — and the retry
-        // only worked because the reload minted a fresh session. Hand back a
-        // usable form with a new session and say what happened, so the very
-        // next attempt succeeds.
-        tracing::info!("login: submit with no live session (expired or missing cookie)");
-        let (jar, id) = ensure_session(&state, jar);
-        let csrf = state.sessions.get(&id).map(|s| s.csrf).unwrap_or_default();
-        let nonce = config::random_token(16);
-        let html = render_login(
+        return login_error(
             &state,
-            &csrf,
-            &nonce,
-            "<p class=\"error\">This page had been open too long, so the login form expired. \
-             Please enter your details again — including a fresh authenticator code.</p>",
+            &jar,
+            &headers,
+            "Your login page expired. Try again.",
         );
-        return (jar, html_headers(&nonce, true, &headers), Html(html)).into_response();
     };
     if !csrf_matches(&session.csrf, &form.csrf) {
-        tracing::warn!("login: rejected — CSRF mismatch");
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
+    if !state.config.local_usable() {
+        return (StatusCode::FORBIDDEN, "local login is disabled").into_response();
+    }
 
-    // Serialize PAM calls before calculating the delay, so a burst cannot race
-    // past the failure counter and exhaust the blocking pool.
-    let _login_permit = state.login_guard.acquire().await;
+    // Check the allowlist BEFORE spending a password check: no reason to let an
+    // unlisted name drive su, and it keeps the tarpit for real attempts.
+    let who = Identity::new(identity::Provider::Local, &form.username);
+    if !state.config.permits(&who) {
+        state.login_guard.record_failure();
+        tracing::warn!("login refused: {who} is not on the allowlist");
+        return login_error(&state, &jar, &headers, "Wrong username or password.");
+    }
+
+    let _permit = state.login_guard.acquire().await;
     tokio::time::sleep(state.login_guard.delay()).await;
 
-    // PAM auth may block; run it off the async runtime.
-    let cfg = state.config.clone();
-    let username = form.username.clone();
+    // Argon2 is deliberately slow; keep it off the async runtime.
+    let stored = state.config.local_password(&who).map(|h| h.to_string());
     let password = form.password.clone();
-    let result = tokio::task::spawn_blocking(move || cfg.authenticate(&username, &password))
-        .await
-        .ok()
-        .flatten();
+    let verified = match stored {
+        Some(hash) => tokio::task::spawn_blocking(move || localauth::verify(&hash, &password))
+            .await
+            .unwrap_or_else(|e| Err(format!("password check task failed: {e}"))),
+        // Allowlisted but no password set: a configuration gap, not a wrong
+        // password, and it must not read as one.
+        None => Err(format!("no password is configured for {who}")),
+    };
 
-    let Some(canonical_user) = result else {
-        state.login_guard.record_failure();
-        tracing::warn!("failed login for user {:?}", form.username);
-        let nonce = config::random_token(16);
-        let html = render_login(
-            &state,
-            &session.csrf,
-            &nonce,
-            "<p class=\"error\">Invalid username or password.</p>",
-        );
+    match verified {
+        Ok(true) => {}
+        Ok(false) => {
+            state.login_guard.record_failure();
+            tracing::warn!("failed local login for {who}");
+            return login_error(&state, &jar, &headers, "Wrong username or password.");
+        }
+        Err(e) => {
+            // A broken checker is not a wrong password, and must not read as one.
+            tracing::error!("local password check failed to run: {e}");
+            return login_error(
+                &state,
+                &jar,
+                &headers,
+                "The server could not check that password. See the log.",
+            );
+        }
+    }
+
+    let user = who.to_string();
+    if !state.config.mfa_required {
+        state.login_guard.record_success();
+        let new_id = state.sessions.login(&id, &user);
+        let jar = jar.add(session_cookie(&state, new_id));
+        tracing::info!("login success for {user}");
+        return (jar, Redirect::to("/webshell/private/")).into_response();
+    }
+    let new_id = state.sessions.begin_mfa(&id, &user);
+    let jar = jar.add(session_cookie(&state, new_id));
+    (jar, Redirect::to("/webshell/mfa")).into_response()
+}
+
+/// Start a Google sign-in. POST (not GET) so it carries the CSRF token and
+/// cannot be triggered by a third-party page linking at us.
+async fn oauth_start(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !state.config.google_usable() {
+        return (StatusCode::FORBIDDEN, "Google sign-in is disabled").into_response();
+    }
+    let Some((id, session)) = current_session(&state, &jar) else {
+        return Redirect::to("/webshell/login").into_response();
+    };
+    if !csrf_matches(&session.csrf, &form.csrf) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let (Some(client_id), Some(redirect_uri)) = (
+        state.config.google_client_id.as_deref(),
+        state.config.redirect_uri(),
+    ) else {
         return (
-            StatusCode::UNAUTHORIZED,
-            html_headers(&nonce, true, &headers),
-            Html(html),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Google sign-in is not configured",
+        )
+            .into_response();
+    };
+    // state/nonce/verifier live on the session, so only this browser can
+    // complete the login they started.
+    let flow = oidc::Flow::new();
+    let url = oidc::authorize_url(client_id, &redirect_uri, &flow);
+    state.sessions.set_oauth(&id, Some(flow));
+    Redirect::to(&url).into_response()
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Where Google sends the browser back. Everything that can go wrong here is
+/// answered with the same page and a generic message; the specific reason goes
+/// to the log, so a failed login never tells an attacker which check tripped.
+async fn oauth_callback(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    if !state.config.google_usable() {
+        return (StatusCode::FORBIDDEN, "Google sign-in is disabled").into_response();
+    }
+    let Some((id, session)) = current_session(&state, &jar) else {
+        return login_error(
+            &state,
+            &jar,
+            &headers,
+            "Your login session expired. Try again.",
+        );
+    };
+    if let Some(error) = q.error.as_deref() {
+        tracing::warn!("google sign-in returned error {error:?}");
+        return login_error(&state, &jar, &headers, "Google declined the sign-in.");
+    }
+    let (Some(flow), Some(code), Some(returned_state)) =
+        (session.oauth.clone(), q.code.as_deref(), q.state.as_deref())
+    else {
+        return login_error(
+            &state,
+            &jar,
+            &headers,
+            "That sign-in did not complete. Try again.",
+        );
+    };
+    // Constant-time: `state` is a per-login secret like any other.
+    if !csrf_matches(&flow.state, returned_state) {
+        tracing::warn!("google callback: state mismatch");
+        return login_error(
+            &state,
+            &jar,
+            &headers,
+            "That sign-in did not complete. Try again.",
+        );
+    }
+    // One-shot: a code, and this flow, are good for exactly one attempt.
+    state.sessions.set_oauth(&id, None);
+
+    let (Some(client_id), Some(client_secret), Some(redirect_uri)) = (
+        state.config.google_client_id.as_deref(),
+        state.config.google_client_secret.as_deref(),
+        state.config.redirect_uri(),
+    ) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Google sign-in is not configured",
         )
             .into_response();
     };
 
-    if state.config.mfa_enabled {
-        let initialized = state
-            .mfa_initialized
-            .load(std::sync::atomic::Ordering::Acquire);
-        let existing_seed = util::lock(&state.mfa_seed).clone();
-        if initialized {
-            let Some(seed) = existing_seed else {
-                tracing::error!("MFA is initialized but its seed is unavailable");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "MFA configuration error")
-                    .into_response();
-            };
-            // Evaluate once: the time window can roll between two calls, and
-            // re-checking after consuming the code could reject a login whose
-            // code has already been spent. Short-circuit order also means only
-            // a code that verified is consumed, so a wrong guess cannot evict
-            // the record of a real one.
-            let verified = totp::verify(&seed, &form.otp);
-            let accepted = verified && state.otp_used.accept(&form.otp);
-            if !accepted {
-                state.login_guard.record_failure();
-                let nonce = config::random_token(16);
-                // A replay is named explicitly: the holder already had a valid
-                // code, so this tells them nothing they did not know, and it is
-                // the difference between "try again" and "wait 30 seconds".
-                let message = if verified {
-                    "<p class=\"error\">That code has already been used. \
-                     Wait for your authenticator to show the next one.</p>"
-                } else {
-                    "<p class=\"error\">Invalid username, password, or OTP.</p>"
-                };
-                let html = render_login(&state, &session.csrf, &nonce, message);
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    html_headers(&nonce, true, &headers),
-                    Html(html),
-                )
-                    .into_response();
-            }
-        } else {
-            if existing_seed.is_none() {
-                *util::lock(&state.mfa_seed) = Some(totp::generate_seed());
-            }
-            let new_id = state.sessions.begin_mfa(&id, &canonical_user);
-            let jar = jar.add(session_cookie(&state, new_id));
-            return (jar, Redirect::to("/webshell/mfa")).into_response();
+    let verified = match oidc::exchange(
+        &state.http,
+        client_id,
+        client_secret,
+        &redirect_uri,
+        code,
+        &flow,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("google sign-in failed: {e}");
+            return login_error(
+                &state,
+                &jar,
+                &headers,
+                "Could not verify that Google account.",
+            );
+        }
+    };
+
+    if !state.config.permits(&verified.identity) {
+        tracing::warn!(
+            "login refused: {} is not on the allowlist",
+            verified.identity
+        );
+        return login_error(
+            &state,
+            &jar,
+            &headers,
+            "That account is not permitted to use this server.",
+        );
+    }
+    // Same address, different Google account: refuse rather than hand over the
+    // previous holder's slots and enrollment.
+    match state
+        .enrollment
+        .pin_subject(&verified.identity, &verified.sub)
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "login refused: {} now resolves to a different Google account",
+                verified.identity
+            );
+            return login_error(
+                &state,
+                &jar,
+                &headers,
+                "That address now belongs to a different Google account.",
+            );
+        }
+        Err(e) => {
+            tracing::error!("could not record enrollment: {e}");
+            return login_error(
+                &state,
+                &jar,
+                &headers,
+                "Server could not record this login.",
+            );
         }
     }
 
-    // Success: rotate the session id (fixation defense).
-    state.login_guard.record_success();
-    let new_id = state.sessions.login(&id, &canonical_user);
+    let user = verified.identity.to_string();
+    if !state.config.mfa_required {
+        let new_id = state.sessions.login(&id, &user);
+        let jar = jar.add(session_cookie(&state, new_id));
+        tracing::info!("login success for {user}");
+        return (jar, Redirect::to("/webshell/private/")).into_response();
+    }
+    // MFA is required: hand off to enrollment or verification, still unauthenticated.
+    let new_id = state.sessions.begin_mfa(&id, &user);
     let jar = jar.add(session_cookie(&state, new_id));
-    tracing::info!("login success for user {:?}", canonical_user);
-    (jar, Redirect::to("/webshell/private/")).into_response()
+    (jar, Redirect::to("/webshell/mfa")).into_response()
 }
 
-fn otp_field(show: bool) -> &'static str {
-    if show {
-        "<label for=\"otp\">Authenticator code</label>\
-         <input id=\"otp\" name=\"otp\" type=\"text\" inputmode=\"numeric\" \
-         autocomplete=\"one-time-code\" pattern=\"[0-9]{6}\" maxlength=\"6\" required />"
-    } else {
-        ""
-    }
+/// Re-render the login page with a message. Used for every callback failure so
+/// the browser lands somewhere useful instead of on a bare status code.
+fn login_error(
+    state: &AppState,
+    jar: &SignedCookieJar,
+    headers: &HeaderMap,
+    message: &str,
+) -> Response {
+    let csrf = current_session(state, jar)
+        .map(|(_, s)| s.csrf)
+        .unwrap_or_default();
+    let nonce = config::random_token(16);
+    let html = render_login(
+        state,
+        &csrf,
+        &nonce,
+        &format!("<p class=\"error\">{}</p>", html_escape(message)),
+    );
+    (html_headers(&nonce, true, headers), Html(html)).into_response()
 }
 
 fn render_login(state: &AppState, csrf: &str, nonce: &str, error: &str) -> String {
-    let initialized = state
-        .mfa_initialized
-        .load(std::sync::atomic::Ordering::Acquire);
-    include_str!("../static/login.html")
-        .replace("{{CSRF}}", &html_escape(csrf))
-        .replace("{{NONCE}}", &html_escape(nonce))
-        .replace(
-            "{{OTP_FIELD}}",
-            otp_field(state.config.mfa_enabled && initialized),
+    let local = state.config.local_usable();
+    let google = state.config.google_usable();
+    let csrf_field = format!(
+        "<input type=\"hidden\" name=\"csrf\" value=\"{}\" />",
+        html_escape(csrf)
+    );
+    // Built, not commented out: a disabled method should be absent from the
+    // page, not merely invisible in it.
+    let local_form = if local {
+        format!(
+            "<form method=\"post\" action=\"/webshell/login/local\" autocomplete=\"off\">\
+             <label for=\"username\">Username</label>\
+             <input id=\"username\" name=\"username\" autocomplete=\"username\" autofocus required />\
+             <label for=\"password\">Password</label>\
+             <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required />\
+             {csrf_field}<button type=\"submit\">Sign in</button></form>"
         )
+    } else {
+        String::new()
+    };
+    let google_form = if google {
+        format!(
+            "<form method=\"post\" action=\"/webshell/oauth/start\">{csrf_field}\
+             <button class=\"google\" type=\"submit\">\
+             <span class=\"g\">G</span> Continue with Google</button></form>"
+        )
+    } else {
+        String::new()
+    };
+    let divider = if local && google {
+        "<p class=\"or\">or</p>"
+    } else {
+        ""
+    };
+    include_str!("../static/login.html")
+        .replace("<!--LOCALFORM-->", &local_form)
+        .replace("<!--GOOGLEFORM-->", &google_form)
+        .replace("<!--OR-->", divider)
+        .replace("{{NONCE}}", &html_escape(nonce))
         .replace("<!--ERROR-->", error)
 }
 
 #[derive(Deserialize)]
-struct MfaSetupForm {
+struct MfaForm {
     csrf: String,
     otp: String,
+    /// Candidate secret during enrollment; absent when already enrolled.
+    #[serde(default)]
+    seed: Option<String>,
 }
 
-async fn mfa_setup_page(
+/// The TOTP step: enrollment for an identity with no secret yet, verification
+/// for one that has. Reached only with an `mfa_pending` session, which is
+/// issued solely by a completed Google sign-in.
+async fn mfa_page(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     headers: HeaderMap,
@@ -832,19 +1091,36 @@ async fn mfa_setup_page(
     let Some((_, session)) = current_session(&state, &jar).filter(|(_, s)| s.mfa_pending) else {
         return Redirect::to("/webshell/login").into_response();
     };
-    render_mfa_setup(&state, &session, &headers, "")
+    render_mfa(&state, &session, &headers, "")
 }
 
-fn render_mfa_setup(
+fn render_mfa(
     state: &AppState,
     session: &session::Session,
     headers: &HeaderMap,
     error: &str,
 ) -> Response {
-    let Some(seed) = util::lock(&state.mfa_seed).clone() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "MFA seed unavailable").into_response();
+    let Ok(id) = session.username.parse::<Identity>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "malformed identity").into_response();
     };
-    let uri = totp::provisioning_uri(&seed, &session.username);
+    let record = state.enrollment.get(&id).unwrap_or_default();
+    let nonce = config::random_token(16);
+
+    // Already enrolled: ask for a code, and never re-show the secret.
+    if record.enrolled() {
+        let html = include_str!("../static/mfa_verify.html")
+            .replace("{{CSRF}}", &html_escape(&session.csrf))
+            .replace("{{NONCE}}", &html_escape(&nonce))
+            .replace("{{USER}}", &html_escape(id.subject()))
+            .replace("<!--ERROR-->", error);
+        return (html_headers(&nonce, true, headers), Html(html)).into_response();
+    }
+
+    // Not enrolled: show a QR for a secret that is NOT stored until a code
+    // proves the authenticator has it. The pending secret rides in the form so
+    // no half-finished enrollment is ever persisted.
+    let seed = totp::generate_seed();
+    let uri = totp::provisioning_uri(&seed, id.subject());
     let qr = match totp::qr_svg(&uri) {
         Ok(qr) => qr,
         Err(e) => {
@@ -852,7 +1128,6 @@ fn render_mfa_setup(
             return (StatusCode::INTERNAL_SERVER_ERROR, "could not render MFA QR").into_response();
         }
     };
-    let nonce = config::random_token(16);
     let html = include_str!("../static/mfa.html")
         .replace("{{CSRF}}", &html_escape(&session.csrf))
         .replace("{{NONCE}}", &html_escape(&nonce))
@@ -862,11 +1137,19 @@ fn render_mfa_setup(
     (html_headers(&nonce, true, headers), Html(html)).into_response()
 }
 
-async fn mfa_setup_submit(
+/// Per-identity replay guard, created on first use.
+fn replay_guard(state: &AppState, user: &str) -> Arc<totp::ReplayGuard> {
+    util::lock(&state.otp_used)
+        .entry(user.to_string())
+        .or_insert_with(|| Arc::new(totp::ReplayGuard::new()))
+        .clone()
+}
+
+async fn mfa_submit(
     State(state): State<AppState>,
     jar: SignedCookieJar,
     headers: HeaderMap,
-    Form(form): Form<MfaSetupForm>,
+    Form(form): Form<MfaForm>,
 ) -> Response {
     let Some((id, session)) = current_session(&state, &jar).filter(|(_, s)| s.mfa_pending) else {
         return Redirect::to("/webshell/login").into_response();
@@ -874,49 +1157,66 @@ async fn mfa_setup_submit(
     if !csrf_matches(&session.csrf, &form.csrf) {
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
-    // Enrollment verification has the same online-guessing risk as normal OTP
-    // login, so it shares the serialized tarpit instead of exposing an
-    // unthrottled six-digit endpoint.
-    let _login_permit = state.login_guard.acquire().await;
+    let Ok(identity) = session.username.parse::<Identity>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "malformed identity").into_response();
+    };
+    // Guessing a six-digit code is exactly the thing a tarpit is for.
+    let _permit = state.login_guard.acquire().await;
     tokio::time::sleep(state.login_guard.delay()).await;
-    let verified = util::lock(&state.mfa_seed)
-        .as_deref()
-        .is_some_and(|seed| totp::verify(seed, &form.otp));
-    // Enrollment consumes the code too: the seed is live from here on, so a
-    // code proven here must not also work on the login form.
-    if !(verified && state.otp_used.accept(&form.otp)) {
+
+    let record = state.enrollment.get(&identity).unwrap_or_default();
+    let enrolling = !record.enrolled();
+    let secret = match record.mfa_secret.clone() {
+        Some(secret) => secret,
+        // Enrollment: the candidate secret comes back with the form, and is
+        // only written once a code proves the authenticator holds it.
+        None => form.seed.clone().unwrap_or_default(),
+    };
+
+    let verified = totp::valid_seed(&secret) && totp::verify(&secret, &form.otp);
+    let accepted = verified && replay_guard(&state, &session.username).accept(&form.otp);
+    if !accepted {
         state.login_guard.record_failure();
         let message = if verified {
             "<p class=\"error\">That code has already been used. \
-             Wait for a new code and try again.</p>"
+             Wait for your authenticator to show the next one.</p>"
         } else {
-            "<p class=\"error\">Invalid code. Wait for a new code and try again.</p>"
+            "<p class=\"error\">That code is not right. Wait for a new one and try again.</p>"
         };
-        return render_mfa_setup(&state, &session, &headers, message);
+        return render_mfa(&state, &session, &headers, message);
     }
-    let seed = util::lock(&state.mfa_seed)
-        .clone()
-        .expect("verified seed exists");
-    if let Err(e) = Settings::persist_mfa_seed(&state.config_path, &seed) {
-        tracing::error!("could not persist MFA seed: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not save MFA configuration",
-        )
-            .into_response();
+
+    if enrolling {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Err(e) = state.enrollment.enroll(&identity, &secret, now) {
+            tracing::error!("could not persist enrollment: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not save enrollment",
+            )
+                .into_response();
+        }
+        tracing::info!("MFA enrollment completed for {identity}");
     }
-    state
-        .mfa_initialized
-        .store(true, std::sync::atomic::Ordering::Release);
+
     state.login_guard.record_success();
     let new_id = state.sessions.login(&id, &session.username);
     let jar = jar.add(session_cookie(&state, new_id));
-    tracing::info!("MFA enrollment completed for user {:?}", session.username);
+    tracing::info!("login success for {identity}");
     (jar, Redirect::to("/webshell/private/")).into_response()
 }
 
 #[derive(Deserialize)]
 struct LogoutForm {
+    csrf: String,
+}
+
+/// A form carrying nothing but its CSRF token.
+#[derive(Deserialize)]
+struct CsrfForm {
     csrf: String,
 }
 

@@ -1,10 +1,13 @@
 # webshell
 
 A browser-based login shell built with **axum** + **tokio** and
-[xterm.js](https://xtermjs.org/). It authenticates against **PAM** (your real
-system password), opens a genuine login shell, and gives you persistent,
+[xterm.js](https://xtermjs.org/). Sign in with **Google** or a
+**webshell-managed password**, add a **TOTP second factor**, and get persistent,
 resumable terminal slots — like an always-attached `tmux`, in the browser — plus
 read-only share links so others can watch a session live.
+
+It links to no PAM library and shells out to nothing, so it ships as a **single
+static binary** with no runtime dependency on the host's auth stack.
 
 You should put this behind tlsproxy which can manage tls proxying, with automatic ACME (let's encrypt) certificate management.
 
@@ -70,9 +73,9 @@ for an automated agent driving a shell:
 
 The wire protocol is deliberately small — JSON control frames (`open`, `resize`,
 `mode`, `close`) and binary frames tagged with a one-byte slot index — so it is
-straightforward to drive programmatically. Note that authentication is still
-PAM + signed cookie + CSRF: an agent has to log in like anyone else, and there is
-no API-token path today.
+straightforward to drive programmatically. Note that authentication still
+applies — signed cookie + CSRF, behind Google or a local password: an agent has
+to log in like anyone else, and there is no API-token path today.
 
 ## Screenshots
 
@@ -103,9 +106,8 @@ no API-token path today.
 
 ## What it does
 
-Point a browser at `https://your-host/webshell/`, log in with your system
-password, and you get a real terminal. Each user has a fixed set of **persistent
-slots**: the shell in a slot keeps running even after you close the tab, and
+Point a browser at `https://your-host/webshell/`, sign in, and you get a real
+terminal. Each identity has its own fixed set of **persistent slots**: the shell in a slot keeps running even after you close the tab, and
 reconnecting replays the recent scrollback — so long-running work survives
 disconnects and you can pick up exactly where you left off from any device.
 
@@ -117,15 +119,21 @@ You can even broadcast your live session in 1 to N multicasting.
 
 ## Features
 
-- **PAM authentication, single user.** Only the user the process runs as can log
-  in, with their real system password (username + password). No app-specific
-  accounts to manage.
-- **Optional TOTP second factor.** Turn on `mfa_enabled` and the first login
-  walks you through enrolling an authenticator app (QR code or a setup key you
-  can type). Codes are **single-use** — an accepted code is remembered and
-  refused if it is presented again inside its validity window.
-- **Genuine login shell.** Each session opens the process owner's configured
-  login shell with the correct home directory and identity environment.
+- **Two ways in, both optional.** **Google sign-in** (OpenID Connect) and a
+  **webshell-managed password**. Enable either or both; a method only appears
+  when it is also fully configured, so there are no buttons that cannot work.
+- **An explicit allowlist.** Every login must match an entry in `auth.users`,
+  written as `provider:subject` — `google:you@gmail.com`, `local:alice`. The
+  prefix matters: the same address at two providers is two different identities.
+- **Optional TOTP second factor.** With `mfa.required`, the first login walks you
+  through enrolling an authenticator (QR code or a typed setup key), **per
+  identity**. Codes are **single-use** — an accepted code is refused if presented
+  again inside its validity window.
+- **Multiple people, separate workspaces.** Each identity gets its own slots,
+  scrollback and share links. Note they all run as the **same OS account** — this
+  is workspace separation, not privilege separation.
+- **Genuine login shell.** Each slot opens the process owner's configured login
+  shell with the correct home directory and environment.
 - **Persistent, resumable slots** (default 10). A slot's shell survives
   disconnects; reattaching replays recent scrollback. Switching between opened
   slots is **instant** — each is its own always-connected session, not a repaint.
@@ -148,10 +156,13 @@ You can even broadcast your live session in 1 to N multicasting.
 - **Auto-reconnect** with backoff on the client, and a live **font size / family**
   setting persisted in your browser.
 - **Security by construction.** Structural auth middleware on
-  `/webshell/private/*`, signed `HttpOnly` `SameSite=Strict` session cookies,
-  per-session CSRF tokens on every state-changing request and the WebSocket, an
-  `Origin` check on WS upgrades, session-id rotation on login, short-lived
-  pre-auth sessions, and a login brute-force tarpit.
+  `/webshell/private/*`, signed `HttpOnly` `SameSite=Lax` session cookies
+  (`Secure` when configured), per-session CSRF tokens on every state-changing
+  request and the WebSocket, an `Origin` check on WS upgrades, session-id
+  rotation on login, short-lived pre-auth sessions, and a login tarpit.
+- **No host auth dependency.** No PAM, no `dlopen`, no setuid helper, nothing
+  exec'd — so it is unaffected by SELinux confinement and builds as a **static
+  musl binary** that runs anywhere.
 - **Single static binary.** All HTML/JS is embedded (`include_str!`); deploy just
   the binary + a small TOML config.
 
@@ -159,12 +170,15 @@ You can even broadcast your live session in 1 to N multicasting.
 
 ```
 browser (xterm.js)  ──TLS──►  reverse proxy  ──►  webshell (axum)
-  /webshell/login              (terminates TLS)     PAM auth, CSRF, session
-  /webshell/private/...  ◄── auth-gated ──►         persistent owner-only slots
+  /webshell/login              (terminates TLS)     allowlist, CSRF, session
+  /webshell/oauth/*      ◄── google sign-in ──►     per-identity slots
+  /webshell/private/...  ◄── auth-gated ──►         + TOTP second factor
   /webshell/public/access  ◄── token, read-only ──► each slot = login shell / PTY
 ```
 
-- `/webshell/login` — PAM login form.
+- `/webshell/login` — the sign-in page (local form, Google button, or both).
+- `/webshell/oauth/start` and `/webshell/oauth/callback` — the Google flow.
+- `/webshell/mfa` — TOTP enrollment and verification.
 - `/webshell/private/*` — the terminal UI, WebSocket, and APIs (auth-gated by a
   single middleware layer).
 - `/webshell/public/access?token=…` — the login-free, read-only viewer.
@@ -175,131 +189,197 @@ browser (xterm.js)  ──TLS──►  reverse proxy  ──►  webshell (axum
 cargo build --release
 ```
 
-Cross-compile a Linux x86_64 binary from any host with `./build-x86_64.sh` — it
-targets **glibc** via `cargo-zigbuild` (not static musl, because PAM is loaded at
-runtime with `dlopen("libpam.so.0")`, which a static musl binary can't do).
+For a fully static binary that runs on any Linux with no shared libraries:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+This works because nothing here depends on the host's auth stack — no PAM, no
+`dlopen`, no setuid helper. `./build-x86_64.sh` cross-compiles a glibc build via
+`cargo-zigbuild` if you prefer one.
 
 ## Configure
 
-Configuration is a TOML file (default `config.toml`):
+Configuration is a TOML file (default `config.toml`), grouped into tables:
 
 ```sh
-webshell genconfig -c config.toml   # write a default config
-webshell validate -c config.toml    # check it
-webshell run -c config.toml         # run (this is also the default subcommand)
+webshell genconfig -c config.toml   # write a starter config
+webshell validate  -c config.toml   # check it
+webshell passwd    local:alice      # hash a password to paste in
+webshell run       -c config.toml   # run (also the default subcommand)
 ```
 
-**Coming from a YAML config?** On start, webshell looks at what is on disk and
-acts:
+Every table and key is optional; a missing one falls back to the default.
 
-| On disk | What happens |
-|---|---|
-| `config.yaml` only | Converted to `config.toml`, original retired as `config.yaml.old`, **and the server stops** so you can review it. Start again to run. |
-| `config.toml` only | Runs. |
-| Both | `config.toml` wins; the YAML is retired as `config.yaml.old` so it cannot drift into looking authoritative. Runs. |
-| Neither | Refuses to start, and tells you to run `genconfig`. |
+| Table | Key | Default | Description |
+|---|---|---|---|
+| `[network]` | `bind` | `127.0.0.1:8080` | Listen address. |
+| | `public_base_url` | *(none)* | Browser-facing base URL. Builds share links, is accepted as a WS `Origin`, and **the Google redirect URI is derived from it**. |
+| | `allowed_origins` | *(empty)* | Extra WebSocket `Origin`s, on top of the request's own `Host`. |
+| | `strict_origin` | `false` | Accept only the listed origins, dropping the Host fallback. |
+| | `cookie_secure` | `false` | Mark the session cookie `Secure`. **Set `true` when served over HTTPS.** |
+| `[auth]` | `users` | *(empty)* | The allowlist, as `provider:subject`. Nobody can log in while empty. |
+| | `login_methods` | `["local"]` | `"local"`, `"google"`, or both. |
+| | `session_ttl_secs` | `28800` | Login-session lifetime. |
+| | `secret_base64` | *(ephemeral)* | base64 cookie key (≥64 bytes). Unset resets every session on restart. |
+| `[mfa]` | `required` | `true` | Require a TOTP code. |
+| | `enrollment_path` | `enrollment.toml` | Per-identity enrollment state, relative to the config file. |
+| `[google]` | `client_id` | *(none)* | OAuth client ID. |
+| | `client_secret` | *(none)* | OAuth client secret. |
+| `[terminals]` | `max_sessions` | `10` | Persistent slots per identity. |
+| | `scrollback_bytes` | `131072` | Replay buffer per slot. |
+| `[sharing]` | `enabled` | `true` | Master switch for share links. |
+| | `max_duration_secs` | `2592000` | Cap on a link's lifetime. |
+| `[local_passwords]` | *(per identity)* | — | Password per `local:` identity. **Must be last** — see below. |
 
-Converting stops the server on purpose: a config that was rewritten a moment
-ago is worth a glance before it is served from. It happens once — the next start
-finds `config.toml` and runs normally.
+`WEBSHELL_CONFIG` may point at the config file instead of `-c`.
 
-If your start command names the YAML file explicitly, it will fail after the
-conversion, saying:
+> **The one TOML trap:** a `[table]` header captures every key after it, so
+> `[local_passwords]` has to be the **last** section in the file. Put a plain
+> key below it and it silently becomes a password entry, and the server refuses
+> to start with a confusing type error.
 
-```
-config error: config.yaml does not exist, but config.toml does. It was
-converted by an earlier run; the original is config.yaml.old. Start with
--c config.toml instead.
-```
+### Local passwords
 
-That is the forcing function — update the flag and it never comes back. To
-convert on your own schedule instead, without retiring the original:
+Generate a hash and paste the printed line into the config:
 
 ```sh
-webshell configrewrite -c config.yaml   # writes config.toml, keeps config.yaml
+$ webshell passwd local:alice
+password for local:alice: ********
+
+[local_passwords]
+"local:alice" = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
 ```
 
-Nothing is ever deleted: these files hold your cookie key and TOTP seed, so
-removing the last copy is your call. YAML is read-only and transitional —
-support for it will be dropped, and the `serde_yaml_ng` dependency with it.
+A value that **looks like a hash** — anything shaped `$id$...`, covering argon2,
+bcrypt (`$2a$`/`$2b$`/`$2y$`) and crypt(3) `$6$` — is only ever verified as a
+hash. There is no fallback to a plaintext comparison, so someone who can read
+the config cannot log in by typing the hash itself. A value that is *not* hash
+shaped is treated as a literal password, which is convenient for a first run and
+compared in constant time. Prefer hashes.
 
-Keys (all optional; `genconfig` writes the defaults):
+### Typical scenarios
 
-| Key | Default | Description |
-|---|---|---|
-| `bind` | `127.0.0.1:8080` | Listen address. |
-| `pam_service` | `login` | PAM service under `/etc/pam.d`. |
-| `mfa_enabled` | `false` | Require application-managed TOTP after PAM password authentication. |
-| `mfa_token_seed` | *(none)* | Base32 TOTP seed generated and saved after successful first-login enrollment. Do not set manually or disclose it. |
-| `max_sessions` | `10` | Persistent slots for the user. |
-| `max_sharing_duration_secs` | `2592000` | Cap on a share link's lifetime. |
-| `sharing_enabled` | `true` | Master switch for share links. |
-| `public_base_url` | *(none)* | External base URL — builds absolute share links, and is accepted as a WebSocket `Origin`. |
-| `scrollback_bytes` | `131072` | Replay buffer per slot. |
-| `session_ttl_secs` | `28800` | Login-session lifetime. |
-| `cookie_secure` | `false` | Set `true` when served over HTTPS. |
-| `allowed_origins` | *(empty)* | **Extra** WebSocket `Origin`s to accept, on top of the request's own `Host`. Rarely needed — see below. |
-| `strict_origin` | `false` | Accept only `allowed_origins` (+ `public_base_url`), refusing any other hostname. |
-| `secret_base64` | *(ephemeral)* | base64 cookie master key (≥64 bytes); a separate share-token key is derived from it. Ephemeral keys reset login sessions on restart. |
+**Just me, one machine, no Google.** Simplest possible setup — no OAuth client,
+no internet dependency at login.
 
-`WEBSHELL_SECRET` (base64 key) and `WEBSHELL_CONFIG` (config path) may also be set
-via the environment.
+```toml
+[network]
+bind = "127.0.0.1:8080"
+public_base_url = "https://shell.example.com"
+cookie_secure = true
 
-Behind a **TLS reverse proxy**, set `public_base_url` to the browser-facing base
-URL — e.g. `https://shell.example.com` — so share links come out absolute.
+[auth]
+users = ["local:alice"]
+login_methods = ["local"]
+secret_base64 = "..."          # openssl rand -base64 64
+
+[mfa]
+required = true
+
+[local_passwords]
+"local:alice" = "$argon2id$..."
+```
+
+**Google sign-in only.** No password to manage; access is whoever you list.
+Remember this puts Google in your login path — if it or your network is down,
+you cannot get in.
+
+```toml
+[auth]
+users = ["google:alice@gmail.com", "google:bob@gmail.com"]
+login_methods = ["google"]
+
+[google]
+client_id = "....apps.googleusercontent.com"
+client_secret = "GOCSPX-..."
+```
+
+**Both — recommended.** Google for everyday use, a local password as
+break-glass for when Google, DNS or your certificate is having a bad day.
+
+```toml
+[auth]
+users = ["google:alice@gmail.com", "local:alice"]
+login_methods = ["local", "google"]
+```
+
+**A small team.** Each identity gets its own slots, scrollback and share links —
+but every shell runs as the **same OS account**, so they can read and delete each
+other's files. Fine for people who already trust each other; not a substitute for
+separate accounts.
+
+```toml
+[auth]
+users = ["google:alice@gmail.com", "google:bob@gmail.com", "google:carol@gmail.com"]
+login_methods = ["google"]
+```
+
+### Getting Google credentials
+
+You need an OAuth client of your own — every deployment does, because the
+redirect URI is registered per host. It takes about five minutes, costs nothing,
+and **requires no review or approval**: webshell asks only for
+`openid email profile`, which Google classifies as non-sensitive.
+
+1. **Google Cloud Console** → create (or pick) a project.
+2. **APIs & Services → OAuth consent screen.** User type **External**. Fill in
+   the app name and your support email. Leave it in **Testing** and add yourself
+   under **Test users** — that avoids publishing and any brand review entirely.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID.**
+   Application type: **Web application** — *not* "Desktop app". Webshell does the
+   code exchange server-side, so it is a confidential client.
+4. **Authorised redirect URIs** — add `<public_base_url>/webshell/oauth/callback`,
+   exactly, for every hostname you serve. Google does no wildcard or prefix
+   matching, and a mismatched trailing slash is a mismatch:
+
+   ```
+   https://shell.example.com/webshell/oauth/callback
+   http://127.0.0.1:8080/webshell/oauth/callback      # local testing
+   ```
+
+   `http://` is only allowed for `localhost`/`127.0.0.1`; everything else must be
+   `https://`. Raw IPs other than loopback are rejected. A hostname that resolves
+   to a private address is fine — Google validates the string, your DNS decides
+   where it points.
+5. **Authorised JavaScript origins** — webshell does **not** need any. They are
+   for browser-side flows (One Tap, the JS SDK); our token exchange is
+   server-to-server. Adding them is harmless, just unnecessary.
+6. **Copy two values** into `[google]`: the **Client ID**
+   (`...apps.googleusercontent.com`) and the **Client secret** (`GOCSPX-...`).
+   Nothing else from the JSON is needed.
+
+The server logs the redirect URI it derived at startup — that line is the
+authoritative copy to paste into the console:
+
+```
+INFO webshell: google sign-in redirect URI: https://shell.example.com/webshell/oauth/callback
+```
+
+If the URI does not match, Google refuses with `redirect_uri_mismatch` before
+webshell is ever reached. If your account is not under **Test users** while the
+app is in Testing, Google refuses with an "app has not completed verification"
+notice.
 
 ### TOTP MFA
 
-Set `mfa_enabled: true` to require a six-digit authenticator code in addition to
-the system username and password. On the first successful password login,
-webshell shows a provisioning QR code. The session is not authenticated until a
-valid code from that QR is submitted. Only then is `mfa_token_seed` written to
-the configuration file; subsequent logins require username, password, and OTP.
+With `mfa.required = true`, an identity with no enrolled secret is sent through
+enrollment on its next login: scan the QR (or type the setup key) and submit a
+code. **The secret is only stored once a code proves the authenticator has it**,
+so an abandoned enrollment leaves nothing behind. Enrollment is per identity, so
+signing in with Google and with a local password gives you two separate entries.
 
-The configuration file contains the TOTP secret and must remain private.
-Webshell writes an enrolled configuration through a mode-0600 temporary file.
-Initialize MFA promptly after enabling it: until enrollment is complete, anyone
-who knows the system password can claim the initial authenticator enrollment.
+**Codes are single-use.** A TOTP code stays valid for its whole time step plus
+one either side, so without this the same six digits would authenticate more than
+once — the property a one-time password exists to prevent. Webshell remembers the
+last few accepted codes per identity and refuses a repeat for as long as it could
+still verify. Resubmit one and you are told it has already been used; wait for the
+next. The memory lives in the process, so a restart clears it — harmless, since a
+code from before a restart has almost certainly expired.
 
-**Codes are single-use.** A TOTP code stays valid for its whole time step (plus
-one step either side), so without this the same six digits would authenticate
-more than once — which is exactly the property a one-time password is meant not
-to have. Webshell remembers the last few accepted codes and refuses a repeat for
-as long as that code could still verify, on both the login form and enrollment.
-If you resubmit one you get "that code has already been used"; wait for your
-authenticator to roll over. The memory lives in the process, so a restart clears
-it — harmless, since a code from before a restart is almost certainly expired.
-
-### WebSocket `Origin`
-
-Every hostname the server is legitimately reached on is accepted out of the box,
-with nothing configured: the upgrade is allowed when the browser's `Origin`
-matches the `Host` it asked for. That holds for `localhost`, a LAN IP, a tailnet
-name and your public domain alike, while a third-party page still fails (it
-sends *its* origin with *your* host) — which is the whole point of the check.
-
-`allowed_origins` is only for the case where the browser-facing origin cannot be
-recovered from the request — typically a reverse proxy that rewrites `Host` to
-the upstream (`Host: 127.0.0.1:8080`), leaving nothing to compare against. Most
-proxies forward the original `Host` and need none of this. Symptom when you do
-need it: the page loads fine but the terminal sits at "reconnecting", with an
-`origin not allowed` warning in the log naming the `Origin` and `Host` it saw.
-
-Entries may be written with or without a scheme, and any path or trailing slash
-is stripped:
-
-```toml
-allowed_origins = [
-  "shell.example.com",          # any scheme, this authority
-  "https://alt.example.com",    # this scheme only
-  "https://a.example.com:8443", # non-default ports are part of the authority
-]
-```
-
-Set `strict_origin: true` to turn the list into a pin instead of an addition:
-the `Host` fallback is dropped and only listed origins (plus `public_base_url`)
-are served, so the server refuses to work through an unexpected hostname. It is
-ignored while nothing is configured, which would reject every client.
+`[mfa].enrollment_path` is written by webshell, not you. It holds each identity's
+secret and the Google `sub` pinned on first login, and is created mode `0600`.
 
 ## Run
 
@@ -308,14 +388,61 @@ webshell run -c config.toml
 # then browse to  https://<public_base_url>/webshell/
 ```
 
-Run `webshell` as the unprivileged account that will use it. The service is
-intentionally single-user and refuses to start as root.
+Run `webshell` as the unprivileged account whose shell you want. It refuses to
+start as root, and every slot — whoever signed in — runs as that account.
+
+It also refuses to start when no login method can work, rather than presenting a
+page nobody can get past:
+
+```
+invalid config: No login methods possible.
+  local:  needs "local" in login_methods and at least one local: user
+  google: needs "google" in login_methods, google_client_id, google_client_secret and public_base_url
+```
 
 ## Security notes
 
-- **Serve over TLS.** The login sends your system password and the shell stream
-  is interactive — over plaintext HTTP both are exposed on the wire. Terminate
-  TLS in front (nginx/caddy/etc.), set `cookie_secure: true`, and restrict who
-  can reach it.
+- **Serve over TLS.** The login carries a password and the shell stream is
+  interactive — over plaintext HTTP both are exposed on the wire. Terminate TLS
+  in front (tlsproxy/nginx/caddy), set `[network].cookie_secure = true`, and
+  restrict who can reach it.
+- **Protect the config file.** It holds the cookie key, the Google client secret
+  and every local password hash. Keep it `0600`; webshell writes
+  `enrollment.toml` that way itself.
+- **`local:` passwords are not system passwords.** They are webshell's own, and
+  their hashes live in a file owned by the account being protected rather than in
+  root-only `/etc/shadow`. Use hashes, not plaintext, and pair them with MFA.
+- **One OS account.** Multiple identities mean separate workspaces, not separate
+  privileges — everyone who can log in gets a shell as the process owner.
+- **Set a stable `secret_base64`.** Without it a restart invalidates every login
+  session and every outstanding share link.
 - The server is in the keystroke path, as with any web terminal — run it only on
   hosts and networks you trust.
+
+### WebSocket `Origin`
+
+Every hostname the server is legitimately reached on is accepted out of the box:
+the upgrade is allowed when the browser's `Origin` matches the `Host` it asked
+for. That holds for `localhost`, a LAN IP and your public domain alike, while a
+third-party page still fails — it sends *its* origin with *your* host, which is
+the whole point of the check.
+
+`[network].allowed_origins` is for when the browser-facing origin cannot be
+recovered from the request — typically a proxy that rewrites `Host` to the
+upstream. Symptom: the page loads but the terminal sits at "reconnecting", with
+an `origin not allowed` warning in the log naming what it saw. Entries may be
+written with or without a scheme; any path or trailing slash is stripped:
+
+```toml
+[network]
+allowed_origins = [
+  "shell.example.com",          # any scheme, this authority
+  "https://alt.example.com",    # this scheme only
+  "https://a.example.com:8443", # non-default ports are part of the authority
+]
+```
+
+Set `strict_origin = true` to turn the list into a pin: the `Host` fallback is
+dropped and only listed origins (plus `public_base_url`) are served, so the
+server refuses to work through an unexpected hostname. Remember to list *every*
+hostname you serve, or its terminal will not connect.

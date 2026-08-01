@@ -26,7 +26,13 @@ const MAX_SESSIONS: usize = 10_000;
 pub struct Session {
     pub authenticated: bool,
     pub mfa_pending: bool,
+    /// The login identity (`google:you@example.com`) once known. Terminal
+    /// pools and share grants key off this, so each identity gets its own
+    /// slots even though every shell runs as the same OS account.
     pub username: String,
+    /// In-flight OIDC login. Held here rather than in a shared map because the
+    /// session cookie is what proves a callback belongs to this browser.
+    pub oauth: Option<crate::oidc::Flow>,
     /// Synchronizer token embedded in forms and required on the WebSocket.
     pub csrf: String,
     created: Instant,
@@ -81,6 +87,7 @@ impl SessionStore {
             authenticated: false,
             mfa_pending: false,
             username: String::new(),
+            oauth: None,
             csrf: random_token(24),
             created: Instant::now(),
             revoked,
@@ -140,6 +147,7 @@ impl SessionStore {
             Session {
                 authenticated: true,
                 mfa_pending: false,
+                oauth: None,
                 username: username.to_string(),
                 csrf: random_token(24),
                 created: Instant::now(),
@@ -161,6 +169,7 @@ impl SessionStore {
             Session {
                 authenticated: false,
                 mfa_pending: true,
+                oauth: None,
                 username: username.to_string(),
                 csrf: random_token(24),
                 created: Instant::now(),
@@ -180,6 +189,13 @@ impl SessionStore {
             }
             keep
         });
+    }
+
+    /// Attach an in-flight OIDC login to a pre-auth session.
+    pub fn set_oauth(&self, id: &str, flow: Option<crate::oidc::Flow>) {
+        if let Some(session) = lock(&self.inner).get_mut(id) {
+            session.oauth = flow;
+        }
     }
 
     pub fn ttl(&self) -> Duration {

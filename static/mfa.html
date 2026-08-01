@@ -52,6 +52,9 @@
       <button type="button" id="back">Back</button>
     </div>
     <input type="hidden" name="csrf" value="{{CSRF}}" />
+    <!-- The candidate secret rides with the form: nothing is stored until a
+         code proves the authenticator actually holds it. -->
+    <input type="hidden" name="seed" value="{{SEED}}" />
   </form>
   <script nonce="{{NONCE}}">
     const scan = document.getElementById("scanStep");

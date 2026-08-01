@@ -5,227 +5,179 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
-/// User-facing configuration, loaded from a TOML file (all fields optional —
-/// missing ones fall back to the documented defaults).
+/// User-facing configuration, loaded from a TOML file.
 ///
-/// Authentication is always PAM, and only the **process owner** may log in
-/// (with both their username and system password).
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Grouped into tables by concern rather than one flat list: a config file is
+/// read far more often than it is written, and `[auth]` / `[network]` says
+/// what a key is *for* in a way a prefix never quite does. Every table and
+/// every key is optional — a missing one falls back to the documented default.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    pub network: Network,
+    pub auth: Auth,
+    pub mfa: Mfa,
+    pub google: Google,
+    pub terminals: TerminalSettings,
+    pub sharing: Sharing,
+    /// Passwords for `local:` identities, keyed by full identity string.
+    /// Declared last: a TOML table absorbs every key that follows it.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub local_passwords: std::collections::HashMap<String, String>,
+}
+
+/// Where the server listens and how it is reached.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Network {
     /// Listen address, e.g. "0.0.0.0:9023".
     pub bind: String,
-    /// PAM service name (file under /etc/pam.d).
-    pub pam_service: String,
-    /// Enable application-managed TOTP MFA.
-    pub mfa_enabled: bool,
-    /// Base32 TOTP seed. Generated after the first successful password login.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mfa_token_seed: Option<String>,
-    /// Persistent terminal slots for the user.
-    pub max_sessions: usize,
-    /// Upper bound a share link may be valid for.
-    pub max_sharing_duration_secs: u64,
-    /// Master switch for read-only share links.
-    pub sharing_enabled: bool,
-    /// Externally-visible base URL, e.g. "https://shell.example.com". Used to
-    /// build absolute share links, and accepted as a WebSocket Origin. A
-    /// trailing slash is optional.
+    /// Externally-visible base URL, e.g. "https://shell.example.com". Builds
+    /// absolute share links, is accepted as a WebSocket Origin, and is what the
+    /// Google redirect URI is derived from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_base_url: Option<String>,
-    /// Bytes of recent output retained per slot for replay on reattach.
-    pub scrollback_bytes: usize,
-    /// Absolute login-session lifetime.
-    pub session_ttl_secs: u64,
-    /// Mark the session cookie `Secure` (serve over HTTPS).
-    pub cookie_secure: bool,
     /// *Extra* WebSocket Origins to accept, beyond the request's own Host and
-    /// public_base_url. Only needed when the browser-facing origin cannot be
-    /// recovered from the request — e.g. a reverse proxy that rewrites Host.
+    /// public_base_url. Only needed behind a proxy that rewrites Host.
     pub allowed_origins: Vec<String>,
-    /// Deprecated singular form of `allowed_origins`; still honoured so older
-    /// configs keep loading (deny_unknown_fields would reject them otherwise).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_origin: Option<String>,
-    /// Pin the accepted Origins to the configured set: drops the "Origin
-    /// matches the request's Host" fallback. Refuses to serve WebSockets
-    /// through any hostname not listed. Ignored when nothing is configured,
-    /// which would lock out every client.
+    /// Pin the accepted Origins to the configured set, dropping the
+    /// Origin-matches-Host fallback. Ignored when nothing is configured, which
+    /// would lock out every client.
     pub strict_origin: bool,
-    /// base64 cookie signing key (>=64 bytes). Empty = ephemeral (resets on restart).
+    /// Mark the session cookie `Secure` (set this when served over HTTPS).
+    pub cookie_secure: bool,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Network {
+            bind: "127.0.0.1:8080".into(),
+            public_base_url: None,
+            allowed_origins: Vec::new(),
+            strict_origin: false,
+            cookie_secure: false,
+        }
+    }
+}
+
+/// Who may log in, and by which methods.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Auth {
+    /// Exactly who may log in, as `provider:subject`.
+    pub users: Vec<crate::identity::Identity>,
+    /// Methods offered: "local" and/or "google". A method is only shown when
+    /// it is also fully configured.
+    pub login_methods: Vec<String>,
+    /// Absolute login-session lifetime, seconds.
+    pub session_ttl_secs: u64,
+    /// base64 cookie signing key (>=64 bytes). Unset = ephemeral, which resets
+    /// every login session on restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_base64: Option<String>,
 }
 
-impl Default for Settings {
+impl Default for Auth {
     fn default() -> Self {
-        Settings {
-            bind: "127.0.0.1:8080".into(),
-            pam_service: "login".into(),
-            mfa_enabled: false,
-            mfa_token_seed: None,
-            max_sessions: 10,
-            max_sharing_duration_secs: 30 * 24 * 3600,
-            sharing_enabled: true,
-            public_base_url: None,
-            scrollback_bytes: 128 * 1024,
+        Auth {
+            users: Vec::new(),
+            login_methods: vec!["local".into()],
             session_ttl_secs: 8 * 3600,
-            cookie_secure: false,
-            allowed_origins: Vec::new(),
-            allowed_origin: None,
-            strict_origin: false,
             secret_base64: None,
         }
     }
 }
 
-/// Preferred config filename. A sibling `config.yaml` is still accepted; see
-/// `resolve_path`.
-pub const DEFAULT_CONFIG: &str = "config.toml";
+/// TOTP second factor.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mfa {
+    /// Require a code. Users with no enrolled secret are sent through
+    /// enrollment on their next login.
+    pub required: bool,
+    /// Where per-identity enrollment state is kept. Relative paths resolve
+    /// against the config file's directory.
+    pub enrollment_path: String,
+}
 
-/// Pick the config file to use. An explicit path that exists always wins; if it
-/// does not, and a same-named legacy YAML file sits beside it, use that. This
-/// is what lets an existing deployment keep starting after the switch to TOML
-/// without its command line or working directory changing.
-pub fn resolve_path(path: &Path) -> std::path::PathBuf {
-    if path.exists() {
-        return path.to_path_buf();
-    }
-    for legacy in ["yaml", "yml"] {
-        let candidate = path.with_extension(legacy);
-        if candidate.exists() {
-            return candidate;
+impl Default for Mfa {
+    fn default() -> Self {
+        Mfa {
+            required: true,
+            enrollment_path: "enrollment.toml".into(),
         }
     }
-    path.to_path_buf()
 }
+
+/// Google sign-in. Only the non-sensitive `openid email profile` scopes are
+/// requested, so the OAuth client needs no Google review.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Google {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+}
+
+/// The persistent terminal slots themselves.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalSettings {
+    /// Persistent slots per user.
+    pub max_sessions: usize,
+    /// Bytes of recent output retained per slot for replay on reattach.
+    pub scrollback_bytes: usize,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        TerminalSettings {
+            max_sessions: 10,
+            scrollback_bytes: 128 * 1024,
+        }
+    }
+}
+
+/// Read-only share links.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sharing {
+    /// Master switch.
+    pub enabled: bool,
+    /// Cap on a single link's lifetime, seconds.
+    pub max_duration_secs: u64,
+}
+
+impl Default for Sharing {
+    fn default() -> Self {
+        Sharing {
+            enabled: true,
+            max_duration_secs: 30 * 24 * 3600,
+        }
+    }
+}
+
+/// Default config filename.
+pub const DEFAULT_CONFIG: &str = "config.toml";
 
 /// What `run` should do about the config files it can see.
 pub enum ConfigChoice {
     /// Load this file and start.
     Use(std::path::PathBuf),
-    /// A legacy file was converted. The server does not start: a rewritten
-    /// config deserves a look before it is served from.
-    Converted {
-        converted: std::path::PathBuf,
-        retired: std::path::PathBuf,
-    },
     /// Nothing usable on disk.
     Missing(std::path::PathBuf),
 }
 
-/// Decide which config to run from, converting or retiring a legacy file as
-/// needed. For a requested `config.toml` (the default) the cases are:
-///
-/// * only `config.yaml` — convert it, and stop so it can be reviewed
-/// * only `config.toml` — use it
-/// * both — the TOML wins; the YAML is retired so it cannot drift into
-///   looking authoritative
-/// * neither — nothing to serve; the caller reports it
+/// Decide which config to run from: use it if it exists, otherwise report that
+/// there is nothing to serve.
 pub fn choose(requested: &Path) -> anyhow::Result<ConfigChoice> {
-    let toml_path = if is_legacy(requested) {
-        requested.with_extension("toml")
+    if requested.exists() {
+        Ok(ConfigChoice::Use(requested.to_path_buf()))
     } else {
-        requested.to_path_buf()
-    };
-    let legacy = [
-        Some(requested.to_path_buf()).filter(|p| is_legacy(p)),
-        Some(requested.with_extension("yaml")),
-        Some(requested.with_extension("yml")),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| p.exists());
-
-    match (toml_path.exists(), legacy) {
-        (true, Some(old)) => {
-            let retired = retire(&old)?;
-            tracing::warn!(
-                "{} is no longer used ({} takes precedence); it is now {}",
-                old.display(),
-                toml_path.display(),
-                retired.display()
-            );
-            Ok(ConfigChoice::Use(toml_path))
-        }
-        (true, None) => Ok(ConfigChoice::Use(toml_path)),
-        (false, Some(old)) => {
-            let (converted, retired) = migrate_legacy(&old)?;
-            Ok(ConfigChoice::Converted { converted, retired })
-        }
-        (false, None) => Ok(ConfigChoice::Missing(toml_path)),
+        Ok(ConfigChoice::Missing(requested.to_path_buf()))
     }
-}
-
-/// Move a superseded config aside as `<name>.old`.
-fn retire(path: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let retired = path.with_extension(format!(
-        "{}.old",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
-    ));
-    std::fs::rename(path, &retired)
-        .map_err(|e| anyhow::anyhow!("moving {} aside: {e}", path.display()))?;
-    Ok(retired)
-}
-
-pub fn is_legacy(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("yaml") | Some("yml")
-    )
-}
-
-/// Convert a legacy YAML config to TOML and move the original aside, returning
-/// `(converted, retired)`.
-///
-/// This is a one-way door by design. The caller converts and then *stops*
-/// rather than starting on the result: a config rewrite is exactly the moment
-/// an operator should look at what was produced, and stopping guarantees they
-/// do instead of discovering the change weeks later. The following start reads
-/// the TOML normally.
-pub fn migrate_legacy(path: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let settings = Settings::load_quiet(path)?;
-    let target = path.with_extension("toml");
-    if !target.exists() {
-        settings.save(&target)?;
-    }
-    let retired = retire(path)?;
-    Ok((target, retired))
-}
-
-/// Explain a missing config when the TOML replacement is sitting right there,
-/// so the failure says what to do instead of just "not found". Covers both the
-/// automatic conversion and a manual `configrewrite` where the YAML was
-/// deleted afterwards.
-pub fn migration_hint(path: &Path) -> Option<String> {
-    if !is_legacy(path) {
-        return None;
-    }
-    let target = path.with_extension("toml");
-    if !target.exists() {
-        return None;
-    }
-    let retired = path.with_extension(format!(
-        "{}.old",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("yaml")
-    ));
-    let converted = if retired.exists() {
-        format!(
-            " It was converted by an earlier run; the original is {}.",
-            retired.display()
-        )
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "{} does not exist, but {} does.{} Start with -c {} instead.",
-        path.display(),
-        target.display(),
-        converted,
-        target.display()
-    ))
 }
 
 impl Settings {
@@ -233,47 +185,16 @@ impl Settings {
     /// existing deployment keeps working, with a warning pointing at
     /// `configrewrite`. YAML support exists only for that migration.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Settings> {
-        Self::load_inner(path, true)
-    }
-
-    /// As `load`, but silent about the file being YAML — for callers that are
-    /// already converting it and would otherwise advise the very thing they
-    /// are doing.
-    fn load_quiet(path: &Path) -> anyhow::Result<Settings> {
-        Self::load_inner(Some(path), false)
-    }
-
-    fn load_inner(path: Option<&Path>, warn_on_yaml: bool) -> anyhow::Result<Settings> {
         let Some(p) = path else {
             return Ok(Settings::default());
         };
         let text = std::fs::read_to_string(p)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", p.display()))?;
-        match toml::from_str(&text) {
-            Ok(settings) => Ok(settings),
-            Err(toml_err) => match serde_yaml_ng::from_str(&text) {
-                Ok(settings) => {
-                    if warn_on_yaml {
-                        tracing::warn!(
-                            "{} is YAML; webshell now uses TOML. Run \
-                             `webshell configrewrite -c {}` to convert it — \
-                             YAML support will go away.",
-                            p.display(),
-                            p.display()
-                        );
-                    }
-                    Ok(settings)
-                }
-                // Report the TOML error: that is the format the file should be
-                // in, so its message is the useful one.
-                Err(_) => Err(anyhow::anyhow!(
-                    "parsing config {}: {toml_err}",
-                    p.display()
-                )),
-            },
-        }
+        toml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing config {}: {e}", p.display()))
     }
 
+    /// A starter config. The table layout does the grouping now, so this is
+    /// just a faithful serialization of the defaults.
     pub fn sample_toml() -> String {
         toml::to_string_pretty(&Settings::default()).unwrap_or_default()
     }
@@ -308,48 +229,21 @@ impl Settings {
         }
         result
     }
-
-    /// Record a completed MFA enrollment. Always written as TOML: if the file
-    /// on disk is still legacy YAML, rewriting it in place would leave a
-    /// `.yaml` holding TOML, so the seed goes to the `.toml` name instead and
-    /// the stale YAML is left for the operator to delete.
-    pub fn persist_mfa_seed(path: &Path, seed: &str) -> anyhow::Result<()> {
-        let mut settings = if path.exists() {
-            Self::load(Some(path))?
-        } else {
-            Self::default()
-        };
-        settings.mfa_enabled = true;
-        settings.mfa_token_seed = Some(seed.to_string());
-
-        let is_legacy = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("yaml") | Some("yml")
-        );
-        let target = if is_legacy {
-            path.with_extension("toml")
-        } else {
-            path.to_path_buf()
-        };
-        settings.save(&target)?;
-        if is_legacy {
-            tracing::warn!(
-                "MFA enrollment written to {} (TOML). {} is now stale — delete it.",
-                target.display(),
-                path.display()
-            );
-        }
-        Ok(())
-    }
 }
 
 /// Fully-resolved runtime configuration.
 pub struct Config {
     pub bind_addr: String,
-    pub pam_service: String,
-    pub mfa_enabled: bool,
-    pub mfa_token_seed: Option<String>,
-    /// The only account permitted to log in: the user running this process.
+    /// The allowlist. Every login must match one of these exactly.
+    pub users: Vec<crate::identity::Identity>,
+    pub login_methods: Vec<crate::identity::Provider>,
+    pub local_passwords: std::collections::HashMap<String, String>,
+    pub mfa_required: bool,
+    pub google_client_id: Option<String>,
+    pub google_client_secret: Option<String>,
+    pub mfa_enrollment_path: std::path::PathBuf,
+    /// The OS account every shell runs as — the user running this process.
+    /// Logins are Google identities; they all share this account.
     pub owner: String,
     /// The owner's home directory (from the passwd DB), for the spawned shell.
     pub owner_home: String,
@@ -385,17 +279,18 @@ impl Config {
         let owner = owner_info();
 
         let public_base_url = s
+            .network
             .public_base_url
             .as_deref()
             .map(|u| u.trim_end_matches('/').to_string());
 
-        // Additive: the configured extras, the deprecated singular key, and the
-        // public base URL all just widen what the Host fallback already allows.
+        // Additive: the configured extras and the public base URL both just
+        // widen what the Host fallback already allows.
         let allowed_origins = s
+            .network
             .allowed_origins
             .iter()
             .map(String::as_str)
-            .chain(s.allowed_origin.as_deref())
             .chain(public_base_url.as_deref())
             .map(normalize_origin)
             .filter(|o| !o.is_empty())
@@ -408,12 +303,36 @@ impl Config {
 
         let login_cmd = vec![owner.shell.clone(), "-l".into()];
 
-        let secret_base64 = env::var("WEBSHELL_SECRET").ok().or(s.secret_base64);
+        // Parse once, at load: an unknown method name should be a startup
+        // error, not a login page that silently offers nothing.
+        let login_methods: Vec<crate::identity::Provider> = s
+            .auth
+            .login_methods
+            .iter()
+            .filter_map(|name| match name.trim().to_lowercase().as_str() {
+                "local" => Some(crate::identity::Provider::Local),
+                "google" => Some(crate::identity::Provider::Google),
+                other => {
+                    tracing::error!("unknown login method {other:?}; ignoring it");
+                    None
+                }
+            })
+            .fold(Vec::new(), |mut acc, m| {
+                if !acc.contains(&m) {
+                    acc.push(m);
+                }
+                acc
+            });
+
+        let secret_base64 = env::var("WEBSHELL_SECRET").ok().or(s.auth.secret_base64);
 
         // Bounded like every other sizing knob: this buffer is retained per
         // slot, so an unclamped value is an OOM waiting for a typo.
-        let slots_per_user = s.max_sessions.clamp(1, 64);
-        let requested_scrollback = s.scrollback_bytes.clamp(4 * 1024, 16 * 1024 * 1024);
+        let slots_per_user = s.terminals.max_sessions.clamp(1, 64);
+        let requested_scrollback = s
+            .terminals
+            .scrollback_bytes
+            .clamp(4 * 1024, 16 * 1024 * 1024);
         // Bound aggregate retained scrollback, not just each slot independently.
         // This prevents a valid-looking max/max configuration from reserving
         // roughly a GiB once all slots have produced output.
@@ -422,25 +341,29 @@ impl Config {
         let ws_message_limit = 64 * 1024;
 
         Config {
-            bind_addr: s.bind,
-            pam_service: s.pam_service,
-            mfa_enabled: s.mfa_enabled,
-            mfa_token_seed: s.mfa_token_seed,
+            bind_addr: s.network.bind,
+            users: s.auth.users,
+            login_methods,
+            local_passwords: s.local_passwords,
+            mfa_required: s.mfa.required,
+            google_client_id: s.google.client_id,
+            google_client_secret: s.google.client_secret,
+            mfa_enrollment_path: std::path::PathBuf::from(s.mfa.enrollment_path),
             owner_home: owner.home,
             owner: owner.name,
             // Load-bearing for the wire format, not just a sanity bound: the
             // mux protocol tags each frame with a ONE-BYTE slot index
             // (pty::tagged), so this must stay <= 255.
             slots_per_user,
-            max_share_secs: s.max_sharing_duration_secs.max(1),
-            sharing_enabled: s.sharing_enabled,
+            max_share_secs: s.sharing.max_duration_secs.max(1),
+            sharing_enabled: s.sharing.enabled,
             public_base_url,
             login_cmd,
             scrollback_cap,
-            session_ttl: Duration::from_secs(s.session_ttl_secs.max(60)),
-            cookie_secure: s.cookie_secure,
+            session_ttl: Duration::from_secs(s.auth.session_ttl_secs.max(60)),
+            cookie_secure: s.network.cookie_secure,
             allowed_origins,
-            strict_origin: s.strict_origin,
+            strict_origin: s.network.strict_origin,
             ws_message_limit,
             secret_base64,
         }
@@ -449,19 +372,48 @@ impl Config {
     /// Verify a login attempt via PAM. Only the process owner may log in (the
     /// username must match); blocks, so call from a blocking task. Returns the
     /// owner's username on success.
-    pub fn authenticate(&self, username: &str, password: &str) -> Option<String> {
-        let owner_ok: bool = username.as_bytes().ct_eq(self.owner.as_bytes()).into();
-        if !owner_ok {
-            tracing::warn!("login rejected: only {:?} may log in", self.owner);
-            return None;
-        }
-        match crate::pam::authenticate(&self.pam_service, &self.owner, password) {
-            Ok(()) => Some(self.owner.clone()),
-            Err(e) => {
-                tracing::warn!("PAM auth failed for {:?}: {e}", self.owner);
-                None
-            }
-        }
+    /// Whether this identity is on the allowlist. Comparison is on the
+    /// normalized form, so capitalisation in the config cannot cause a
+    /// mysterious denial.
+    /// The stored hash for a local identity, if one is configured.
+    pub fn local_password(&self, id: &crate::identity::Identity) -> Option<&str> {
+        let wanted = id.to_string();
+        self.local_passwords
+            .iter()
+            .find(|(k, _)| k.trim().to_lowercase() == wanted)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Local login can work: enabled, and at least one local identity exists.
+    pub fn local_usable(&self) -> bool {
+        self.login_methods
+            .contains(&crate::identity::Provider::Local)
+            && self
+                .users
+                .iter()
+                .any(|u| u.provider() == crate::identity::Provider::Local)
+    }
+
+    /// Google login can work: enabled, and every piece it needs is configured.
+    pub fn google_usable(&self) -> bool {
+        self.login_methods
+            .contains(&crate::identity::Provider::Google)
+            && self.google_client_id.is_some()
+            && self.google_client_secret.is_some()
+            && self.redirect_uri().is_some()
+    }
+
+    pub fn permits(&self, id: &crate::identity::Identity) -> bool {
+        self.users.contains(id)
+    }
+
+    /// Where Google should send the browser back. Derived rather than
+    /// configured: it must match what is registered in the Cloud Console, and
+    /// two sources of truth for one URL is a support burden.
+    pub fn redirect_uri(&self) -> Option<String> {
+        self.public_base_url
+            .as_ref()
+            .map(|base| format!("{base}/webshell/oauth/callback"))
     }
 }
 
@@ -597,7 +549,10 @@ mod tests {
     #[test]
     fn public_base_url_is_an_allowed_origin() {
         let cfg = Config::from_settings(Settings {
-            public_base_url: Some("https://shell.example.com/".into()),
+            network: Network {
+                public_base_url: Some("https://shell.example.com/".into()),
+                ..Network::default()
+            },
             ..Settings::default()
         });
         assert_eq!(cfg.allowed_origins, vec!["https://shell.example.com"]);
@@ -608,13 +563,16 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_singular_key_still_counts_and_dedupes() {
+    fn extra_origins_and_the_base_url_merge_without_duplicates() {
         let cfg = Config::from_settings(Settings {
-            public_base_url: Some("https://a.b".into()),
-            allowed_origin: Some("https://a.b/".into()),
-            allowed_origins: vec!["c.d".into(), "".into()],
+            network: Network {
+                public_base_url: Some("https://a.b".into()),
+                allowed_origins: vec!["c.d".into(), "".into(), "https://a.b/".into()],
+                ..Network::default()
+            },
             ..Settings::default()
         });
+        // Empty entries dropped, trailing slash normalized, no repeats.
         assert_eq!(cfg.allowed_origins, vec!["c.d", "https://a.b"]);
     }
 }

@@ -15,7 +15,6 @@ anyhow = "1"
 portable-pty = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml_ng = "0.10"   # legacy config read only; see configrewrite
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
@@ -25,7 +24,9 @@ hmac = "0.12"
 sha2 = "0.10"
 sha1 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-libloading = "0.8"
+bcrypt = "0.15"
+argon2 = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
