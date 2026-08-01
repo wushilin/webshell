@@ -199,6 +199,34 @@ This works because nothing here depends on the host's auth stack — no PAM, no
 `dlopen`, no setuid helper. `./build-x86_64.sh` cross-compiles a glibc build via
 `cargo-zigbuild` if you prefer one.
 
+## Quick start (no config)
+
+To try it out or share a shell quickly, `webshell simple` needs no config file,
+no MFA and no Google — just one local user, straight from the environment:
+
+```sh
+WEBSHELL_USER=alice WEBSHELL_PASSWORD=hunter2 webshell simple
+# Web Shell listening on http://127.0.0.1:9023/webshell/
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEBSHELL_USER` | *(required)* | The single username to log in as. |
+| `WEBSHELL_PASSWORD` | *(required)* | Its password (checked verbatim; not hashed). |
+| `WEBSHELL_BIND` | `127.0.0.1:9023` | Listen address. Set `0.0.0.0:PORT` to expose it. |
+
+```sh
+# expose on all interfaces, custom port
+WEBSHELL_BIND=0.0.0.0:12702 WEBSHELL_USER=alice WEBSHELL_PASSWORD=hunter2 webshell simple
+```
+
+Nothing is written to disk and no enrollment file is created. This mode is meant
+for quick, local, trusted sharing — the password lives in the process
+environment, and there is no second factor. For anything exposed to the
+internet, use the full config below (put it behind TLS, enable MFA), and note
+that `cookie_secure` stays `false` here, so serve `simple` over plain HTTP on a
+trusted network rather than fronting it with HTTPS.
+
 ## Configure
 
 Configuration is a TOML file (default `config.toml`), grouped into tables:

@@ -128,6 +128,10 @@ struct Cli {
 enum Command {
     /// Run the server (default).
     Run(ConfigArgs),
+    /// Run with no config file: a single local user from WEBSHELL_USER /
+    /// WEBSHELL_PASSWORD, no MFA and no Google. WEBSHELL_BIND overrides the
+    /// listen address (default 127.0.0.1:9023).
+    Simple,
     /// Write a default config file.
     Genconfig(ConfigArgs),
     /// Load a config file and report whether it is valid.
@@ -167,6 +171,7 @@ async fn main() {
         Command::Genconfig(a) => genconfig(&a.config),
         Command::Validate(a) => validate(&a.config.clone()),
         Command::Passwd { id } => passwd(&id),
+        Command::Simple => run_simple().await,
         Command::Run(a) => run_server(&a.config.clone()).await,
     }
 }
@@ -326,6 +331,15 @@ async fn run_server(config_path: &std::path::Path) {
         tracing::info!("permitted user: {user}");
     }
 
+    serve(config, config_path.to_path_buf(), false).await;
+}
+
+/// Build the app state and serve until shutdown. Shared by `run` (config file)
+/// and `simple` (env vars): both produce a `Config`, and everything from here
+/// down — enrollment state, sessions, routing, listening — is identical. The
+/// `simple` flag only changes the startup line printed to the operator.
+async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
+    let config_path = config_path.as_path();
     // Enrollment lives beside the config unless an absolute path is given.
     let enrollment_path = if config.mfa_enrollment_path.is_absolute() {
         config.mfa_enrollment_path.clone()
@@ -442,8 +456,42 @@ async fn run_server(config_path: &std::path::Path) {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {bind}: {e}"));
+    if simple {
+        // A clean, clickable line for the ad-hoc operator — the tracing log
+        // below still fires for anyone watching structured output.
+        println!("Web Shell listening on http://{bind}{BASE_PATH}/");
+    }
     tracing::info!("webshell listening on http://{bind}{BASE_PATH}/");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Zero-config local mode: read a single user and password from the
+/// environment and serve immediately — no config file, no MFA, no Google.
+/// Meant for a quick `WEBSHELL_USER=… WEBSHELL_PASSWORD=… webshell simple`.
+async fn run_simple() {
+    if let Err(e) = config::ensure_unprivileged() {
+        eprintln!("startup error: {e}");
+        std::process::exit(1);
+    }
+
+    let user = std::env::var("WEBSHELL_USER").unwrap_or_default();
+    let password = std::env::var("WEBSHELL_PASSWORD").unwrap_or_default();
+    if user.trim().is_empty() || password.is_empty() {
+        eprintln!(
+            "Err: You need to specify WEBSHELL_USER and WEBSHELL_PASSWORD to run in simple mode"
+        );
+        std::process::exit(1);
+    }
+    let bind = std::env::var("WEBSHELL_BIND").unwrap_or_else(|_| "127.0.0.1:9023".to_string());
+
+    // No config file to anchor relative paths against; the enrollment store is
+    // never written in this mode (MFA is off), so the cwd is a fine base.
+    serve(
+        Config::simple(&user, &password, &bind),
+        std::path::PathBuf::from("."),
+        true,
+    )
+    .await;
 }
 
 fn load_signing_key(secret_base64: Option<&str>) -> Key {

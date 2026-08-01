@@ -271,6 +271,33 @@ pub struct Config {
 }
 
 impl Config {
+    /// Zero-config local-only setup for `webshell simple`: one `local:` user
+    /// with the given password, MFA off, Google off, everything else defaulted.
+    /// The password is stored verbatim — `localauth::verify` accepts a plaintext
+    /// value, so this mode trades the config file for two environment variables.
+    pub fn simple(user: &str, password: &str, bind: &str) -> Self {
+        let identity = crate::identity::Identity::new(crate::identity::Provider::Local, user);
+        let mut local_passwords = std::collections::HashMap::new();
+        local_passwords.insert(identity.to_string(), password.to_string());
+        Config::from_settings(Settings {
+            network: Network {
+                bind: bind.to_string(),
+                ..Network::default()
+            },
+            auth: Auth {
+                users: vec![identity],
+                login_methods: vec!["local".to_string()],
+                ..Auth::default()
+            },
+            mfa: Mfa {
+                required: false,
+                ..Mfa::default()
+            },
+            local_passwords,
+            ..Settings::default()
+        })
+    }
+
     pub fn from_settings(s: Settings) -> Self {
         // Resolve identity from the passwd DB, NOT from the environment: when a
         // supervisor starts the service with a stale environment, HOME/USER may
