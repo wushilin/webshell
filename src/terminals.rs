@@ -654,7 +654,10 @@ mod tests {
         );
         assert_eq!(cmd.get_env("EDITOR"), Some(std::ffi::OsStr::new("vim")));
         // Built-ins survive when not overridden.
-        assert_eq!(cmd.get_env("HOME"), Some(std::ffi::OsStr::new("/home/alice")));
+        assert_eq!(
+            cmd.get_env("HOME"),
+            Some(std::ffi::OsStr::new("/home/alice"))
+        );
         assert_eq!(cmd.get_env("USER"), Some(std::ffi::OsStr::new("alice")));
         assert_eq!(cmd.get_env("LOGNAME"), Some(std::ffi::OsStr::new("alice")));
     }

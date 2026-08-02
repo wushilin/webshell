@@ -13,7 +13,7 @@
 //! NOT be safe for the implicit flow, where the token arrives via the browser.
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::identity::{Identity, Provider};
 
@@ -28,7 +28,7 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 /// The per-login secrets that tie a callback to the browser that started it.
 /// Held in the caller's pre-auth session, never in a shared map: the cookie is
 /// what proves the callback belongs to this browser.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Flow {
     /// CSRF for the redirect: echoed by Google, compared on return.
     pub state: String,

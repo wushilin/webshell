@@ -106,7 +106,6 @@ struct AppState {
     /// user's spent code reject another user whose authenticator happens to
     /// show the same six digits — a false denial, and a cross-user leak.
     otp_used: Arc<Mutex<HashMap<String, Arc<totp::ReplayGuard>>>>,
-    config_path: Arc<std::path::PathBuf>,
     key: Key,
 }
 
@@ -266,7 +265,7 @@ async fn run_server(config_path: &std::path::Path) {
     };
     let config_path = config_path.as_path();
 
-    let settings = match Settings::load(Some(config_path)) {
+    let mut settings = match Settings::load(Some(config_path)) {
         Ok(s) => {
             tracing::info!("loaded config {}", config_path.display());
             s
@@ -276,6 +275,20 @@ async fn run_server(config_path: &std::path::Path) {
             std::process::exit(1);
         }
     };
+    if std::env::var("WEBSHELL_SECRET").is_err() && settings.auth.secret_base64.is_none() {
+        settings.auth.secret_base64 = Some(generate_cookie_secret());
+        if let Err(e) = settings.save(config_path) {
+            eprintln!(
+                "startup error: could not persist generated auth.secret_base64 to {}: {e}",
+                config_path.display()
+            );
+            std::process::exit(1);
+        }
+        tracing::info!(
+            "generated and persisted auth.secret_base64 in {}",
+            config_path.display()
+        );
+    }
 
     let config = Config::from_settings(settings);
 
@@ -358,7 +371,30 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
     };
     tracing::info!("enrollment state: {}", enrollment_path.display());
 
-    let sessions = Arc::new(SessionStore::new(config.session_ttl));
+    let sessions = if simple {
+        Arc::new(SessionStore::new(config.session_ttl))
+    } else if let Some(configured_path) = &config.session_path {
+        let session_path = if configured_path.is_absolute() {
+            configured_path.clone()
+        } else {
+            config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(configured_path)
+        };
+        let sessions = match SessionStore::load(session_path.clone(), config.session_ttl) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                eprintln!("startup error: {e}");
+                std::process::exit(1);
+            }
+        };
+        tracing::info!("login session state: {}", session_path.display());
+        sessions
+    } else {
+        tracing::info!("login session state: in-memory only");
+        Arc::new(SessionStore::new(config.session_ttl))
+    };
     tracing::info!("login command: {:?}", config.login_cmd);
     let terminals = Arc::new(Terminals::new(
         config.slots_per_user,
@@ -390,7 +426,6 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
             .build()
             .expect("building the HTTP client"),
         otp_used: Arc::new(Mutex::new(HashMap::new())),
-        config_path: Arc::new(config_path.to_path_buf()),
         key,
     };
 
@@ -435,6 +470,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         .route("/webshell/oauth/start", post(oauth_start))
         .route("/webshell/oauth/callback", get(oauth_callback))
         .route("/webshell/mfa", get(mfa_page).post(mfa_submit))
+        .route("/webshell/mfa/cancel", post(mfa_cancel))
         .route("/favicon.ico", get(favicon))
         .route("/webshell/favicon.ico", get(favicon))
         // Vendored browser assets. Public by necessity — the share-link viewer
@@ -515,6 +551,13 @@ fn load_signing_key(secret_base64: Option<&str>) -> Key {
             Key::generate()
         }
     }
+}
+
+fn generate_cookie_secret() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 64];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    base64::engine::general_purpose::STANDARD.encode(buf)
 }
 
 fn derive_key(master: &[u8], context: &[u8]) -> Vec<u8> {
@@ -781,8 +824,13 @@ async fn login_page(
     jar: SignedCookieJar,
     headers: HeaderMap,
 ) -> Response {
-    if authed_session(&state, &jar).is_some() {
-        return Redirect::to("/webshell/private/").into_response();
+    if let Some((_, session)) = current_session(&state, &jar) {
+        if session.authenticated {
+            return Redirect::to("/webshell/private/").into_response();
+        }
+        if session.mfa_pending {
+            return Redirect::to("/webshell/mfa").into_response();
+        }
     }
     let (jar, id) = ensure_session(&state, jar);
     let csrf = state.sessions.get(&id).map(|s| s.csrf).unwrap_or_default();
@@ -1257,6 +1305,21 @@ async fn mfa_submit(
     let jar = jar.add(session_cookie(&state, new_id));
     tracing::info!("login success for {identity}");
     (jar, Redirect::to("/webshell/private/")).into_response()
+}
+
+async fn mfa_cancel(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if let Some((id, session)) = current_session(&state, &jar).filter(|(_, s)| s.mfa_pending) {
+        if !csrf_matches(&session.csrf, &form.csrf) {
+            return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+        }
+        state.sessions.remove(&id);
+    }
+    let jar = jar.remove(Cookie::from(COOKIE_NAME));
+    (jar, Redirect::to("/webshell/login")).into_response()
 }
 
 #[derive(Deserialize)]

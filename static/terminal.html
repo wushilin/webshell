@@ -10,10 +10,17 @@
   <style>
     /* overscroll-behavior: kill pull-to-refresh / rubber-banding — a swipe
        must never reload the page, even on gestures the app doesn't own. */
-    html, body { height: 100%; margin: 0; background: #000; color: #cbd0d8; overscroll-behavior: none; }
+    html, body {
+      height: 100%; margin: 0; background: #000; color: #cbd0d8;
+      overflow: hidden; overscroll-behavior: none;
+    }
+    @supports (height: 100dvh) {
+      html, body { height: 100dvh; }
+    }
     #bar {
       display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
-      padding: .4rem .6rem; background: #14171d;
+      padding: .4rem max(.6rem, env(safe-area-inset-right)) .4rem max(.6rem, env(safe-area-inset-left));
+      background: #14171d;
       font: .8rem system-ui, sans-serif; box-sizing: border-box;
       border-bottom: 1px solid #23272f;
       position: relative; z-index: 35;
@@ -47,16 +54,27 @@
     #status.wait { color: #e0b34c; }
     form.logout { margin: 0; }
     /* All session panes stack in the same area; only the active one shows. */
-    #panes { position: absolute; left: 0; right: 0; bottom: 0; top: 46px; }
-    .pane { position: absolute; inset: 0; padding: 4px; display: none; }
+    #panes {
+      position: absolute; left: 0; right: 0; bottom: 0; top: 46px;
+      overflow: hidden; will-change: transform;
+    }
+    .pane { position: absolute; inset: 0; padding: 4px; display: none; box-sizing: border-box; }
     .pane.visible { display: block; }
     #more { display: none; }
     @media (max-width: 640px) {
       #bar strong, #bar .user { display: none; }
-      #more { display: inline-block; }
-      .slots { overflow-x: auto; min-width: 0; }
-      #bar { flex-wrap: nowrap; }
-      #status { min-width: 0; font-size: 0; }
+      #bar { flex-wrap: nowrap; gap: .35rem; min-height: 44px; }
+      #more {
+        display: inline-grid; place-items: center; flex: 0 0 36px;
+        width: 36px; height: 32px; padding: 0; font-size: 1.15rem;
+      }
+      .slots {
+        flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none;
+        -webkit-overflow-scrolling: touch; padding-bottom: 1px;
+      }
+      .slots::-webkit-scrollbar { display: none; }
+      .slot { flex: 0 0 32px; height: 28px; }
+      #status { flex: 0 0 14px; min-width: 0; font-size: 0; text-align: center; }
       #status::before {
         content: ""; display: inline-block; width: 10px; height: 10px;
         border-radius: 50%; background: #7ecb7e; vertical-align: middle;
@@ -70,12 +88,15 @@
     .modal-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,.6);
       display: grid; place-items: center; z-index: 50;
-      animation: modalfade .12s ease-out;
+      padding: max(.75rem, env(safe-area-inset-top)) max(.75rem, env(safe-area-inset-right))
+        max(.75rem, env(safe-area-inset-bottom)) max(.75rem, env(safe-area-inset-left));
+      box-sizing: border-box; animation: modalfade .12s ease-out;
     }
     .modal-overlay[hidden] { display: none; }
     .modal {
       background: #1a1d24; border: 1px solid #2c313c; border-radius: 12px;
-      padding: 1.2rem 1.4rem; width: min(92vw, 420px);
+      padding: 1.2rem 1.4rem; width: min(92vw, 420px); max-height: 100%;
+      overflow-y: auto; box-sizing: border-box;
       font: .85rem system-ui, sans-serif; color: #e6e6e6;
       box-shadow: 0 12px 48px rgba(0,0,0,.55);
       animation: modalpop .12s ease-out;
@@ -148,7 +169,8 @@
     #linksEmpty { color: #9aa0aa; padding: .6rem 0; }
     /* Display-settings popover */
     .cog-panel {
-      position: absolute; top: 44px; right: 8px; z-index: 40;
+      position: absolute; top: calc(var(--bar-height, 44px) + 4px);
+      right: max(8px, env(safe-area-inset-right)); z-index: 40;
       background: #1a1d24; border: 1px solid #2c313c; border-radius: 10px;
       padding: .7rem .8rem; font: .8rem system-ui, sans-serif; color: #e6e6e6;
       box-shadow: 0 10px 32px rgba(0,0,0,.5); display: grid; gap: .55rem;
@@ -160,20 +182,83 @@
       border-radius: 6px; padding: .25rem .4rem; font: inherit;
     }
     .cog-panel input[type=number] { width: 4rem; }
+    @media (max-width: 640px) {
+      .cog-panel {
+        left: max(8px, env(safe-area-inset-left)); right: max(8px, env(safe-area-inset-right));
+        max-height: min(70vh, 420px); overflow-y: auto;
+      }
+      #morePanel .action, #morePanel form, #morePanel form .action { width: 100%; box-sizing: border-box; }
+      #morePanel .action { min-height: 38px; text-align: left; }
+      #morePanel label.ro {
+        min-height: 38px; justify-content: flex-start; padding: 0 .1rem; box-sizing: border-box;
+      }
+      .ttl { flex-basis: calc(50% - .2rem); min-height: 40px; }
+      .modal { width: 100%; padding: 1rem; }
+      .modal-actions { flex-direction: column; }
+      .link-row { align-items: stretch; flex-wrap: wrap; }
+      .link-main { flex-basis: 100%; }
+      .link-row .action { flex: 1 1 0; min-height: 36px; }
+    }
     /* Mobile soft-key bar: sits at the bottom of the *visible* viewport,
        above the soft keyboard when it is open. */
     #keybar {
       position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-      display: flex; gap: .25rem; padding: .3rem .4rem; box-sizing: border-box;
-      background: #14171d; border-top: 1px solid #23272f;
+      display: flex; gap: .25rem;
+      padding: .3rem max(.4rem, env(safe-area-inset-right))
+        max(.3rem, env(safe-area-inset-bottom)) max(.4rem, env(safe-area-inset-left));
+      box-sizing: border-box;
+      background: rgba(20, 23, 29, .72); border-top: 1px solid rgba(88, 98, 120, .55);
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
     }
     #keybar[hidden] { display: none; }
     #keybar button {
       flex: 1; min-width: 0; height: 34px; border: 1px solid #2c313c; border-radius: 6px;
-      background: #0f1115; color: #cbd0d8; font: .8rem ui-monospace, monospace;
-      touch-action: manipulation; padding: 0;
+      background: rgba(15, 17, 21, .72); color: #cbd0d8; font: .8rem ui-monospace, monospace;
+      touch-action: manipulation; padding: 0; overflow: hidden; white-space: nowrap;
+      transition: background-color .08s ease-out, border-color .08s ease-out, color .08s ease-out;
     }
     #keybar button.armed { background: #4c8bf5; color: #fff; border-color: #4c8bf5; }
+    #keybar button:active, #keybar button.pressed {
+      background: #6aa0ff; color: #fff; border-color: #9bbdff;
+    }
+    #keybar button svg, #keyCallout button svg {
+      width: 21px; height: 21px; vertical-align: middle; pointer-events: none;
+    }
+    #keybar button.toggle {
+      flex: 0 0 40px; font-family: system-ui, sans-serif; font-size: 1rem;
+    }
+    #keybar.collapsed {
+      left: auto; right: max(.45rem, env(safe-area-inset-right)); width: auto;
+      border: 1px solid #2c313c; border-radius: 10px; box-shadow: 0 8px 26px rgba(0,0,0,.45);
+    }
+    #keybar.collapsed button:not(.toggle) { display: none; }
+    #keybar.collapsed button.toggle { width: 42px; flex-basis: 42px; }
+    #keyCallout {
+      position: fixed; right: max(.45rem, env(safe-area-inset-right));
+      bottom: calc(var(--keybar-bottom, 0px) + var(--keybar-height, 44px) + .45rem);
+      z-index: 45; display: grid; grid-template-columns: repeat(4, minmax(42px, 1fr));
+      gap: .3rem; width: min(92vw, 300px); padding: .45rem;
+      background: rgba(26, 29, 36, .76); border: 1px solid rgba(88, 98, 120, .62); border-radius: 10px;
+      box-shadow: 0 10px 32px rgba(0,0,0,.55); box-sizing: border-box;
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    }
+    #keyCallout[hidden] { display: none; }
+    #keyCallout button {
+      height: 34px; border: 1px solid #2c313c; border-radius: 6px;
+      background: rgba(15, 17, 21, .76); color: #cbd0d8; font: .78rem ui-monospace, monospace;
+      touch-action: manipulation;
+      transition: background-color .08s ease-out, border-color .08s ease-out, color .08s ease-out;
+    }
+    #keyCallout button.wide { grid-column: span 2; font-family: system-ui, sans-serif; }
+    #keyCallout button.armed { background: #4c8bf5; color: #fff; border-color: #4c8bf5; }
+    #keyCallout button:active, #keyCallout button.pressed {
+      background: #6aa0ff; color: #fff; border-color: #9bbdff;
+    }
+    @media (max-width: 420px) {
+      #keybar { gap: .18rem; padding-top: .24rem; }
+      #keybar button { height: 32px; font-size: .72rem; }
+      #keybar button.toggle { flex-basis: 34px; }
+    }
   </style>
 </head>
 <body>
@@ -196,6 +281,7 @@
   </div>
   <div id="panes"></div>
   <div id="keybar" hidden></div>
+  <div id="keyCallout" hidden></div>
 
   <div id="cogPanel" class="cog-panel" hidden>
     <label>Font size <input type="number" id="fontSize" min="8" max="40" step="1" /></label>
@@ -289,13 +375,25 @@
         ["Monospace", "monospace"],
       ];
       const KEY = "webshell.term";
-      const DEF = { fontSize: 14, fontFamily: FONTS[0][1] };
+      const DEF = {
+        fontSize: 14,
+        fontFamily: FONTS[0][1],
+        keyBarCollapsed: false,
+        keyBarTouched: false,
+      };
       function load() {
         try { return Object.assign({}, DEF, JSON.parse(localStorage.getItem(KEY) || "{}")); }
         catch (_) { return Object.assign({}, DEF); }
       }
       function save(p) {
-        try { localStorage.setItem(KEY, JSON.stringify({ fontSize: p.fontSize, fontFamily: p.fontFamily })); }
+        try {
+          localStorage.setItem(KEY, JSON.stringify({
+            fontSize: p.fontSize,
+            fontFamily: p.fontFamily,
+            keyBarCollapsed: !!p.keyBarCollapsed,
+            keyBarTouched: !!p.keyBarTouched,
+          }));
+        }
         catch (_) {}
       }
       function wireControls(prefs, onChange) {
@@ -324,7 +422,7 @@
           panel.hidden = true;
         });
       }
-      return { load, wireControls };
+      return { load, save, wireControls };
     })();
     const prefs = TermPrefs.load();
 
@@ -333,6 +431,23 @@
     const panesEl = document.getElementById("panes");
     const roEl = document.getElementById("ro");
     const enc = new TextEncoder();
+
+    function hardenTermTextarea(pane) {
+      const ta = pane.querySelector(".xterm-helper-textarea");
+      if (!ta) return null;
+      ta.setAttribute("autocomplete", "off");
+      ta.setAttribute("autocorrect", "off");
+      ta.setAttribute("autocapitalize", "none");
+      ta.setAttribute("spellcheck", "false");
+      ta.setAttribute("data-form-type", "other");
+      ta.setAttribute("data-lpignore", "true");
+      ta.setAttribute("data-1p-ignore", "true");
+      return ta;
+    }
+
+    function applyAssistantPref() {
+      sessions.forEach((s) => { if (s) hardenTermTextarea(s.pane); });
+    }
 
     // One independent, always-connected session per slot, created lazily on
     // first visit and kept alive afterward — so switching between opened slots
@@ -537,15 +652,9 @@
         // Best-effort: keep mobile autofill (passwords/cards/addresses) and
         // text suggestions away from xterm's hidden textarea. The browser's
         // keyboard accessory UI is not fully page-controllable.
-        const ta = this.pane.querySelector(".xterm-helper-textarea");
+        const ta = hardenTermTextarea(this.pane);
         if (ta) {
-          ta.setAttribute("autocomplete", "off");
-          ta.setAttribute("autocorrect", "off");
-          ta.setAttribute("autocapitalize", "none");
-          ta.setAttribute("spellcheck", "false");
           ta.setAttribute("name", "xt-" + this.index);
-          ta.setAttribute("data-form-type", "other");
-          ta.setAttribute("data-lpignore", "true");
         }
 
         this.term.onData((d) => this.input(d));
@@ -645,11 +754,14 @@
       // one-shot Ctrl modifier, then forwards to the socket.
       input(d) {
         if (this.suppressReports) return;
-        if (ctrlArmed || shiftArmed) {
-          if (ctrlArmed && d.length === 1) d = ctrlTransform(d);
+        if (ctrlArmed || shiftArmed || altArmed) {
+          if (d.length === 1) {
+            if (ctrlArmed) d = ctrlTransform(d);
+            if (altArmed) d = "\x1b" + d;
+          }
           // One-shot: any chunk consumes both modifiers. Typed characters
           // have no bar-shift form — the native keyboard's shift owns them.
-          setCtrl(false); setShift(false);
+          setCtrl(false); setShift(false); setAlt(false);
         }
         if (!this.readOnly) Conn.sendInput(this.index, d);
       }
@@ -786,7 +898,9 @@
         barEl.appendChild(cogBtn);
         barEl.appendChild(logoutForm);
       }
+      document.documentElement.style.setProperty("--bar-height", barEl.offsetHeight + "px");
       panesEl.style.top = barEl.offsetHeight + "px";
+      requestAnimationFrame(scheduleLayout);
     }
     moreBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -804,16 +918,52 @@
 
     // ---- mobile key bar (touch devices only) ----
     const keyBar = document.getElementById("keybar");
-    let ctrlArmed = false, shiftArmed = false;
-    let ctrlBtn = null, shiftBtn = null;
+    const keyCallout = document.getElementById("keyCallout");
+    let ctrlArmed = false, shiftArmed = false, altArmed = false;
+    let ctrlBtn = null, shiftBtn = null, altBtn = null, calloutBtn = null;
+    let keyBarToggleBtn = null;
 
     function setCtrl(on) {
       ctrlArmed = on;
-      if (ctrlBtn) ctrlBtn.classList.toggle("armed", on);
+      [ctrlBtn, keyCallout.querySelector("[data-mod=ctrl]")].forEach((b) => {
+        if (b) b.classList.toggle("armed", on);
+      });
     }
     function setShift(on) {
       shiftArmed = on;
-      if (shiftBtn) shiftBtn.classList.toggle("armed", on);
+      [shiftBtn, keyCallout.querySelector("[data-mod=shift]")].forEach((b) => {
+        if (b) b.classList.toggle("armed", on);
+      });
+    }
+    function setAlt(on) {
+      altArmed = on;
+      [altBtn, keyCallout.querySelector("[data-mod=alt]")].forEach((b) => {
+        if (b) b.classList.toggle("armed", on);
+      });
+    }
+    function closeKeyCallout() {
+      keyCallout.hidden = true;
+      if (calloutBtn) {
+        calloutBtn.classList.remove("armed");
+        calloutBtn.textContent = "▤";
+        calloutBtn.title = "Open key drawer";
+      }
+    }
+    function setKeyBarCollapsed(on, touched) {
+      prefs.keyBarCollapsed = !!on;
+      if (touched) prefs.keyBarTouched = true;
+      keyBar.classList.toggle("collapsed", prefs.keyBarCollapsed);
+      closeKeyCallout();
+      if (keyBarToggleBtn) {
+        keyBarToggleBtn.textContent = prefs.keyBarCollapsed ? "⌃" : "⌄";
+        keyBarToggleBtn.title = prefs.keyBarCollapsed ? "Open modifier keypad" : "Collapse modifier keypad";
+      }
+      TermPrefs.save(prefs);
+      requestAnimationFrame(scheduleLayout);
+    }
+    function flashKey(btn) {
+      btn.classList.add("pressed");
+      setTimeout(() => { btn.classList.remove("pressed"); }, 110);
     }
     // Map a keystroke to its control byte: letters and @[\]^_ use code&31,
     // ? maps to DEL; anything else passes through unchanged.
@@ -826,38 +976,124 @@
     // CSI final bytes for arrows, used for modifier encoding.
     const ARROWS = { "\x1b[A": "A", "\x1b[B": "B", "\x1b[D": "D", "\x1b[C": "C" };
     const KEYS = [
-      ["esc", "\x1b"], ["tab", "\t"], ["ctrl", "MOD_CTRL"], ["shift", "MOD_SHIFT"],
+      ["esc", "\x1b"], ["tab", "\t"], ["ctrl", "MOD_CTRL"], ["alt", "MOD_ALT"],
+      ["shift", "MOD_SHIFT"],
       ["↑", "\x1b[A"], ["↓", "\x1b[B"], ["←", "\x1b[D"], ["→", "\x1b[C"],
     ];
+    const EXTRA_KEYS = [
+      ["F1", "\x1bOP"], ["F2", "\x1bOQ"], ["F3", "\x1bOR"], ["F4", "\x1bOS"],
+      ["F5", "\x1b[15~"], ["F6", "\x1b[17~"], ["F7", "\x1b[18~"], ["F8", "\x1b[19~"],
+      ["F9", "\x1b[20~"], ["F10", "\x1b[21~"], ["F11", "\x1b[23~"], ["F12", "\x1b[24~"],
+      ["home", "\x1b[H"], ["end", "\x1b[F"], ["pgup", "\x1b[5~"], ["pgdn", "\x1b[6~"],
+      ["ins", "\x1b[2~"], ["del", "\x1b[3~"], ["break", "\x03"], ["clear", "\x0c"],
+      ["`", "`"],
+    ];
+    function sendKeySeq(seq) {
+      const s = sessions[active];
+      if (!s) return;
+      let out = seq;
+      const mod = 1 + (shiftArmed ? 1 : 0) + (altArmed ? 2 : 0) + (ctrlArmed ? 4 : 0);
+      if (ARROWS[seq] && mod > 1) {
+        out = "\x1b[1;" + mod + ARROWS[seq];
+        setCtrl(false); setShift(false); setAlt(false);
+      } else if (seq === "\t" && shiftArmed) {
+        out = "\x1b[Z";
+        setCtrl(false); setShift(false); setAlt(false);
+      }
+      s.input(out);
+    }
+    function setKeyLabel(button, label) {
+      if (label !== "shift") {
+        button.textContent = label;
+        return;
+      }
+      button.title = "Shift";
+      button.setAttribute("aria-label", "Shift");
+      button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4.5 11H8v7h8v-7h3.5L12 3Z"/></svg>';
+    }
     KEYS.forEach(([label, seq]) => {
       const b = document.createElement("button");
-      b.textContent = label;
+      b.type = "button";
+      setKeyLabel(b, label);
       // pointerdown + preventDefault: never move focus, so the soft
       // keyboard stays up while tapping bar keys.
       b.addEventListener("pointerdown", (e) => {
         e.preventDefault();
+        flashKey(b);
         if (seq === "MOD_CTRL") { setCtrl(!ctrlArmed); return; }
         if (seq === "MOD_SHIFT") { setShift(!shiftArmed); return; }
-        const s = sessions[active];
-        if (!s) return;
-        let out = seq;
-        // Armed modifiers give arrows/tab their CSI-modified forms here; the
-        // generic one-shot consumption in input() covers every other key.
-        const mod = 1 + (shiftArmed ? 1 : 0) + (ctrlArmed ? 4 : 0);
-        if (ARROWS[seq] && mod > 1) {
-          out = "\x1b[1;" + mod + ARROWS[seq];
-          setCtrl(false); setShift(false);
-        } else if (seq === "\t" && shiftArmed) {
-          out = "\x1b[Z";
-          setCtrl(false); setShift(false);
-        }
-        s.input(out);
+        if (seq === "MOD_ALT") { setAlt(!altArmed); return; }
+        sendKeySeq(seq);
       });
       if (seq === "MOD_CTRL") ctrlBtn = b;
       if (seq === "MOD_SHIFT") shiftBtn = b;
+      if (seq === "MOD_ALT") altBtn = b;
       keyBar.appendChild(b);
     });
-    if (window.matchMedia("(pointer: coarse) and (hover: none)").matches) keyBar.hidden = false;
+    calloutBtn = document.createElement("button");
+    calloutBtn.type = "button";
+    calloutBtn.textContent = "▤";
+    calloutBtn.title = "Open key drawer";
+    calloutBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      flashKey(calloutBtn);
+      const open = keyCallout.hidden;
+      keyCallout.hidden = !open;
+      calloutBtn.classList.toggle("armed", open);
+      calloutBtn.textContent = open ? "▥" : "▤";
+      calloutBtn.title = open ? "Close key drawer" : "Open key drawer";
+      const s = sessions[active];
+      if (s) s.term.focus();
+    });
+    keyBar.appendChild(calloutBtn);
+
+    EXTRA_KEYS.forEach(([label, seq]) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      setKeyLabel(b, label);
+      if (seq === "COLLAPSE" || seq === "CLOSE") b.classList.add("wide");
+      if (seq === "MOD_CTRL") b.dataset.mod = "ctrl";
+      if (seq === "MOD_SHIFT") b.dataset.mod = "shift";
+      if (seq === "MOD_ALT") b.dataset.mod = "alt";
+      b.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        flashKey(b);
+        if (seq === "MOD_CTRL") { setCtrl(!ctrlArmed); return; }
+        if (seq === "MOD_SHIFT") { setShift(!shiftArmed); return; }
+        if (seq === "MOD_ALT") { setAlt(!altArmed); return; }
+        if (seq === "COLLAPSE") { setKeyBarCollapsed(true, true); return; }
+        if (seq === "CLOSE") { closeKeyCallout(); return; }
+        sendKeySeq(seq);
+      });
+      keyCallout.appendChild(b);
+    });
+    document.addEventListener("pointerdown", (e) => {
+      if (keyCallout.hidden) return;
+      if (keyCallout.contains(e.target) || keyBar.contains(e.target)) return;
+      closeKeyCallout();
+    });
+    keyBarToggleBtn = document.createElement("button");
+    keyBarToggleBtn.type = "button";
+    keyBarToggleBtn.className = "toggle";
+    keyBarToggleBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      flashKey(keyBarToggleBtn);
+      setKeyBarCollapsed(!prefs.keyBarCollapsed, true);
+      const s = sessions[active];
+      if (s) s.term.focus();
+    });
+    keyBar.appendChild(keyBarToggleBtn);
+    setKeyBarCollapsed(prefs.keyBarCollapsed, false);
+    const coarsePointer = window.matchMedia("(pointer: coarse)");
+    function updateKeyBarVisibility() {
+      keyBar.hidden = false;
+      if (!coarsePointer.matches && !prefs.keyBarTouched) {
+        setKeyBarCollapsed(true, false);
+      }
+      requestAnimationFrame(scheduleLayout);
+    }
+    if (coarsePointer.addEventListener) coarsePointer.addEventListener("change", updateKeyBarVisibility);
+    updateKeyBarVisibility();
 
     function activate(i) {
       active = i;
@@ -1269,14 +1505,19 @@
       scheduleSlotsRefresh();
     });
 
-    // ---- keyboard-aware layout: shift panes visually when the soft keyboard
-    // opens, instead of resizing them. iOS WebKit does not shrink the layout
-    // viewport for the soft keyboard — it scrolls the page instead. Pin the
-    // scroll and derive the occluded height from visualViewport. The key bar
-    // rides on top of the keyboard, and the panes slide up behind the top bar
-    // instead of shrinking. ----
+    // ---- keyboard-aware layout: resize the terminal around the soft keyboard.
+    // iOS WebKit does not shrink the layout viewport for the soft keyboard; it
+    // scrolls the page instead. Pin the scroll, derive the occluded height from
+    // visualViewport, and reserve that space in the terminal pane. ----
     let layoutQueued = false;
     let lastW = 0, lastH = 0;
+    let lastPaneTop = "", lastPaneBottom = "";
+    function termInputFocused() {
+      const s = sessions[active];
+      return !!(s && s.pane.contains(document.activeElement) &&
+        document.activeElement.classList &&
+        document.activeElement.classList.contains("xterm-helper-textarea"));
+    }
     function layoutViewport() {
       layoutQueued = false;
       const vv = window.visualViewport;
@@ -1285,31 +1526,29 @@
         if (window.scrollY) window.scrollTo(0, 0);
         // Pinch-zoom also shrinks vv.height/offsetTop; don't mistake that
         // for keyboard occlusion.
-        occluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        const rawOccluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        // iPad with a hardware keyboard can report visualViewport deltas even
+        // when there is no software keyboard. Only resize for a substantial
+        // keyboard-sized occlusion while xterm owns text focus.
+        if (termInputFocused() && rawOccluded > 80) occluded = rawOccluded;
       }
-      const kb = keyBar.hidden ? 0 : keyBar.offsetHeight;
+      const kb = keyBar.hidden || keyBar.classList.contains("collapsed") ? 0 : keyBar.offsetHeight;
       keyBar.style.bottom = occluded + "px";
+      document.documentElement.style.setProperty("--keybar-bottom", occluded + "px");
+      document.documentElement.style.setProperty("--keybar-height", (keyBar.hidden ? 0 : keyBar.offsetHeight) + "px");
+      document.documentElement.style.setProperty("--bar-height", barEl.offsetHeight + "px");
       panesEl.style.top = barEl.offsetHeight + "px";
-      panesEl.style.bottom = kb + "px";
-      // Keyboard = pure visual shift: slide the panes up so the prompt line
-      // stays visible above the key bar. No fit, no cols/rows change, no
-      // PTY-resize round-trip on keyboard open/close — the top rows just
-      // slide behind the top bar until the keyboard goes away.
-      // Clamp the shift so the cursor row never slides behind the top bar —
-      // on a fresh/cleared screen the prompt is in the TOP rows and a full
-      // shift would hide exactly what the user is typing into.
-      let shift = occluded;
-      const a = sessions[active];
-      if (a && occluded) {
-        const rowH = a.pane.clientHeight / a.term.rows;
-        shift = Math.min(occluded, Math.max(0, Math.floor(a.term.buffer.active.cursorY * rowH)));
-      }
-      panesEl.style.transform = shift ? "translateY(-" + shift + "px)" : "";
-      // Refit only when the layout viewport really changed (orientation,
-      // desktop window resize). The soft keyboard never alters
-      // innerWidth/Height on iOS or modern Android, so it can't refit.
-      if (window.innerWidth !== lastW || window.innerHeight !== lastH) {
+      panesEl.style.bottom = (occluded + kb) + "px";
+      panesEl.style.transform = "";
+      // Refit when either the layout viewport or the reserved insets change.
+      // On iOS, keyboard open/close usually changes visualViewport rather than
+      // innerHeight, so the pane bottom check is what drives terminal resize.
+      const paneTop = panesEl.style.top;
+      const paneBottom = panesEl.style.bottom;
+      if (window.innerWidth !== lastW || window.innerHeight !== lastH ||
+          paneTop !== lastPaneTop || paneBottom !== lastPaneBottom) {
         lastW = window.innerWidth; lastH = window.innerHeight;
+        lastPaneTop = paneTop; lastPaneBottom = paneBottom;
         const s = sessions[active];
         if (s) s.fitAndResize();
       }
@@ -1323,6 +1562,8 @@
       window.visualViewport.addEventListener("resize", scheduleLayout);
       window.visualViewport.addEventListener("scroll", scheduleLayout);
     }
+    document.addEventListener("focusin", scheduleLayout);
+    document.addEventListener("focusout", scheduleLayout);
     window.addEventListener("resize", scheduleLayout);
     scheduleLayout();
 

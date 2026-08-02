@@ -23,6 +23,7 @@
     input { border:1px solid #2c313c; background:#0f1115; color:#e6e6e6; }
     button { margin-top:1rem; border:0; background:#4c8bf5; color:white; font-weight:600; }
     button:disabled { background:#39414f; color:#b7bdc8; cursor:progress; }
+    button.secondary { background:#0f1115; color:#cbd0d8; border:1px solid #2c313c; }
     .error { color:#ff6b6b; }
   </style>
 </head>
@@ -41,6 +42,7 @@
         <p id="copyStatus" role="status" aria-live="polite"></p>
       </div>
       <button type="button" id="next">Next: verify code</button>
+      <button type="submit" class="secondary" formnovalidate formaction="/webshell/mfa/cancel">Cancel</button>
     </div>
     <div id="verifyStep" hidden>
       <h2>Verify authenticator</h2>
@@ -50,6 +52,7 @@
       <input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required />
       <button id="verify" type="submit">Verify and continue</button>
       <button type="button" id="back">Back</button>
+      <button type="submit" class="secondary" formnovalidate formaction="/webshell/mfa/cancel">Cancel</button>
     </div>
     <input type="hidden" name="csrf" value="{{CSRF}}" />
     <!-- The candidate secret rides with the form: nothing is stored until a
@@ -100,6 +103,7 @@
         btn.textContent = LABEL;
       }
       form.addEventListener("submit", (e) => {
+        if (e.submitter && e.submitter.formAction.endsWith("/webshell/mfa/cancel")) return;
         if (sent) { e.preventDefault(); return; }
         if (!form.checkValidity()) return;
         sent = true;

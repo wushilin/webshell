@@ -15,6 +15,49 @@ See https://github.com/wushilin/tlsproxy_rs
 
 You can proxy /webshell to this service by reverse proxy, or simply using SNI host.example.com to do TLS -> Plaintext to this service. Both OK.
 
+## Quick start (no config)
+
+To try it out or share a shell quickly, `webshell simple` needs no config file,
+no MFA and no Google — just one local user, straight from the environment:
+
+```sh
+cargo build --release
+WEBSHELL_USER=alice WEBSHELL_PASSWORD=hunter2 target/release/webshell simple
+# Web Shell listening on http://127.0.0.1:9023/webshell/
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEBSHELL_USER` | *(required)* | The single username to log in as. |
+| `WEBSHELL_PASSWORD` | *(required)* | Its password (checked verbatim; not hashed). |
+| `WEBSHELL_BIND` | `127.0.0.1:9023` | Listen address. Set `0.0.0.0:PORT` to expose it. |
+
+```sh
+# expose on all interfaces, custom port
+WEBSHELL_BIND=0.0.0.0:12702 WEBSHELL_USER=alice WEBSHELL_PASSWORD=hunter2 target/release/webshell simple
+```
+
+Nothing is written to disk and no enrollment or session file is created. This
+mode is meant for quick, local, trusted sharing — the password lives in the
+process environment, and there is no second factor. For anything exposed to the
+internet, use the full config below: put it behind TLS and enable MFA.
+
+## Build
+
+```sh
+cargo build --release
+```
+
+For a fully static binary that runs on any Linux with no shared libraries:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+This works because nothing here depends on the host's auth stack — no PAM, no
+`dlopen`, no setuid helper. `./build-x86_64.sh` cross-compiles a glibc build via
+`cargo-zigbuild` if you prefer one.
+
 ## Stateful: the shell outlives the connection
 
 This is the point of the project, so it is worth being explicit about.
@@ -193,50 +236,6 @@ browser (xterm.js)  ──TLS──►  reverse proxy  ──►  webshell (axum
   single middleware layer).
 - `/webshell/public/access?token=…` — the login-free, read-only viewer.
 
-## Build
-
-```sh
-cargo build --release
-```
-
-For a fully static binary that runs on any Linux with no shared libraries:
-
-```sh
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-This works because nothing here depends on the host's auth stack — no PAM, no
-`dlopen`, no setuid helper. `./build-x86_64.sh` cross-compiles a glibc build via
-`cargo-zigbuild` if you prefer one.
-
-## Quick start (no config)
-
-To try it out or share a shell quickly, `webshell simple` needs no config file,
-no MFA and no Google — just one local user, straight from the environment:
-
-```sh
-WEBSHELL_USER=alice WEBSHELL_PASSWORD=hunter2 webshell simple
-# Web Shell listening on http://127.0.0.1:9023/webshell/
-```
-
-| Variable | Default | Description |
-|---|---|---|
-| `WEBSHELL_USER` | *(required)* | The single username to log in as. |
-| `WEBSHELL_PASSWORD` | *(required)* | Its password (checked verbatim; not hashed). |
-| `WEBSHELL_BIND` | `127.0.0.1:9023` | Listen address. Set `0.0.0.0:PORT` to expose it. |
-
-```sh
-# expose on all interfaces, custom port
-WEBSHELL_BIND=0.0.0.0:12702 WEBSHELL_USER=alice WEBSHELL_PASSWORD=hunter2 webshell simple
-```
-
-Nothing is written to disk and no enrollment file is created. This mode is meant
-for quick, local, trusted sharing — the password lives in the process
-environment, and there is no second factor. For anything exposed to the
-internet, use the full config below (put it behind TLS, enable MFA), and note
-that `cookie_secure` stays `false` here, so serve `simple` over plain HTTP on a
-trusted network rather than fronting it with HTTPS.
-
 ## Configure
 
 Configuration is a TOML file (default `config.toml`), grouped into tables:
@@ -260,7 +259,8 @@ Every table and key is optional; a missing one falls back to the default.
 | `[auth]` | `users` | *(empty)* | The allowlist, as `provider:subject`. Nobody can log in while empty. |
 | | `login_methods` | `["local"]` | `"local"`, `"google"`, or both. |
 | | `session_ttl_secs` | `28800` | Login-session lifetime. |
-| | `secret_base64` | *(ephemeral)* | base64 cookie key (≥64 bytes). Unset resets every session on restart. |
+| | `session_path` | *(none)* | Optional restart-surviving login session state file. Relative paths resolve beside the config file. |
+| | `secret_base64` | *(generated)* | base64 cookie key (≥64 bytes). If unset in config-backed mode, webshell generates one and writes it into the config on startup. |
 | `[mfa]` | `required` | `true` | Require a TOTP code. |
 | | `enrollment_path` | `enrollment.toml` | Per-identity enrollment state, relative to the config file. |
 | `[google]` | `client_id` | *(none)* | OAuth client ID. |
@@ -334,7 +334,8 @@ cookie_secure = true
 [auth]
 users = ["local:alice"]
 login_methods = ["local"]
-secret_base64 = "..."          # openssl rand -base64 64
+session_path = "sessions.toml"
+# secret_base64 is generated and persisted on first startup if omitted.
 
 [mfa]
 required = true
@@ -469,14 +470,18 @@ invalid config: No login methods possible.
   restrict who can reach it.
 - **Protect the config file.** It holds the cookie key, the Google client secret
   and every local password hash. Keep it `0600`; webshell writes
-  `enrollment.toml` that way itself.
+  `enrollment.toml` and configured session stores that way itself.
 - **`local:` passwords are not system passwords.** They are webshell's own, and
   their hashes live in a file owned by the account being protected rather than in
   root-only `/etc/shadow`. Use hashes, not plaintext, and pair them with MFA.
 - **One OS account.** Multiple identities mean separate workspaces, not separate
   privileges — everyone who can log in gets a shell as the process owner.
-- **Set a stable `secret_base64`.** Without it a restart invalidates every login
-  session and every outstanding share link.
+- **Session persistence is opt-in login persistence, not PTY persistence.** Set
+  `[auth].session_path` to keep meaningful login state across restarts:
+  authenticated sessions, MFA-pending sessions and in-progress Google flows.
+  Anonymous login-page CSRF sessions stay memory-only and bounded. Running
+  shells still live in the webshell process, so a webshell restart drops
+  terminal processes even though the browser login can survive.
 - The server is in the keystroke path, as with any web terminal — run it only on
   hosts and networks you trust.
 

@@ -72,8 +72,12 @@ pub struct Auth {
     pub login_methods: Vec<String>,
     /// Absolute login-session lifetime, seconds.
     pub session_ttl_secs: u64,
-    /// base64 cookie signing key (>=64 bytes). Unset = ephemeral, which resets
-    /// every login session on restart.
+    /// Where restart-surviving login sessions are kept. Relative paths resolve
+    /// against the config file's directory. Unset = in-memory only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<String>,
+    /// base64 cookie signing key (>=64 bytes). In config-backed mode, unset is
+    /// generated and persisted on startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_base64: Option<String>,
 }
@@ -84,6 +88,7 @@ impl Default for Auth {
             users: Vec::new(),
             login_methods: vec!["local".into()],
             session_ttl_secs: 8 * 3600,
+            session_path: None,
             secret_base64: None,
         }
     }
@@ -269,6 +274,7 @@ pub struct Config {
     pub envs: std::collections::BTreeMap<String, String>,
     pub scrollback_cap: usize,
     pub session_ttl: Duration,
+    pub session_path: Option<std::path::PathBuf>,
     pub cookie_secure: bool,
     /// Origins accepted on top of the request's own Host: the configured
     /// extras plus public_base_url. Normalized — no path, no trailing slash —
@@ -407,6 +413,7 @@ impl Config {
             envs: s.terminals.envs,
             scrollback_cap,
             session_ttl: Duration::from_secs(s.auth.session_ttl_secs.max(60)),
+            session_path: s.auth.session_path.map(Into::into),
             cookie_secure: s.network.cookie_secure,
             allowed_origins,
             strict_origin: s.network.strict_origin,

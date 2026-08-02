@@ -18,6 +18,8 @@
     button { margin-top:1.2rem; width:100%; padding:.65rem; border:0; border-radius:8px; background:#4c8bf5; color:#fff; font-size:.95rem; font-weight:600; cursor:pointer; }
     button:hover { background:#3f7be0; }
     button:disabled { background:#39414f; color:#b7bdc8; cursor:progress; }
+    button.secondary { margin-top:.6rem; background:#0f1115; color:#cbd0d8; border:1px solid #2c313c; }
+    button.secondary:hover { border-color:#4c8bf5; background:#111720; }
     .error { color:#ff6b6b; font-size:.85rem; margin:.75rem 0 0; }
   </style>
 </head>
@@ -32,6 +34,7 @@
     <input type="hidden" name="csrf" value="{{CSRF}}" />
     <p class="error" id="clientError" hidden></p>
     <button id="verify" type="submit">Verify</button>
+    <button type="submit" class="secondary" formnovalidate formaction="/webshell/mfa/cancel">Cancel</button>
   </form>
   <script nonce="{{NONCE}}">
     // Same one-submission guard as the login form: verification runs behind a
@@ -43,6 +46,7 @@
       let sent = false;
       function rearm() { sent = false; btn.disabled = false; btn.textContent = "Verify"; }
       form.addEventListener("submit", (e) => {
+        if (e.submitter && e.submitter.formAction.endsWith("/webshell/mfa/cancel")) return;
         if (sent) { e.preventDefault(); return; }
         if (!form.checkValidity()) return;
         sent = true;
