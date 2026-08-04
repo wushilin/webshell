@@ -55,20 +55,35 @@ fn mode_str(m: AttachMode) -> &'static str {
     }
 }
 
+/// Optional `init` member: mode-reinstating sequences the client writes after
+/// its reset, before the replay blob. Out-of-band on purpose — inside the
+/// replay these bytes would inflate the client's stream offset. The bytes are
+/// synthesized DECSETs (ESC, `[?;hl`, digits), so ESC is the only character
+/// needing a JSON escape.
+fn init_json(init: &[u8]) -> String {
+    if init.is_empty() {
+        return String::new();
+    }
+    let ascii: String = init.iter().map(|&b| b as char).collect();
+    format!(r#","init":"{}""#, ascii.replace('\u{1b}', "\\u001b"))
+}
+
 fn hello_json(term: Option<usize>, a: &Attachment) -> String {
     match term {
         Some(t) => format!(
-            r#"{{"type":"hello","term":{},"mode":"{}","epoch":{},"offset":{}}}"#,
+            r#"{{"type":"hello","term":{},"mode":"{}","epoch":{},"offset":{}{}}}"#,
             t,
             mode_str(a.mode),
             a.epoch,
-            a.base_offset
+            a.base_offset,
+            init_json(&a.init)
         ),
         None => format!(
-            r#"{{"type":"hello","mode":"{}","epoch":{},"offset":{}}}"#,
+            r#"{{"type":"hello","mode":"{}","epoch":{},"offset":{}{}}}"#,
             mode_str(a.mode),
             a.epoch,
-            a.base_offset
+            a.base_offset,
+            init_json(&a.init)
         ),
     }
 }
@@ -458,4 +473,23 @@ pub async fn bridge(
     }
 
     // Do NOT kill the shell here — slots are persistent and resumable.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_init_is_omitted_from_the_hello() {
+        assert_eq!(init_json(b""), "");
+    }
+
+    #[test]
+    fn init_escapes_esc_for_json() {
+        let frag = init_json(b"\x1b[?1049h");
+        assert_eq!(frag, r#","init":"\u001b[?1049h""#);
+        let json = format!(r#"{{"type":"hello"{frag}}}"#);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["init"], "\u{1b}[?1049h");
+    }
 }

@@ -44,6 +44,117 @@ pub enum AttachMode {
     Replay,
 }
 
+/// Scanner position of a [`ModeTracker`] between feeds. Sequences routinely
+/// straddle eviction boundaries, so the position must persist across calls.
+enum Scan {
+    Ground,
+    Esc,
+    Csi { buf: Vec<u8> },
+}
+
+/// Tracks the DECSET private modes a replay's oldest byte assumes. Fed
+/// exactly the bytes evicted from the ring's front, it answers: which modes
+/// did the trimmed-away prefix leave enabled? A full replay must reinstate
+/// those (alt screen above all — a fullscreen app whose `?1049h` scrolled out
+/// of the ring would otherwise redraw into the primary buffer, and its exit
+/// would restore nothing).
+struct ModeTracker {
+    st: Scan,
+    /// `?1`: application cursor keys.
+    app_cursor: bool,
+    /// `?25l`: cursor hidden (visible is the default).
+    cursor_hidden: bool,
+    /// `?47`/`?1047`/`?1049`: alt screen, remembering which variant enabled it.
+    alt_screen: Option<u16>,
+    /// `?2004`: bracketed paste.
+    bracketed_paste: bool,
+}
+
+impl ModeTracker {
+    fn new() -> Self {
+        ModeTracker {
+            st: Scan::Ground,
+            app_cursor: false,
+            cursor_hidden: false,
+            alt_screen: None,
+            bracketed_paste: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.st = match std::mem::replace(&mut self.st, Scan::Ground) {
+                Scan::Ground if b == 0x1b => Scan::Esc,
+                Scan::Ground => Scan::Ground,
+                Scan::Esc if b == b'[' => Scan::Csi { buf: Vec::new() },
+                Scan::Esc if b == 0x1b => Scan::Esc,
+                Scan::Esc => Scan::Ground,
+                Scan::Csi { mut buf } => match b {
+                    // Parameter and intermediate bytes. The cap only guards
+                    // against pathological streams; real DECSETs are short.
+                    0x20..=0x3f => {
+                        if buf.len() < 32 {
+                            buf.push(b);
+                        }
+                        Scan::Csi { buf }
+                    }
+                    0x40..=0x7e => {
+                        self.dispatch(&buf, b);
+                        Scan::Ground
+                    }
+                    0x1b => Scan::Esc,
+                    // C0 controls inside a CSI are executed by terminals
+                    // without aborting the sequence; ignore them likewise.
+                    _ => Scan::Csi { buf },
+                },
+            };
+        }
+    }
+
+    fn dispatch(&mut self, buf: &[u8], final_byte: u8) {
+        let set = match final_byte {
+            b'h' => true,
+            b'l' => false,
+            _ => return,
+        };
+        let Some(params) = buf.strip_prefix(b"?") else {
+            return;
+        };
+        for p in params.split(|&b| b == b';') {
+            let Some(n) = std::str::from_utf8(p).ok().and_then(|s| s.parse::<u16>().ok()) else {
+                continue;
+            };
+            match n {
+                1 => self.app_cursor = set,
+                25 => self.cursor_hidden = !set,
+                47 | 1047 | 1049 => self.alt_screen = if set { Some(n) } else { None },
+                2004 => self.bracketed_paste = set,
+                _ => {}
+            }
+        }
+    }
+
+    /// Sequences reinstating every non-default mode, for the head of a replay.
+    /// Alt screen first: entering it clears the (just-reset) alt buffer before
+    /// the replayed frames draw.
+    fn synth(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(n) = self.alt_screen {
+            out.extend_from_slice(format!("\x1b[?{n}h").as_bytes());
+        }
+        if self.app_cursor {
+            out.extend_from_slice(b"\x1b[?1h");
+        }
+        if self.bracketed_paste {
+            out.extend_from_slice(b"\x1b[?2004h");
+        }
+        if self.cursor_hidden {
+            out.extend_from_slice(b"\x1b[?25l");
+        }
+        out
+    }
+}
+
 /// Capped ring buffer of recent shell output, replayed to new clients.
 struct Scrollback {
     buf: VecDeque<u8>,
@@ -51,6 +162,9 @@ struct Scrollback {
     /// Total bytes ever pushed since spawn (monotonic, not capped). The
     /// client mirrors this count; resume = serving the difference.
     total: u64,
+    /// Mode state at the ring's front — what the oldest surviving byte
+    /// assumes the terminal looks like. See [`ModeTracker`].
+    front_state: ModeTracker,
 }
 
 impl Scrollback {
@@ -59,14 +173,25 @@ impl Scrollback {
             buf: VecDeque::new(),
             cap,
             total: 0,
+            front_state: ModeTracker::new(),
         }
     }
     fn push(&mut self, data: &[u8]) {
         self.total += data.len() as u64;
         self.buf.extend(data.iter().copied());
+        let mut evicted = Vec::new();
         while self.buf.len() > self.cap {
-            self.buf.pop_front();
+            evicted.push(self.buf.pop_front().expect("len > cap > 0"));
         }
+        self.front_state.feed(&evicted);
+    }
+
+    /// Escape sequences a full replay must be prefixed with so the ring's
+    /// bytes render against the mode state they were emitted under. Sent to
+    /// the client out-of-band (hello `init`), never counted in the stream
+    /// offset. Empty whenever the enabling sequences still live in the ring.
+    fn front_init(&self) -> Vec<u8> {
+        self.front_state.synth()
     }
     fn snapshot(&self) -> Vec<u8> {
         self.buf.iter().copied().collect()
@@ -155,6 +280,10 @@ pub struct Attachment {
     pub epoch: u64,
     /// Stream position where `replay` begins.
     pub base_offset: u64,
+    /// Mode-reinstating prefix for a full replay (see `Scrollback::front_init`).
+    /// Delivered in the hello, outside the offset-counted stream. Empty on
+    /// resume.
+    pub init: Vec<u8>,
 }
 
 struct UserPool {
@@ -284,6 +413,10 @@ impl Terminals {
         // there is no gap/overlap at the cut point.
         let sb = lock(&term.scrollback);
         let (mode, base_offset, replay) = sb.cut(client_offset);
+        let init = match mode {
+            AttachMode::Replay => sb.front_init(),
+            AttachMode::Resume => Vec::new(),
+        };
         let output_rx = term.output_tx.subscribe();
         drop(sb);
 
@@ -295,6 +428,7 @@ impl Terminals {
             mode,
             epoch: term.epoch,
             base_offset,
+            init,
         })
     }
 
@@ -327,6 +461,10 @@ impl Terminals {
         // there is no gap/overlap at the cut point.
         let sb = lock(&term.scrollback);
         let (mode, base_offset, replay) = sb.cut(client_offset);
+        let init = match mode {
+            AttachMode::Replay => sb.front_init(),
+            AttachMode::Resume => Vec::new(),
+        };
         let output_rx = term.output_tx.subscribe();
         drop(sb);
         Ok(Attachment {
@@ -337,6 +475,7 @@ impl Terminals {
             mode,
             epoch: term.epoch,
             base_offset,
+            init,
         })
     }
 
@@ -626,6 +765,62 @@ mod tests {
         assert_eq!(mode, AttachMode::Replay);
         assert_eq!(base, 0);
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn replay_reinstates_alt_screen_trimmed_from_the_ring() {
+        let mut s = Scrollback::new(16);
+        s.push(b"\x1b[?1049h"); // fullscreen app enters the alt screen…
+        s.push(&[b'x'; 64]); // …then its redraws trim the enable out
+        let (mode, _, _) = s.cut(None);
+        assert_eq!(mode, AttachMode::Replay);
+        assert_eq!(s.front_init(), b"\x1b[?1049h");
+    }
+
+    #[test]
+    fn no_init_while_the_enable_is_still_in_the_ring() {
+        let mut s = Scrollback::new(1024);
+        s.push(b"\x1b[?1049h");
+        s.push(b"drawing");
+        assert!(s.front_init().is_empty());
+    }
+
+    #[test]
+    fn leaving_alt_screen_clears_the_init() {
+        let mut s = Scrollback::new(8);
+        s.push(b"\x1b[?1049h");
+        s.push(&[b'x'; 32]);
+        s.push(b"\x1b[?1049l"); // app exits the alt screen…
+        s.push(&[b'y'; 32]); // …and the disable is trimmed out too
+        assert!(s.front_init().is_empty());
+    }
+
+    #[test]
+    fn tracker_survives_sequences_split_across_evictions() {
+        let mut s = Scrollback::new(4);
+        s.push(b"\x1b[?10");
+        s.push(b"49h");
+        s.push(&[b'x'; 16]);
+        assert_eq!(s.front_init(), b"\x1b[?1049h");
+    }
+
+    #[test]
+    fn init_reinstates_each_tracked_mode() {
+        let mut s = Scrollback::new(4);
+        s.push(b"\x1b[?1h\x1b[?2004h\x1b[?25l\x1b[?1049h");
+        s.push(&[b'x'; 8]);
+        assert_eq!(
+            s.front_init(),
+            b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[?25l".as_slice()
+        );
+    }
+
+    #[test]
+    fn combined_params_and_untracked_modes_are_handled() {
+        let mut s = Scrollback::new(4);
+        s.push(b"\x1b[?1049;2004h\x1b[?12h\x1b[31m");
+        s.push(&[b'x'; 8]);
+        assert_eq!(s.front_init(), b"\x1b[?1049h\x1b[?2004h".as_slice());
     }
 
     #[test]

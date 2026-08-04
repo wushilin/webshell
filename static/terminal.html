@@ -845,7 +845,15 @@
           this.term.write(new Uint8Array(0), () => {
             // A newer hello may have arrived while this barrier was queued.
             // Its own barrier/replay is authoritative.
-            if (renderGeneration === this.renderGeneration) this.term.reset();
+            if (renderGeneration === this.renderGeneration) {
+              this.term.reset();
+              // Reinstate modes whose enable sequences were trimmed out of
+              // the replay ring (alt screen above all): without this, a
+              // fullscreen app resumed mid-run draws into the primary buffer
+              // and its exit leaves the screen unrestored. Queued here so it
+              // parses after the reset and before the replay blob.
+              if (m.init) this.term.write(m.init);
+            }
           });
         }
         if (this.isActive()) refreshStatus();

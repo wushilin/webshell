@@ -150,7 +150,7 @@ async fn expect_ws_status(request: WsRequest<()>, expected: StatusCode) {
     assert_eq!(status.as_u16(), expected.as_u16());
 }
 
-async fn recv_hello<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, term: usize)
+async fn recv_hello<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, term: usize) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -163,7 +163,7 @@ where
         if let Message::Text(text) = message {
             let value: Value = serde_json::from_str(&text).unwrap();
             if value["type"] == "hello" && value["term"] == term {
-                return;
+                return value;
             }
         }
     }
@@ -343,4 +343,54 @@ async fn mux_runs_commands_in_two_terminal_slots() {
         .unwrap();
     assert_eq!(slots[0]["running"], true);
     assert_eq!(slots[1]["running"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_hello_reinstates_alt_screen_scrolled_out_of_the_ring() {
+    let server = TestServer::start().await;
+    let (cookie, csrf) = server.login().await;
+
+    let request = ws_request(
+        format!("{}/webshell/private/ws?csrf={csrf}", server.ws),
+        Some(&cookie),
+        &server.http,
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws.send(Message::Text(
+        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string(),
+    ))
+    .await
+    .unwrap();
+    recv_hello(&mut ws, 0).await;
+
+    // A fullscreen app enters the alt screen (octal escapes, so the command's
+    // own echo carries no real ESC), then floods well past the 128 KiB
+    // scrollback ring, trimming the enable sequence out of the replay window.
+    run_command(
+        &mut ws,
+        0,
+        "printf '\\033[?1049h'; head -c 200000 /dev/zero | tr '\\0' x; printf '\\n\\104\\117\\116\\105\\060\\n'\n",
+        "DONE0",
+    )
+    .await;
+
+    // A fresh attachment (no resume state) gets a full replay. Its hello must
+    // reinstate the still-active alt screen that the ring no longer shows —
+    // otherwise the app redraws into the primary buffer and its exit leaves
+    // the screen unrestored.
+    let request = ws_request(
+        format!("{}/webshell/private/ws?csrf={csrf}", server.ws),
+        Some(&cookie),
+        &server.http,
+    );
+    let (mut ws2, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws2.send(Message::Text(
+        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let hello = recv_hello(&mut ws2, 0).await;
+    assert_eq!(hello["mode"], "replay");
+    let init = hello["init"].as_str().expect("replay hello carries init");
+    assert!(init.contains("\u{1b}[?1049h"), "init={init:?}");
 }
