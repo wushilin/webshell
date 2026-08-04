@@ -648,6 +648,26 @@
         });
         this.fit = new FitAddon.FitAddon();
         this.term.loadAddon(this.fit);
+
+        // Swallow the DECSET sequences apps (vim, Claude Code, htop…) use to
+        // turn on mouse reporting. With mouse tracking never enabled, drag
+        // always selects text locally — no Shift needed — and wheel scrolling
+        // in fullscreen apps still works via xterm's arrow-key fallback.
+        // 9/1000-1003 are the tracking modes, 1005/1006/1015/1016 their
+        // encodings (swallowed too so a combined "?1002;1006h" can't slip
+        // tracking through). Focus reporting (1004) stays untouched.
+        const MOUSE_MODES = new Set([9, 1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016]);
+        const swallowMouse = (params) => params.every((p) => MOUSE_MODES.has(p));
+        this.term.parser.registerCsiHandler({ prefix: "?", final: "h" }, swallowMouse);
+        this.term.parser.registerCsiHandler({ prefix: "?", final: "l" }, swallowMouse);
+
+        // Select-to-copy: any finished selection lands on the clipboard, so a
+        // fullscreen app's constant redraws can't clear it before Ctrl+C.
+        this.term.onSelectionChange(() => {
+          const s = this.term.getSelection();
+          if (s) navigator.clipboard.writeText(s).catch(() => {});
+        });
+
         this.term.open(this.pane);
 
         // Best-effort: keep mobile autofill (passwords/cards/addresses) and
