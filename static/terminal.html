@@ -668,6 +668,19 @@
           if (s) navigator.clipboard.writeText(s).catch(() => {});
         });
 
+        // Shift+Enter sends ESC CR ("insert newline" in Claude Code and other
+        // TUIs) — a terminal otherwise emits plain \r for both Enter and
+        // Shift+Enter, so apps can't tell them apart. Same mapping Claude
+        // Code's /terminal-setup installs for iTerm2/VS Code. Returning false
+        // for every event type keeps xterm's keypress path from also firing \r.
+        this.term.attachCustomKeyEventHandler((e) => {
+          if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            if (e.type === "keydown") this.input("\x1b\r");
+            return false;
+          }
+          return true;
+        });
+
         this.term.open(this.pane);
 
         // Best-effort: keep mobile autofill (passwords/cards/addresses) and
@@ -776,7 +789,10 @@
       input(d) {
         if (this.suppressReports) return;
         if (ctrlArmed || shiftArmed || altArmed) {
-          if (d.length === 1) {
+          if (d === "\r" && shiftArmed && !ctrlArmed && !altArmed) {
+            // Bar-shift + return = newline (ESC CR), same as desktop Shift+Enter.
+            d = "\x1b\r";
+          } else if (d.length === 1) {
             if (ctrlArmed) d = ctrlTransform(d);
             if (altArmed) d = "\x1b" + d;
           }
