@@ -625,6 +625,7 @@
         this.offset = 0;          // stream bytes received (the resume checkpoint)
         this.awaitingHello = false; // open sent; drop data frames until the hello
         this.expectFirst = false; // next data frame is the replay/delta blob
+        this.renderGeneration = 0; // invalidates callbacks from older replays
         this.reopenTimer = null;
         this.closing = false;     // user asked to delete: no respawn on close
         // Suppress xterm report replies while the replay frame is parsed.
@@ -795,10 +796,22 @@
         this.epoch = m.epoch;
         this.offset = m.offset;
         this.expectFirst = true;
+        const renderGeneration = ++this.renderGeneration;
         // resume: the stream continues exactly where we left off — keep the
         // screen, scroll position and all. replay: different shell or missed
-        // window — redraw from scratch.
-        if (m.mode === "replay") this.term.reset();
+        // window — redraw from scratch. xterm parses write() calls
+        // asynchronously, so reset must itself be queued behind bytes from
+        // the old connection. A synchronous reset here lets those old bytes
+        // parse afterwards and splice stale escape-sequence state into the
+        // replay (especially after a suspended mobile tab).
+        if (m.mode === "replay") {
+          this.suppressReports = true;
+          this.term.write(new Uint8Array(0), () => {
+            // A newer hello may have arrived while this barrier was queued.
+            // Its own barrier/replay is authoritative.
+            if (renderGeneration === this.renderGeneration) this.term.reset();
+          });
+        }
         if (this.isActive()) refreshStatus();
         // The slot is live as of this hello — paint it green now instead of
         // waiting out the 5s poll.
@@ -814,7 +827,10 @@
           // not injected into the live shell.
           this.expectFirst = false;
           this.suppressReports = true;
-          const clear = () => { this.suppressReports = false; };
+          const renderGeneration = this.renderGeneration;
+          const clear = () => {
+            if (renderGeneration === this.renderGeneration) this.suppressReports = false;
+          };
           this.term.write(data, clear);
           setTimeout(clear, 300);
         } else {
@@ -1572,10 +1588,19 @@
     // Coming back to the foreground (mobile backgrounds kill sockets):
     // reconnect dead sessions immediately instead of waiting out the
     // exponential backoff, which can sit at 5s.
+    let hiddenAt = null;
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible") {
+        hiddenAt = performance.now();
+        return;
+      }
       if (Conn.failures >= MAX_FAILURES) { refreshSlots(); return; }  // given up: reload only
-      if (!Conn.ws || Conn.ws.readyState === WebSocket.CLOSING || Conn.ws.readyState === WebSocket.CLOSED) {
+      // Mobile network stacks can leave a dead TCP connection looking OPEN
+      // to JavaScript after the app resumes. Reconnect proactively after a
+      // meaningful suspension; epoch/offset resume makes this inexpensive.
+      const wasSuspended = hiddenAt !== null && performance.now() - hiddenAt > 10000;
+      hiddenAt = null;
+      if (wasSuspended || !Conn.ws || Conn.ws.readyState === WebSocket.CLOSING || Conn.ws.readyState === WebSocket.CLOSED) {
         Conn.reconnect();
       }
       refreshSlots();

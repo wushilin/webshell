@@ -2216,6 +2216,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tower",
  "tower-http",

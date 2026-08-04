@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::util::lock;
@@ -22,10 +22,18 @@ pub enum PtyCmd {
     Kill,
 }
 
-/// Identity of a shell spawn. A client resuming with a stale epoch (the
-/// shell was reset/respawned meanwhile) gets a full replay, never a delta
-/// spliced across two different shells.
-static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Identity of a shell spawn. Keep this within JavaScript's exact-integer
+/// range because it crosses the wire as a JSON number. Randomness, rather
+/// than a process-local counter, prevents an epoch from being reused after a
+/// server restart and splicing a new shell onto a browser's old screen.
+fn next_epoch() -> u64 {
+    loop {
+        let epoch = rand::random::<u64>() & ((1_u64 << 53) - 1);
+        if epoch != 0 {
+            return epoch;
+        }
+    }
+}
 
 /// How an attachment's `replay` bytes relate to what the client already has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -551,7 +559,7 @@ fn spawn_terminal(
         size,
         shutdown_tx,
         killer,
-        epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+        epoch: next_epoch(),
     })
 }
 
