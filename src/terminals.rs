@@ -68,6 +68,11 @@ struct ModeTracker {
     alt_screen: Option<u16>,
     /// `?2004`: bracketed paste.
     bracketed_paste: bool,
+    /// `?9`/`?1000`-`?1003` mouse tracking and `?1005`/`?1006`/`?1015`/`?1016`
+    /// encodings still enabled. The client swallows these (drag stays local
+    /// selection) but remembers them to synthesize SGR wheel reports; without
+    /// them in the replay a resumed fullscreen app falls back to arrow keys.
+    mouse: std::collections::BTreeSet<u16>,
 }
 
 impl ModeTracker {
@@ -78,6 +83,7 @@ impl ModeTracker {
             cursor_hidden: false,
             alt_screen: None,
             bracketed_paste: false,
+            mouse: std::collections::BTreeSet::new(),
         }
     }
 
@@ -129,6 +135,13 @@ impl ModeTracker {
                 25 => self.cursor_hidden = !set,
                 47 | 1047 | 1049 => self.alt_screen = if set { Some(n) } else { None },
                 2004 => self.bracketed_paste = set,
+                9 | 1000..=1003 | 1005 | 1006 | 1015 | 1016 => {
+                    if set {
+                        self.mouse.insert(n);
+                    } else {
+                        self.mouse.remove(&n);
+                    }
+                }
                 _ => {}
             }
         }
@@ -147,6 +160,9 @@ impl ModeTracker {
         }
         if self.bracketed_paste {
             out.extend_from_slice(b"\x1b[?2004h");
+        }
+        for n in &self.mouse {
+            out.extend_from_slice(format!("\x1b[?{n}h").as_bytes());
         }
         if self.cursor_hidden {
             out.extend_from_slice(b"\x1b[?25l");
@@ -807,12 +823,31 @@ mod tests {
     #[test]
     fn init_reinstates_each_tracked_mode() {
         let mut s = Scrollback::new(4);
-        s.push(b"\x1b[?1h\x1b[?2004h\x1b[?25l\x1b[?1049h");
+        s.push(b"\x1b[?1h\x1b[?2004h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1049h");
         s.push(&[b'x'; 8]);
         assert_eq!(
             s.front_init(),
-            b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[?25l".as_slice()
+            b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25l".as_slice()
         );
+    }
+
+    #[test]
+    fn init_reinstates_mouse_modes_and_disabling_clears_them() {
+        // Claude Code's exact enable set, trimmed from the ring, must come
+        // back in the init — the client synthesizes wheel reports only while
+        // it knows the app wants SGR mouse tracking.
+        let mut s = Scrollback::new(4);
+        s.push(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        s.push(&[b'x'; 8]);
+        assert_eq!(
+            s.front_init(),
+            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h".as_slice()
+        );
+
+        let mut s = Scrollback::new(4);
+        s.push(b"\x1b[?1000h\x1b[?1006h\x1b[?1006l\x1b[?1000l");
+        s.push(&[b'x'; 8]);
+        assert_eq!(s.front_init(), b"".as_slice());
     }
 
     #[test]
