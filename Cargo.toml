@@ -1,6 +1,6 @@
 [package]
 name = "webshell"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A browser-based, PAM-authenticated login shell with persistent, resumable per-user terminal slots."
 
