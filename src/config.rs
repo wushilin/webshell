@@ -685,10 +685,12 @@ mod tests {
         assert!(sample.contains("lets_encrypt_enabled = false"));
         assert!(sample.contains("store_dir = \"certs\""));
         assert!(sample.contains("lets_encrypt_staging = false"));
-        // [certs] must serialize before [local_passwords] — the TOML
-        // table-absorbs-what-follows trap.
-        let certs_pos = sample.find("[certs]").unwrap();
-        assert!(Settings::default().local_passwords.is_empty() || certs_pos < sample.find("[local_passwords]").unwrap_or(usize::MAX));
+        // Ordering is only observable when local_passwords serializes at all.
+        let mut s = Settings::default();
+        s.local_passwords
+            .insert("local:alice".to_string(), "x".to_string());
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.find("[certs]").unwrap() < text.find("[local_passwords]").unwrap());
     }
 
     #[test]
