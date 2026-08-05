@@ -243,9 +243,10 @@ fn bind_443(bind: &str) -> std::net::TcpListener {
     };
     // axum-server drives this through tokio; a blocking std listener would
     // wedge the accept loop.
-    listener
-        .set_nonblocking(true)
-        .expect("setting the TLS listener non-blocking");
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("startup error: cannot set the TLS listener non-blocking: {e}");
+        std::process::exit(1);
+    }
     listener
 }
 
