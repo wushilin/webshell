@@ -15,7 +15,8 @@ use crate::config::Settings;
 pub struct TlsConfig {
     /// The one certificate hostname, derived from `network.public_base_url`.
     pub hostname: String,
-    /// ACME account key + certificate cache directory, absolute.
+    /// ACME account key + certificate cache directory; relative `store_dir`
+    /// already resolved against the config file's directory.
     pub store_dir: PathBuf,
     /// Let's Encrypt staging endpoint instead of production.
     pub staging: bool,
@@ -74,6 +75,14 @@ fn public_hostname(base: Option<&str>) -> anyhow::Result<String> {
         )
     })?;
     let authority = rest.split('/').next().unwrap_or("");
+    // An https URL admits userinfo ("user@host"), but a certificate hostname
+    // never does — refuse rather than mis-parse.
+    if authority.contains('@') {
+        anyhow::bail!(
+            "network.public_base_url {base:?} must not contain userinfo — \
+             use plain https://hostname"
+        );
+    }
     let host = match authority.rsplit_once(':') {
         Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
             if port != "443" {
@@ -194,6 +203,8 @@ mod tests {
             "https://localhost",         // not public
             "https://shell.example.com:8443", // non-default port
             "https://",                  // no host
+            "https://user@shell.example.com", // userinfo
+            "https://user:pass@shell.example.com", // userinfo with password
         ] {
             assert!(
                 validate(&enabled("0.0.0.0:443", Some(base)), Path::new(DIR)).is_err(),
