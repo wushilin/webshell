@@ -50,6 +50,16 @@ pub fn validate(s: &Settings, config_dir: &Path) -> anyhow::Result<Option<TlsCon
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(str::to_string);
+    if let Some(email) = &contact_email {
+        // Deliberately loose — full RFC 5322 is not the goal; catching a
+        // pasted hostname or sentence before the ACME account call is.
+        if !email.contains('@') || email.contains(char::is_whitespace) {
+            anyhow::bail!(
+                "certs.contact_email {email:?} does not look like an email \
+                 address"
+            );
+        }
+    }
     Ok(Some(TlsConfig {
         hostname,
         store_dir,
@@ -112,6 +122,21 @@ fn public_hostname(base: Option<&str>) -> anyhow::Result<String> {
              Let's Encrypt is enabled, not localhost"
         );
     }
+    // A trailing dot, an empty label, a stray query string, or anything else
+    // that isn't a plain DNS label sequence would otherwise sail through as
+    // "the host" — refuse it here rather than let it fail obscurely at ACME
+    // order time.
+    let valid_label = |l: &str| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !host.split('.').all(valid_label) {
+        anyhow::bail!(
+            "network.public_base_url {base:?} does not name a plain DNS \
+             hostname — got {host:?}"
+        );
+    }
     Ok(host.to_ascii_lowercase())
 }
 
@@ -132,7 +157,15 @@ fn check_bind(bind: &str) -> anyhow::Result<()> {
             addr.port()
         );
     }
-    if addr.ip().is_loopback() {
+    let ip = addr.ip();
+    // An IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) is still loopback —
+    // Ipv6Addr::is_loopback only recognizes ::1, so it must be unwrapped
+    // to its IPv4 form before the loopback check means anything.
+    let mapped_loopback = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        std::net::IpAddr::V4(_) => false,
+    };
+    if ip.is_loopback() || mapped_loopback {
         anyhow::bail!(
             "network.bind {bind:?} is loopback — Let's Encrypt must be able \
              to reach this listener; bind 0.0.0.0:443, [::]:443 or a public IP"
@@ -211,6 +244,9 @@ pub async fn serve_https(app: axum::Router, bind: &str, tls: TlsConfig) {
                 Err(err) => tracing::error!("acme: {err:?}"),
             }
         }
+        // Polling this stream is what drives renewals — its end is an
+        // emergency worth shouting about, not a clean shutdown.
+        tracing::error!("acme: event stream ended; certificates will no longer renew");
     });
 
     let listener = bind_443(bind);
@@ -286,7 +322,13 @@ mod tests {
 
     #[test]
     fn bad_binds_are_refused() {
-        for bind in ["127.0.0.1:443", "[::1]:443", "0.0.0.0:8443", "localhost:443"] {
+        for bind in [
+            "127.0.0.1:443",
+            "[::1]:443",
+            "[::ffff:127.0.0.1]:443",
+            "0.0.0.0:8443",
+            "localhost:443",
+        ] {
             let err = validate(&enabled(bind, BASE), Path::new(DIR)).unwrap_err();
             assert!(err.to_string().contains("network.bind"), "{bind}: {err}");
         }
@@ -295,15 +337,16 @@ mod tests {
     #[test]
     fn hostname_is_derived_and_validated() {
         // Trailing slash / path and an explicit :443 are all fine.
-        for base in [
-            "https://shell.example.com/",
-            "https://shell.example.com:443",
-            "https://Shell.Example.Com/webshell",
+        for (base, expected_hostname) in [
+            ("https://shell.example.com/", "shell.example.com"),
+            ("https://shell.example.com:443", "shell.example.com"),
+            ("https://Shell.Example.Com/webshell", "shell.example.com"),
+            ("https://a-1.example.com", "a-1.example.com"),
         ] {
             let tls = validate(&enabled("0.0.0.0:443", Some(base)), Path::new(DIR))
                 .unwrap()
                 .unwrap();
-            assert_eq!(tls.hostname, "shell.example.com", "{base}");
+            assert_eq!(tls.hostname, expected_hostname, "{base}");
         }
         for base in [
             "http://shell.example.com",  // not https
@@ -314,6 +357,10 @@ mod tests {
             "https://",                  // no host
             "https://user@shell.example.com", // userinfo
             "https://user:pass@shell.example.com", // userinfo with password
+            "https://shell.example.com.", // trailing dot / empty label
+            "https://shell.example.com:", // empty port, trailing colon
+            "https://host:8x80",         // non-numeric port
+            "https://host?x=1",          // query string stays in host
         ] {
             assert!(
                 validate(&enabled("0.0.0.0:443", Some(base)), Path::new(DIR)).is_err(),
@@ -362,5 +409,9 @@ mod tests {
         s.certs.contact_email = Some("   ".into());
         let tls = validate(&s, Path::new(DIR)).unwrap().unwrap();
         assert_eq!(tls.contact_email, None);
+
+        s.certs.contact_email = Some("not an email".into());
+        let err = validate(&s, Path::new(DIR)).unwrap_err();
+        assert!(err.to_string().contains("contact_email"), "{err}");
     }
 }
