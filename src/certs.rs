@@ -141,6 +141,25 @@ fn check_bind(bind: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Attach a validated TLS mode to the runtime config. Serving HTTPS directly
+/// means the session cookie must never travel plaintext, so the Secure flag
+/// stops being the operator's choice here.
+pub fn attach(config: &mut crate::config::Config, tls: Option<TlsConfig>) {
+    if let Some(t) = &tls {
+        if !config.cookie_secure {
+            tracing::info!("certs: forcing network.cookie_secure = true (serving HTTPS directly)");
+            config.cookie_secure = true;
+        }
+        tracing::info!(
+            "certs: Let's Encrypt enabled for {} ({}), store {}",
+            t.hostname,
+            if t.staging { "staging" } else { "production" },
+            t.store_dir.display()
+        );
+    }
+    config.tls = tls;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +245,21 @@ mod tests {
         s.certs.store_dir = "/var/lib/webshell/certs".into();
         let tls = validate(&s, Path::new(DIR)).unwrap().unwrap();
         assert_eq!(tls.store_dir, Path::new("/var/lib/webshell/certs"));
+    }
+
+    #[test]
+    fn attach_forces_the_secure_cookie_flag() {
+        let mut config = crate::config::Config::from_settings(Settings::default());
+        assert!(!config.cookie_secure);
+        let tls = validate(&enabled("0.0.0.0:443", BASE), Path::new(DIR)).unwrap();
+        attach(&mut config, tls);
+        assert!(config.cookie_secure);
+        assert!(config.tls.is_some());
+
+        let mut config = crate::config::Config::from_settings(Settings::default());
+        attach(&mut config, None);
+        assert!(!config.cookie_secure);
+        assert!(config.tls.is_none());
     }
 
     #[test]

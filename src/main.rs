@@ -291,7 +291,22 @@ async fn run_server(config_path: &std::path::Path) {
         );
     }
 
-    let config = Config::from_settings(settings);
+    // TLS-mode preconditions are checked here, at startup, for the same
+    // reason the login checks below are: a bad [certs] combination must be a
+    // refusal with a reason, not a mystery at first connect.
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let tls = match certs::validate(&settings, &config_dir) {
+        Ok(tls) => tls,
+        Err(e) => {
+            eprintln!("startup error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut config = Config::from_settings(settings);
+    certs::attach(&mut config, tls);
 
     // Everything a login depends on is checked here, at startup, rather than
     // discovered by the first person who tries to sign in.

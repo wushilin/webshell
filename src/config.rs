@@ -320,6 +320,8 @@ pub struct Config {
     /// and do not need to widen this attacker-controlled allocation limit.
     pub ws_message_limit: usize,
     pub secret_base64: Option<String>,
+    /// Validated Let's Encrypt mode; None serves plain HTTP exactly as before.
+    pub tls: Option<crate::certs::TlsConfig>,
 }
 
 impl Config {
@@ -452,6 +454,7 @@ impl Config {
             strict_origin: s.network.strict_origin,
             ws_message_limit,
             secret_base64,
+            tls: None,
         }
     }
 
