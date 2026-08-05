@@ -1,3 +1,4 @@
+mod certs;
 mod config;
 mod enrollment;
 mod identity;
