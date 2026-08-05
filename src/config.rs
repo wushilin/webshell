@@ -21,6 +21,7 @@ pub struct Settings {
     pub google: Google,
     pub terminals: TerminalSettings,
     pub sharing: Sharing,
+    pub certs: Certs,
     /// Passwords for `local:` identities, keyed by full identity string.
     /// Declared last: a TOML table absorbs every key that follows it.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -170,6 +171,38 @@ impl Default for Sharing {
         Sharing {
             enabled: true,
             max_duration_secs: 30 * 24 * 3600,
+        }
+    }
+}
+
+/// Automatic TLS: obtain and renew a Let's Encrypt certificate in-process.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Certs {
+    /// Master switch. When true, webshell terminates TLS itself with an
+    /// automatically obtained and renewed Let's Encrypt certificate, and the
+    /// bind/public_base_url combination is validated at startup.
+    pub lets_encrypt_enabled: bool,
+    /// ACME account key and certificate cache. Relative paths resolve
+    /// against the config file's directory.
+    pub store_dir: String,
+    /// Use the Let's Encrypt staging endpoint: untrusted certificates but
+    /// generous rate limits. For first-time setup on a new host — a failed
+    /// production attempt counts against strict per-domain limits.
+    pub lets_encrypt_staging: bool,
+    /// Optional ACME account contact. Let's Encrypt mails expiry warnings
+    /// here if renewal silently breaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_email: Option<String>,
+}
+
+impl Default for Certs {
+    fn default() -> Self {
+        Certs {
+            lets_encrypt_enabled: false,
+            store_dir: "certs".into(),
+            lets_encrypt_staging: false,
+            contact_email: None,
         }
     }
 }
@@ -643,6 +676,31 @@ mod tests {
         let sample = Settings::sample_toml();
         assert!(sample.contains("login_cmd = []"));
         assert!(sample.contains("[terminals.envs]"));
+    }
+
+    #[test]
+    fn sample_config_documents_certs() {
+        let sample = Settings::sample_toml();
+        assert!(sample.contains("[certs]"));
+        assert!(sample.contains("lets_encrypt_enabled = false"));
+        assert!(sample.contains("store_dir = \"certs\""));
+        assert!(sample.contains("lets_encrypt_staging = false"));
+        // [certs] must serialize before [local_passwords] — the TOML
+        // table-absorbs-what-follows trap.
+        let certs_pos = sample.find("[certs]").unwrap();
+        assert!(Settings::default().local_passwords.is_empty() || certs_pos < sample.find("[local_passwords]").unwrap_or(usize::MAX));
+    }
+
+    #[test]
+    fn certs_table_parses() {
+        let s: Settings = toml::from_str(
+            "[certs]\nlets_encrypt_enabled = true\nstore_dir = \"/var/lib/webshell/certs\"\ncontact_email = \"ops@example.com\"\n",
+        )
+        .unwrap();
+        assert!(s.certs.lets_encrypt_enabled);
+        assert_eq!(s.certs.store_dir, "/var/lib/webshell/certs");
+        assert!(!s.certs.lets_encrypt_staging);
+        assert_eq!(s.certs.contact_email.as_deref(), Some("ops@example.com"));
     }
 
     #[test]
