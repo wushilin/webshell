@@ -30,6 +30,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum-server = "0.7"
+rustls-acme = { version = "0.14", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

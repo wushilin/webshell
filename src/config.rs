@@ -21,6 +21,7 @@ pub struct Settings {
     pub google: Google,
     pub terminals: TerminalSettings,
     pub sharing: Sharing,
+    pub certs: Certs,
     /// Passwords for `local:` identities, keyed by full identity string.
     /// Declared last: a TOML table absorbs every key that follows it.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -174,6 +175,38 @@ impl Default for Sharing {
     }
 }
 
+/// Automatic TLS: obtain and renew a Let's Encrypt certificate in-process.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Certs {
+    /// Master switch. When true, webshell terminates TLS itself with an
+    /// automatically obtained and renewed Let's Encrypt certificate, and the
+    /// bind/public_base_url combination is validated at startup.
+    pub lets_encrypt_enabled: bool,
+    /// ACME account key and certificate cache. Relative paths resolve
+    /// against the config file's directory.
+    pub store_dir: String,
+    /// Use the Let's Encrypt staging endpoint: untrusted certificates but
+    /// generous rate limits. For first-time setup on a new host — a failed
+    /// production attempt counts against strict per-domain limits.
+    pub lets_encrypt_staging: bool,
+    /// Optional ACME account contact. Let's Encrypt mails expiry warnings
+    /// here if renewal silently breaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_email: Option<String>,
+}
+
+impl Default for Certs {
+    fn default() -> Self {
+        Certs {
+            lets_encrypt_enabled: false,
+            store_dir: "certs".into(),
+            lets_encrypt_staging: false,
+            contact_email: None,
+        }
+    }
+}
+
 /// Default config filename.
 pub const DEFAULT_CONFIG: &str = "config.toml";
 
@@ -287,6 +320,8 @@ pub struct Config {
     /// and do not need to widen this attacker-controlled allocation limit.
     pub ws_message_limit: usize,
     pub secret_base64: Option<String>,
+    /// Validated Let's Encrypt mode; None serves plain HTTP exactly as before.
+    pub tls: Option<crate::certs::TlsConfig>,
 }
 
 impl Config {
@@ -419,6 +454,7 @@ impl Config {
             strict_origin: s.network.strict_origin,
             ws_message_limit,
             secret_base64,
+            tls: None,
         }
     }
 
@@ -643,6 +679,33 @@ mod tests {
         let sample = Settings::sample_toml();
         assert!(sample.contains("login_cmd = []"));
         assert!(sample.contains("[terminals.envs]"));
+    }
+
+    #[test]
+    fn sample_config_documents_certs() {
+        let sample = Settings::sample_toml();
+        assert!(sample.contains("[certs]"));
+        assert!(sample.contains("lets_encrypt_enabled = false"));
+        assert!(sample.contains("store_dir = \"certs\""));
+        assert!(sample.contains("lets_encrypt_staging = false"));
+        // Ordering is only observable when local_passwords serializes at all.
+        let mut s = Settings::default();
+        s.local_passwords
+            .insert("local:alice".to_string(), "x".to_string());
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(text.find("[certs]").unwrap() < text.find("[local_passwords]").unwrap());
+    }
+
+    #[test]
+    fn certs_table_parses() {
+        let s: Settings = toml::from_str(
+            "[certs]\nlets_encrypt_enabled = true\nstore_dir = \"/var/lib/webshell/certs\"\ncontact_email = \"ops@example.com\"\n",
+        )
+        .unwrap();
+        assert!(s.certs.lets_encrypt_enabled);
+        assert_eq!(s.certs.store_dir, "/var/lib/webshell/certs");
+        assert!(!s.certs.lets_encrypt_staging);
+        assert_eq!(s.certs.contact_email.as_deref(), Some("ops@example.com"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod certs;
 mod config;
 mod enrollment;
 mod identity;
@@ -290,7 +291,22 @@ async fn run_server(config_path: &std::path::Path) {
         );
     }
 
-    let config = Config::from_settings(settings);
+    // TLS-mode preconditions are checked here, at startup, for the same
+    // reason the login checks below are: a bad [certs] combination must be a
+    // refusal with a reason, not a mystery at first connect.
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let tls = match certs::validate(&settings, &config_dir) {
+        Ok(tls) => tls,
+        Err(e) => {
+            eprintln!("startup error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut config = Config::from_settings(settings);
+    certs::attach(&mut config, tls);
 
     // Everything a login depends on is checked here, at startup, rather than
     // discovered by the first person who tries to sign in.
@@ -412,6 +428,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         b"webshell/share-token/v1",
     )));
     let bind = config.bind_addr.clone();
+    let tls = config.tls.clone();
 
     let state = AppState {
         config: Arc::new(config),
@@ -491,6 +508,13 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         )
         .with_state(state);
 
+    if let Some(tls) = tls {
+        // Simple mode has no config file and therefore no [certs]; only the
+        // config-backed path can get here.
+        tracing::info!("webshell listening on https://{}{BASE_PATH}/", tls.hostname);
+        certs::serve_https(app, &bind, tls).await;
+        return;
+    }
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {bind}: {e}"));
