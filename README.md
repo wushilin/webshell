@@ -271,6 +271,10 @@ Every table and key is optional; a missing one falls back to the default.
 | | `envs` | *(empty)* | Extra environment for every shell — see below. |
 | `[sharing]` | `enabled` | `true` | Master switch for share links. |
 | | `max_duration_secs` | `2592000` | Cap on a link's lifetime. |
+| `[certs]` | `lets_encrypt_enabled` | `false` | Terminate TLS in-process with an auto-obtained/renewed Let's Encrypt certificate — see below. |
+| | `store_dir` | `certs` | ACME account key + certificate cache, relative to the config file. |
+| | `lets_encrypt_staging` | `false` | Use the staging endpoint (untrusted certs, generous rate limits) for first-time setup. |
+| | `contact_email` | *(none)* | ACME contact; Let's Encrypt mails expiry warnings if renewal breaks. |
 | `[local_passwords]` | *(per identity)* | — | Password per `local:` identity. **Must be last** — see below. |
 
 `WEBSHELL_CONFIG` may point at the config file instead of `-c`.
@@ -466,7 +470,7 @@ invalid config: No login methods possible.
 
 - **Serve over TLS.** The login carries a password and the shell stream is
   interactive — over plaintext HTTP both are exposed on the wire. Terminate TLS
-  in front (tlsproxy/nginx/caddy), set `[network].cookie_secure = true`, and
+  in front (tlsproxy/nginx/caddy) — or let webshell do it, see *Built-in TLS with Let's Encrypt* — set `[network].cookie_secure = true`, and
   restrict who can reach it.
 - **Protect the config file.** It holds the cookie key, the Google client secret
   and every local password hash. Keep it `0600`; webshell writes
@@ -512,3 +516,40 @@ Set `strict_origin = true` to turn the list into a pin: the `Host` fallback is
 dropped and only listed origins (plus `public_base_url`) are served, so the
 server refuses to work through an unexpected hostname. Remember to list *every*
 hostname you serve, or its terminal will not connect.
+
+### Built-in TLS with Let's Encrypt
+
+Instead of a TLS proxy in front, webshell can terminate TLS itself:
+
+```toml
+[network]
+bind = "0.0.0.0:443"                       # must be :443, non-loopback
+public_base_url = "https://shell.example.com"  # the certificate hostname
+
+[certs]
+lets_encrypt_enabled = true
+contact_email = "you@example.com"          # optional: expiry warnings
+```
+
+The certificate hostname is derived from `public_base_url` (which must be
+`https://` and a real DNS name — no IPs, no localhost). Validation is
+TLS-ALPN-01 on the same listener: no port 80, no separate challenge server,
+but Let's Encrypt must be able to reach **this** machine on port 443 of that
+hostname, so DNS has to point here and the bind is checked at startup —
+anything other than a non-loopback `:443` refuses to start with the reason.
+`cookie_secure` is forced on. Certificates renew automatically; every ACME
+event is logged under an `acme:` prefix.
+
+Binding port 443 as an unprivileged user (webshell refuses to run as root)
+needs one of:
+
+```sh
+sudo setcap cap_net_bind_service=+ep "$(command -v webshell)"   # or:
+# systemd unit:  AmbientCapabilities=CAP_NET_BIND_SERVICE
+# or:            sysctl net.ipv4.ip_unprivileged_port_start=443
+```
+
+First time on a new host, set `lets_encrypt_staging = true`, confirm issuance
+in the log (the browser will warn — staging certs are untrusted), then flip
+it off and delete the contents of `store_dir`. A failed production attempt
+counts against Let's Encrypt's strict rate limits; staging's are generous.
