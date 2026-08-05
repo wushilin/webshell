@@ -428,6 +428,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         b"webshell/share-token/v1",
     )));
     let bind = config.bind_addr.clone();
+    let tls = config.tls.clone();
 
     let state = AppState {
         config: Arc::new(config),
@@ -507,6 +508,13 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         )
         .with_state(state);
 
+    if let Some(tls) = tls {
+        // Simple mode has no config file and therefore no [certs]; only the
+        // config-backed path can get here.
+        tracing::info!("webshell listening on https://{}{BASE_PATH}/", tls.hostname);
+        certs::serve_https(app, &bind, tls).await;
+        return;
+    }
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {bind}: {e}"));

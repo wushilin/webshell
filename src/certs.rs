@@ -160,6 +160,95 @@ pub fn attach(config: &mut crate::config::Config, tls: Option<TlsConfig>) {
     config.tls = tls;
 }
 
+/// Serve the app over TLS with an auto-managed Let's Encrypt certificate.
+/// Mirrors the plain-HTTP tail of `serve()`: runs forever, or exits with a
+/// startup error if the socket cannot be bound.
+pub async fn serve_https(app: axum::Router, bind: &str, tls: TlsConfig) {
+    use futures::StreamExt;
+    use rustls_acme::caches::DirCache;
+    use rustls_acme::futures_rustls::rustls::ServerConfig;
+    use rustls_acme::AcmeConfig;
+
+    // The store holds the ACME account private key — same posture as the
+    // config file: never world-readable. recursive() also makes this a no-op
+    // when the directory already exists.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&tls.store_dir)
+        {
+            eprintln!(
+                "startup error: cannot create certs.store_dir {}: {e}",
+                tls.store_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let mut acme = AcmeConfig::new([tls.hostname.clone()])
+        .cache(DirCache::new(tls.store_dir.clone()))
+        .directory_lets_encrypt(!tls.staging);
+    if let Some(email) = &tls.contact_email {
+        acme = acme.contact_push(format!("mailto:{email}"));
+    }
+    let mut state = acme.state();
+
+    let mut rustls_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(state.resolver());
+    rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let acceptor = state.axum_acceptor(std::sync::Arc::new(rustls_config));
+
+    // The state object IS the event stream — order progress, issuance,
+    // renewals, failures all arrive here. Log every one: renewals happen
+    // months after anyone was watching the terminal.
+    tokio::spawn(async move {
+        while let Some(event) = state.next().await {
+            match event {
+                Ok(ok) => tracing::info!("acme: {ok:?}"),
+                Err(err) => tracing::error!("acme: {err:?}"),
+            }
+        }
+    });
+
+    let listener = bind_443(bind);
+    axum_server::from_tcp(listener)
+        .acceptor(acceptor)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
+/// Bind the TLS socket, translating the classic first-deploy failure —
+/// unprivileged processes may not bind 443 — into instructions rather than
+/// a bare EACCES. Webshell refuses to run as root by design, so granting
+/// the capability is the supported path.
+fn bind_443(bind: &str) -> std::net::TcpListener {
+    let listener = match std::net::TcpListener::bind(bind) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("startup error: cannot bind {bind}: {e}");
+            eprintln!("  binding port 443 as an unprivileged user needs one of:");
+            eprintln!("    sudo setcap cap_net_bind_service=+ep \"$(command -v webshell)\"");
+            eprintln!("    systemd unit: AmbientCapabilities=CAP_NET_BIND_SERVICE");
+            eprintln!("    sysctl net.ipv4.ip_unprivileged_port_start=443");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("startup error: cannot bind {bind}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // axum-server drives this through tokio; a blocking std listener would
+    // wedge the accept loop.
+    listener
+        .set_nonblocking(true)
+        .expect("setting the TLS listener non-blocking");
+    listener
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
