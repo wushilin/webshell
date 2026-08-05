@@ -130,12 +130,16 @@ This satisfies "log all cert events": nothing is filtered.
 
 ## Dependencies
 
-- `rustls-acme` with its axum-server integration feature and the **ring**
-  crypto backend — explicitly not aws-lc-rs, because release builds are musl
-  static builds (`build-x86_64.sh`) and ring cross-compiles cleanly.
-- `axum-server` (pulled by that feature) alongside the existing axum 0.7.
+- `rustls-acme` 0.14 (its `axum` feature pulls `axum-server` 0.7, matching
+  the existing axum 0.7; the 0.15 line moved to axum-server 0.8) with the
+  **ring** crypto backend — explicitly not the default aws-lc-rs, because
+  release builds cross-compile with cargo-zigbuild (`build-x86_64.sh`) and
+  aws-lc-sys's C/cmake build breaks zig cross-linking, while ring is already
+  in the dependency tree via reqwest and demonstrably cross-builds.
+- `axum-server` 0.7 as a direct dependency (for `from_tcp` + `.acceptor()`).
 
-The implementation must verify the musl build still succeeds.
+The implementation must verify the cross-build (`build-x86_64.sh`) still
+succeeds.
 
 ## Testing
 
