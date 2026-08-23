@@ -76,19 +76,19 @@ Across a disconnect and reattach you keep:
   disconnect keeps going with nothing attached; its output is buffered and
   delivered when you return.
 
-Reattaching is **byte-exact, not a repaint**. Each shell instance has an `epoch`,
-and the client tracks a byte `offset` in that shell's output stream. On reconnect
-it sends both back, and the server replies with *exactly the bytes it missed* —
-or a full replay, but only if it fell outside the retained window. There is no
-screen-scraping, no redraw guesswork, no duplicated output.
+Reattaching performs one authoritative replay of the slot's retained console
+output, then follows live bytes from that exact cut point. The replay resets the
+browser terminal first, which avoids carrying stale parser or fullscreen-screen
+state across a dropped connection. There is no screen-scraping or redraw
+guesswork.
 
 **The honest limits:**
 
 - Slots live in the server process. They survive dropped connections and
   restarts of your *browser* — **not** a restart of `webshell` itself.
-- The replay window is a ring buffer per slot (`scrollback_bytes`, 128 KiB by
-  default). Miss more than that and you get a full replay of what is retained,
-  not the whole history.
+- The snapshot comes from a ring buffer per slot (`scrollback_bytes`, 128 KiB by
+  default), so it contains the retained recent console output, not unlimited
+  history.
 - The slot count is fixed (`max_sessions`, default 10).
 
 ### Why this is agent friendly
@@ -102,10 +102,9 @@ for an automated agent driving a shell:
 - **Long tasks don't need a babysitter.** Start a migration or a build, drop the
   connection entirely, reattach later and collect the output. Nothing has to stay
   connected for the work to continue.
-- **Deterministic resume.** The `(epoch, offset)` pair means an agent can know
-  precisely what it missed, and can tell "same shell, here's the delta" from
-  "this is a different shell now" — a distinction you cannot make by looking at
-  a repainted screen.
+- **Deterministic reconnect.** Each attachment receives a bounded console
+  snapshot before live output, so a reconnect converges on the server's retained
+  state even when the browser's previous terminal renderer became stale.
 - **Parallel workstreams.** Slots are independent shells on one connection: run
   the build in one, tail logs in another, keep a REPL in a third.
 - **Supervision without interference.** A read-only share link lets a human watch

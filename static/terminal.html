@@ -536,8 +536,8 @@
           if (myGen !== this.generation) return;
           this.reconnectDelay = 500;
           this.failures = 0;
-          // Restore every slot the user has opened; each resumes from its
-          // own offset (delta) or replays in full — one round trip.
+          // Restore every slot the user has opened from one authoritative
+          // scrollback snapshot, then follow live output from that cut.
           // Re-open live slots; a dead background slot stays dead until the
           // user activates it (respawning it silently would be a surprise).
           // The dead ACTIVE slot must re-open here: its delayed respawn
@@ -621,10 +621,10 @@
         this.readOnly = false;
         this.opened = false;      // user has visited this slot; re-open on reconnect
         this.dead = false;        // server closed the channel; re-open respawns
-        this.epoch = null;        // shell-instance id from the last hello
-        this.offset = 0;          // stream bytes received (the resume checkpoint)
         this.awaitingHello = false; // open sent; drop data frames until the hello
-        this.expectFirst = false; // next data frame is the replay/delta blob
+        this.expectFirst = false; // next data frame is the snapshot blob
+        this.snapshotBuffer = null; // snapshot + live frames waiting for reset
+        this.snapshotBarrierReady = false;
         this.renderGeneration = 0; // invalidates callbacks from older replays
         this.reopenTimer = null;
         this.closing = false;     // user asked to delete: no respawn on close
@@ -866,54 +866,48 @@
         this.sendResize();
       }
 
-      // Ask the server to (re)attach this slot over the mux connection,
-      // resuming from our offset when the server still can.
+      // Ask the server to (re)attach this slot. Deliberately omit an
+      // epoch/offset checkpoint: every attachment starts with a fresh,
+      // authoritative scrollback snapshot before following live output.
       sendOpen() {
         clearTimeout(this.reopenTimer);
         this.dead = false;
         // Frames for this slot arriving before the hello are a previous
         // attachment's stream (re-open race); writing them would duplicate
-        // output and corrupt the offset. Drop until the hello re-syncs us.
+        // output. Drop them until the hello establishes the new snapshot cut.
         this.awaitingHello = true;
         const msg = {
           type: "open", term: this.index,
           cols: this.term.cols, rows: this.term.rows,
           ro: this.readOnly,
         };
-        if (this.epoch !== null) { msg.epoch = this.epoch; msg.offset = this.offset; }
         Conn.sendJson(msg);
       }
 
       onHello(m) {
         this.awaitingHello = false;
-        this.epoch = m.epoch;
-        this.offset = m.offset;
         this.expectFirst = true;
+        this.snapshotBuffer = [];
+        this.snapshotBarrierReady = false;
         const renderGeneration = ++this.renderGeneration;
-        // resume: the stream continues exactly where we left off — keep the
-        // screen, scroll position and all. replay: different shell or missed
-        // window — redraw from scratch. xterm parses write() calls
-        // asynchronously, so reset must itself be queued behind bytes from
-        // the old connection. A synchronous reset here lets those old bytes
-        // parse afterwards and splice stale escape-sequence state into the
-        // replay (especially after a suspended mobile tab).
-        if (m.mode === "replay") {
-          this.suppressReports = true;
-          this.term.write(new Uint8Array(0), () => {
-            // A newer hello may have arrived while this barrier was queued.
-            // Its own barrier/replay is authoritative.
-            if (renderGeneration === this.renderGeneration) {
-              this.term.reset();
-              this.resetMouseState();  // m.init below re-arms it if still on
-              // Reinstate modes whose enable sequences were trimmed out of
-              // the replay ring (alt screen above all): without this, a
-              // fullscreen app resumed mid-run draws into the primary buffer
-              // and its exit leaves the screen unrestored. Queued here so it
-              // parses after the reset and before the replay blob.
-              if (m.init) this.term.write(m.init);
-            }
-          });
-        }
+        // xterm parses write() calls asynchronously. Queue a barrier behind
+        // bytes from the old connection, reset there, then parse the mode
+        // prefix before releasing the new snapshot and any following live
+        // frames. This prevents stale parser/screen state from being spliced
+        // into fullscreen TUIs after a suspended-tab reconnect.
+        this.suppressReports = true;
+        this.term.write(new Uint8Array(0), () => {
+          if (renderGeneration !== this.renderGeneration) return;
+          this.term.reset();
+          this.resetMouseState();  // m.init below re-arms it if still on
+          const ready = () => {
+            if (renderGeneration !== this.renderGeneration) return;
+            this.snapshotBarrierReady = true;
+            this.flushSnapshot(renderGeneration);
+          };
+          if (m.init) this.term.write(m.init, ready);
+          else ready();
+        });
         if (this.isActive()) refreshStatus();
         // The slot is live as of this hello — paint it green now instead of
         // waiting out the 5s poll.
@@ -922,26 +916,50 @@
 
       onOutput(data) {
         if (this.awaitingHello) return;  // stale frames from a replaced attachment
-        this.offset += data.length;
-        if (this.expectFirst) {
-          // Replay/delta blob (sent even when empty): suppress terminal
-          // report replies so answers to historical color/status queries are
-          // not injected into the live shell.
-          this.expectFirst = false;
-          this.suppressReports = true;
-          const renderGeneration = this.renderGeneration;
-          const clear = () => {
-            if (renderGeneration === this.renderGeneration) this.suppressReports = false;
-          };
-          this.term.write(data, clear);
-          setTimeout(clear, 300);
-        } else {
-          this.term.write(data);
+        if (this.snapshotBuffer !== null) {
+          // The first frame is the snapshot (even when empty). Later frames
+          // may arrive before xterm reaches the reset barrier; retain all of
+          // them in transport order and release them together afterwards.
+          this.snapshotBuffer.push(data);
+          if (this.expectFirst) this.expectFirst = false;
+          this.flushSnapshot(this.renderGeneration);
+          return;
         }
+        this.term.write(data);
       }
 
-      // Tear the slot down after a user-requested delete: drop the resume
-      // state so the next visit starts a clean shell, and clear `opened` so
+      flushSnapshot(renderGeneration) {
+        if (renderGeneration !== this.renderGeneration ||
+            !this.snapshotBarrierReady || this.expectFirst ||
+            this.snapshotBuffer === null) return;
+        const chunks = this.snapshotBuffer;
+        this.snapshotBuffer = null;
+        const clear = () => {
+          if (renderGeneration === this.renderGeneration) {
+            this.suppressReports = false;
+            // A suspended browser can leave xterm's canvas stale even when
+            // its buffer is correct (resizing appears to "fix" it). Force
+            // the same full repaint once the authoritative snapshot parses.
+            if (this.isActive()) this.term.refresh(0, this.term.rows - 1);
+          }
+        };
+        if (!chunks.length) {
+          this.term.write(new Uint8Array(0), clear);
+        } else {
+          chunks.forEach((chunk, i) => {
+            this.term.write(chunk, i === chunks.length - 1 ? clear : undefined);
+          });
+        }
+        // Defensive fallback for renderers that fail to invoke a write
+        // callback while their document is backgrounded. The real callback
+        // still performs the repaint once parsing completes.
+        setTimeout(() => {
+          if (renderGeneration === this.renderGeneration) this.suppressReports = false;
+        }, 300);
+      }
+
+      // Tear the slot down after a user-requested delete: drop pending replay
+      // state so the next visit starts clean, and clear `opened` so
       // neither the reconnect loop nor activate() revives it behind the
       // user's back. Idempotent — the closed frame and the POST reply race,
       // and whichever lands second must not repeat the notice.
@@ -950,8 +968,8 @@
         this.closing = false;
         this.awaitingHello = false;
         this.dead = true;
-        this.epoch = null;
-        this.offset = 0;
+        this.snapshotBuffer = null;
+        this.snapshotBarrierReady = false;
         if (!this.opened) return;
         this.opened = false;
         this.term.reset();
@@ -965,10 +983,7 @@
         // Deleted on purpose: stay closed instead of respawning.
         if (this.closing) { this.markClosed(); return; }
         // Shell exited / was reset ("exit") or attach failed ("error").
-        // Keep epoch/offset: the next open carries them so the server can
-        // decide delta vs. full replay via its epoch check. If the shell
-        // really did respawn, the epoch mismatch forces a full replay
-        // anyway, so retaining stale state here is always safe.
+        // The next open always requests a new full snapshot.
         this.dead = true;
         refreshSlots();
         if (!this.isActive()) return;   // background: re-opened on activation
@@ -1700,7 +1715,8 @@
       if (Conn.failures >= MAX_FAILURES) { refreshSlots(); return; }  // given up: reload only
       // Mobile network stacks can leave a dead TCP connection looking OPEN
       // to JavaScript after the app resumes. Reconnect proactively after a
-      // meaningful suspension; epoch/offset resume makes this inexpensive.
+      // meaningful suspension. Reconnect performs one bounded snapshot per
+      // opened slot, then returns to live streaming.
       const wasSuspended = hiddenAt !== null && performance.now() - hiddenAt > 10000;
       hiddenAt = null;
       if (wasSuspended || !Conn.ws || Conn.ws.readyState === WebSocket.CLOSING || Conn.ws.readyState === WebSocket.CLOSED) {

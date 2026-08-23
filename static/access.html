@@ -145,10 +145,26 @@
     let remaining = null;
     const MAX_TIMEOUT = 2147483000;
 
-    // Resume checkpoint: epoch identifies the shell instance, offset counts
-    // stream bytes received. Passed on reconnect for a delta instead of a
-    // full replay.
-    let epoch = null, offset = 0;
+    // A reconnect always starts with one authoritative snapshot. Hold it and
+    // any immediately following live frames until xterm has drained old
+    // writes and reset its parser/screen state.
+    let snapshotBuffer = null, snapshotBarrierReady = false;
+    let expectSnapshot = false, renderGeneration = 0;
+
+    function flushSnapshot(gen) {
+      if (gen !== renderGeneration || !snapshotBarrierReady ||
+          expectSnapshot || snapshotBuffer === null) return;
+      const chunks = snapshotBuffer;
+      snapshotBuffer = null;
+      const repaint = () => term.refresh(0, term.rows - 1);
+      if (!chunks.length) {
+        term.write(new Uint8Array(0), repaint);
+      } else {
+        chunks.forEach((chunk, i) => {
+          term.write(chunk, i === chunks.length - 1 ? repaint : undefined);
+        });
+      }
+    }
 
     function fmtRemaining(s) {
       if (s == null) return "";
@@ -182,9 +198,7 @@
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      let u = `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;
-      if (epoch !== null) u += `&epoch=${epoch}&offset=${offset}`;
-      return u;
+      return `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;
     }
     function connect() {
       if (expired) return;
@@ -200,17 +214,32 @@
           let m;
           try { m = JSON.parse(ev.data); } catch (_) { return; }
           if (m.type === "hello") {
-            epoch = m.epoch;
-            offset = m.offset;
-            // replay: different shell or missed window — redraw from scratch.
-            // resume: stream continues seamlessly; keep the screen.
-            if (m.mode === "replay") term.reset();
+            const gen = ++renderGeneration;
+            snapshotBuffer = [];
+            snapshotBarrierReady = false;
+            expectSnapshot = true;
+            term.write(new Uint8Array(0), () => {
+              if (gen !== renderGeneration) return;
+              term.reset();
+              const ready = () => {
+                if (gen !== renderGeneration) return;
+                snapshotBarrierReady = true;
+                flushSnapshot(gen);
+              };
+              if (m.init) term.write(m.init, ready);
+              else ready();
+            });
           }
           return;
         }
         const data = new Uint8Array(ev.data);
-        offset += data.length;
-        term.write(data);
+        if (snapshotBuffer !== null) {
+          snapshotBuffer.push(data);
+          if (expectSnapshot) expectSnapshot = false;
+          flushSnapshot(renderGeneration);
+        } else {
+          term.write(data);
+        }
       };
       sock.onclose = async () => {
         if (myGen !== generation || expired) return;
