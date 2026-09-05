@@ -1732,7 +1732,7 @@ async fn access_ws(
         tracing::warn!("access ws: rejected — sharing is disabled");
         return (StatusCode::FORBIDDEN, "sharing is disabled").into_response();
     }
-    let Some((user, index, revoked)) = state.shares.lease(&q.token) else {
+    let Some(lease) = state.shares.lease(&q.token) else {
         tracing::warn!("access ws: rejected — invalid or expired share token");
         return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
     };
@@ -1746,11 +1746,8 @@ async fn access_ws(
         );
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    // Force-close the viewer exactly when the token expires.
-    let deadline = state
-        .shares
-        .remaining_secs(&q.token)
-        .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
+    let user = lease.username.clone();
+    let index = lease.index;
     let resume = match (q.epoch, q.offset) {
         (Some(e), Some(o)) => Some((e, o)),
         _ => None,
@@ -1762,7 +1759,10 @@ async fn access_ws(
             ws.max_message_size(state.config.ws_message_limit)
                 .max_frame_size(state.config.ws_message_limit)
                 .on_upgrade(move |socket| {
-                    pty::bridge(socket, attachment, true, deadline, Some(revoked))
+                    // The lease carries the expiry the token was admitted
+                    // on; the bridge force-closes at that instant and refuses
+                    // to forward anything past it — see `pty::bridge`.
+                    pty::bridge(socket, attachment, true, Some(lease))
                 })
         }
         Err(e) => {

@@ -363,15 +363,122 @@ fn valid_size(cols: u16, rows: u16) -> (u16, u16) {
 /// hello text frame, then the replay/delta as the first binary frame (even
 /// if empty — this keeps the frame sequence uniform: hello, replay, live),
 /// then live output. When `read_only` is set, all input and resize frames
-/// from this client are dropped (server-enforced). When `deadline` is set
-/// (share links), the connection is force-closed at that time so an expired
-/// token cannot keep watching a connection it opened before expiry.
+/// from this client are dropped (server-enforced).
+///
+/// When `lease` is set (share links), the server ends the stream itself, with
+/// no help from the client:
+///
+/// - a timer force-closes the socket at the lease deadline, so a socket opened
+///   before expiry cannot keep watching past it;
+/// - the wall clock is re-checked against the lease before every frame is
+///   forwarded, so nothing is streamed once expired even if the timer and the
+///   monotonic clock disagree with wall time (e.g. after a clock step);
+/// - the `select!` is `biased` toward the expiry and revocation arms, so a
+///   busy output stream cannot win the race against a deadline that has
+///   already fired;
+/// - revocation closes the socket immediately, and the minute sweep in
+///   `ShareStore::sweep` revokes every expired grant, so a socket that somehow
+///   outlived its own timer is closed by the scheduler;
+/// - the socket also re-checks its own lease on a fixed tick, so it does not
+///   depend on any of the above events arriving.
+///
+/// A viewer that reconnects afterwards is refused at the upgrade, before any
+/// attachment exists.
+/// How often a share viewer socket re-checks its own lease against the wall
+/// clock, as a safety net behind the exact deadline timer.
+const SHARE_AUDIT_SECS: u64 = 15;
+
+/// Why a [`ViewerOutput`] refused to forward a frame.
+enum Stop {
+    /// The lease is no longer valid (expired or revoked); a Close frame has
+    /// been sent and nothing more will be.
+    Invalid,
+    /// The peer went away.
+    Gone,
+}
+
+/// RAII guard over a viewer socket's write half.
+///
+/// The `SplitSink` is *owned* by this guard and reachable only through
+/// [`ViewerOutput::send`], which refuses every frame once the lease is no
+/// longer valid — expired *or* revoked, the same check for both, so every
+/// way of invalidating a link fails the client identically. Validity is
+/// one-way: the wall clock does not run backwards past an expiry, and a
+/// revocation is never un-sent, so an invalid guard can never be reactivated.
+///
+/// The termination paths call [`ViewerOutput::close`], which takes `self` by
+/// value: after that, no handle to the socket exists anywhere, so streaming
+/// further is not a runtime check but a compile error. Dropping the guard
+/// without `close` (a panic, an early return) also drops the sink, which
+/// tears the connection down.
+struct ViewerOutput {
+    sink: futures::stream::SplitSink<WebSocket, Message>,
+    lease: Option<crate::share::Lease>,
+}
+
+impl ViewerOutput {
+    fn new(
+        sink: futures::stream::SplitSink<WebSocket, Message>,
+        lease: Option<crate::share::Lease>,
+    ) -> Self {
+        Self { sink, lease }
+    }
+
+    /// False once the lease (if any) has expired or been revoked.
+    fn valid(&self) -> bool {
+        self.lease.as_ref().is_none_or(|l| l.valid())
+    }
+
+    /// Forward one frame, unless the lease is no longer valid — in which case
+    /// the frame is dropped, a Close is sent instead, and `Err(Stop::Invalid)`
+    /// tells the caller to consume the guard. Validity is re-evaluated on
+    /// every call, so this holds even if no timer or channel ever fired.
+    async fn send(&mut self, msg: Message) -> Result<(), Stop> {
+        if !self.valid() {
+            let _ = self.sink.send(Message::Close(None)).await;
+            return Err(Stop::Invalid);
+        }
+        self.sink.send(msg).await.map_err(|_| Stop::Gone)
+    }
+
+    /// End the stream: send Close and give up the sink for good.
+    async fn close(mut self) {
+        let _ = self.sink.send(Message::Close(None)).await;
+        // `self.sink` drops here; the guard is gone.
+    }
+}
+
+/// Bridge a WebSocket to ONE attached terminal (share viewers). Sends a
+/// hello text frame, then the replay/delta as the first binary frame (even
+/// if empty — this keeps the frame sequence uniform: hello, replay, live),
+/// then live output. When `read_only` is set, all input and resize frames
+/// from this client are dropped (server-enforced).
+///
+/// When `lease` is set (share links), the server ends the stream itself, with
+/// no help from the client. The write half of the socket is held by a
+/// [`ViewerOutput`] guard that is the only way to emit a frame:
+///
+/// - the guard checks the lease — wall-clock expiry *and* revocation — before
+///   every frame, so nothing is forwarded once it is invalid even if a timer
+///   or the monotonic clock disagrees with wall time (e.g. after a clock
+///   step), and every invalidation fails the client the same way;
+/// - a timer fires at the lease deadline and consumes the guard, so a socket
+///   opened before expiry cannot keep watching past it;
+/// - the `select!` is `biased` toward the termination arms, so a busy output
+///   stream cannot win the race against a deadline that has already fired;
+/// - revocation consumes the guard immediately, and the minute sweep in
+///   `ShareStore::sweep` revokes every expired grant, so a socket that somehow
+///   outlived its own timer is closed by the scheduler;
+/// - the socket re-checks its own lease on a fixed tick as well, so it does
+///   not depend on any of the above events arriving.
+///
+/// A viewer that reconnects afterwards is refused at the upgrade, before any
+/// attachment exists.
 pub async fn bridge(
     socket: WebSocket,
     attachment: Attachment,
     read_only: bool,
-    deadline: Option<tokio::time::Instant>,
-    revoked: Option<tokio::sync::watch::Receiver<bool>>,
+    lease: Option<crate::share::Lease>,
 ) {
     let hello = hello_json(None, &attachment);
     let Attachment {
@@ -382,16 +489,21 @@ pub async fn bridge(
         ..
     } = attachment;
 
-    let (mut sink, mut stream) = socket.split();
+    let (sink, mut stream) = socket.split();
 
-    if sink.send(Message::Text(hello)).await.is_err() {
+    let deadline = lease.as_ref().map(|l| l.deadline());
+    let mut revoked = lease.as_ref().map(|l| l.revoked.clone());
+    let mut out = ViewerOutput::new(sink, lease);
+
+    // Nothing leaves the server on an expired lease — not even the hello.
+    if out.send(Message::Text(hello)).await.is_err() {
         return;
     }
-    if sink.send(Message::Binary(replay)).await.is_err() {
+    if out.send(Message::Binary(replay)).await.is_err() {
         return;
     }
 
-    // Fires at `deadline`, or never when there is none.
+    // Fires at the lease deadline, or never when there is no lease.
     let expiry = async move {
         match deadline {
             Some(d) => tokio::time::sleep_until(d).await,
@@ -400,9 +512,11 @@ pub async fn bridge(
     };
     tokio::pin!(expiry);
 
+    // Resolves when the grant is revoked, or when its sender is dropped —
+    // both mean the viewer must go.
     let revocation = async move {
-        match revoked {
-            Some(mut rx) => {
+        match revoked.as_mut() {
+            Some(rx) => {
                 if *rx.borrow() {
                     return;
                 }
@@ -413,40 +527,61 @@ pub async fn bridge(
     };
     tokio::pin!(revocation);
 
+    // Scheduled self-check: independent of the one-shot deadline, the
+    // revocation channel, and any client traffic.
+    let leased = out.lease.is_some();
+    let mut audit = tokio::time::interval(std::time::Duration::from_secs(SHARE_AUDIT_SECS));
+    audit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Every arm below ends the task by `return`, and none of them kills the
+    // shell: slots are persistent and resumable.
     loop {
         tokio::select! {
-            // Share token expired mid-session: disconnect the viewer.
+            // Poll in declaration order: the termination arms are checked
+            // before any output is forwarded.
+            biased;
+
+            // Share token expired mid-session: the guard is consumed here, and
+            // the sink with it.
             _ = &mut expiry => {
-                let _ = sink.send(Message::Close(None)).await;
-                break;
+                out.close().await;
+                return;
             },
             _ = &mut revocation => {
-                let _ = sink.send(Message::Close(None)).await;
-                break;
+                out.close().await;
+                return;
+            },
+            _ = audit.tick(), if leased => {
+                if !out.valid() {
+                    out.close().await;
+                    return;
+                }
             },
             // Terminal died or was reset: disconnect so the client reconnects
             // to the fresh shell instead of staring at a dead one.
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    let _ = sink.send(Message::Close(None)).await;
-                    break;
+                    out.close().await;
+                    return;
                 }
             },
-            // Shell output -> browser.
-            out = output_rx.recv() => match out {
+            // Shell output -> browser, through the guard.
+            recv = output_rx.recv() => match recv {
                 Ok(bytes) => {
-                    if sink.send(Message::Binary(bytes)).await.is_err() {
-                        break;
+                    if out.send(Message::Binary(bytes)).await.is_err() {
+                        // Expired (Close already sent) or peer gone: either
+                        // way, drop the guard.
+                        return;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     // The byte stream now has a hole and the viewer's offset
                     // is dishonest: drop the connection; the reconnect heals
                     // via the ring (delta or replay).
-                    let _ = sink.send(Message::Close(None)).await;
-                    break;
+                    out.close().await;
+                    return;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
             // Browser -> shell (ignored entirely for read-only viewers).
             msg = stream.next() => match msg {
@@ -465,14 +600,12 @@ pub async fn bridge(
                         }
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Err(_)) => break,
+                Some(Ok(Message::Close(_))) | None => return,
+                Some(Err(_)) => return,
                 _ => {}
             },
         }
     }
-
-    // Do NOT kill the shell here — slots are persistent and resumable.
 }
 
 #[cfg(test)]

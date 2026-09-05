@@ -70,6 +70,77 @@ pub enum CreateError {
     TooMany,
 }
 
+/// A viewer's admission to one shared slot, valid until `expires_at`.
+///
+/// The server enforces the expiry itself on every viewer socket: the socket is
+/// force-closed at [`Lease::deadline`], and [`Lease::expired`] is re-checked
+/// against the wall clock before every frame is streamed. `revoked` flips (or
+/// its sender is dropped by a sweep) when the grant goes away early.
+pub struct Lease {
+    pub username: String,
+    pub index: usize,
+    /// Unix seconds, as signed into the token.
+    pub expires_at: u64,
+    pub revoked: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Lease {
+    /// The wall-clock instant this lease ends.
+    fn expires_at_time(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.expires_at)
+    }
+
+    /// True once the wall clock has reached the expiry. Second-granular by
+    /// construction of the token, so the boundary is the top of that second.
+    pub fn expired(&self) -> bool {
+        SystemTime::now() >= self.expires_at_time()
+    }
+
+    /// True once the grant has been revoked — explicitly by the owner, by the
+    /// sweep pruning it, or by the sender being dropped for any reason. There
+    /// is no way back: a `watch` never un-sends, and a dropped sender stays
+    /// dropped.
+    pub fn revoked(&self) -> bool {
+        *self.revoked.borrow() || self.revoked.has_changed().is_err()
+    }
+
+    /// The single validity predicate every viewer frame is gated on: not
+    /// expired and not revoked. Once false it can never become true again.
+    pub fn valid(&self) -> bool {
+        !self.expired() && !self.revoked()
+    }
+
+    /// Monotonic deadline for the force-close timer, with sub-second
+    /// precision: an already-expired lease yields a deadline in the past, so
+    /// a timer armed on it fires immediately.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        let remaining = self
+            .expires_at_time()
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        tokio::time::Instant::now() + remaining
+    }
+}
+
+/// Drop every grant that has expired as of `now`, telling its live viewers to
+/// disconnect first. Every path that prunes the map goes through here, so an
+/// expired grant never leaves the map silently: the bridge's revocation arm
+/// fires on the explicit `true` (and would also fire on the sender being
+/// dropped, but the signal is deliberate rather than incidental).
+fn prune_expired(grants: &mut HashMap<String, Grant>, now: u64) -> usize {
+    let mut closed = 0;
+    grants.retain(|_, g| {
+        if g.expires_at > now {
+            return true;
+        }
+        if g.revoked.send(true).is_ok() {
+            closed += 1;
+        }
+        false
+    });
+    closed
+}
+
 /// Trim a user-supplied note to something safe to store and redisplay:
 /// control characters (including newlines) collapse to spaces, and the result
 /// is bounded. Escaping is the renderer's job — the UI writes it via
@@ -136,8 +207,7 @@ impl ShareStore {
         let mut grants = crate::util::lock(&self.grants);
         // Reclaim expired entries first: the cap should reflect what is
         // actually usable, not what has accumulated.
-        let now = now_unix();
-        grants.retain(|_, g| g.expires_at > now);
+        prune_expired(&mut grants, now_unix());
         if grants.values().filter(|g| g.username == username).count() >= MAX_GRANTS_PER_USER {
             return Err(CreateError::TooMany);
         }
@@ -155,11 +225,19 @@ impl ShareStore {
         Ok((token, id))
     }
 
-    /// Drop expired grants. Called on a timer so a user who mints links and
-    /// never opens the manage dialog still gets the memory back.
-    pub fn sweep(&self) {
-        let now = now_unix();
-        crate::util::lock(&self.grants).retain(|_, g| g.expires_at > now);
+    /// Drop expired grants and disconnect any viewer still streaming on one.
+    ///
+    /// Called on a timer (every minute) as the scheduled safety net behind the
+    /// per-connection deadline: even if a viewer socket somehow outlived its
+    /// own timer, the next sweep closes it. It also bounds the map for a user
+    /// who mints links and never opens the manage dialog. Returns how many
+    /// grants had viewers signalled.
+    pub fn sweep(&self) -> usize {
+        let closed = prune_expired(&mut crate::util::lock(&self.grants), now_unix());
+        if closed > 0 {
+            tracing::info!("share sweep: closed viewers on {closed} expired grant(s)");
+        }
+        closed
     }
 
     /// Verify a token's signature and decode its payload (username, slot, expiry
@@ -183,11 +261,14 @@ impl ShareStore {
     /// Resolve a valid, non-expired token to `(username, index)`.
     pub fn resolve(&self, token: &str) -> Option<(String, usize)> {
         let (id, user, index, exp) = self.verify(token)?;
+        let mut grants = crate::util::lock(&self.grants);
         if now_unix() >= exp {
-            crate::util::lock(&self.grants).remove(&id);
+            // Prune this one on the way out, signalling any viewer on it.
+            if let Some(g) = grants.remove(&id) {
+                let _ = g.revoked.send(true);
+            }
             return None;
         }
-        let grants = crate::util::lock(&self.grants);
         let grant = grants.get(&id)?;
         if grant.username != user || grant.index != index || grant.expires_at != exp {
             return None;
@@ -216,10 +297,11 @@ impl ShareStore {
         }
     }
 
-    pub fn lease(
-        &self,
-        token: &str,
-    ) -> Option<(String, usize, tokio::sync::watch::Receiver<bool>)> {
+    /// Lease a viewer connection against a valid, non-expired token. The
+    /// returned [`Lease`] carries the expiry the token was signed with, so the
+    /// caller derives its force-close deadline from the *same* check that
+    /// admitted it — there is no second lookup that could disagree.
+    pub fn lease(&self, token: &str) -> Option<Lease> {
         let (id, user, index, exp) = self.verify(token)?;
         if now_unix() >= exp {
             return None;
@@ -229,13 +311,17 @@ impl ShareStore {
         if grant.username != user || grant.index != index || grant.expires_at != exp {
             return None;
         }
-        Some((user, index, grant.revoked.subscribe()))
+        Some(Lease {
+            username: user,
+            index,
+            expires_at: exp,
+            revoked: grant.revoked.subscribe(),
+        })
     }
 
     pub fn list(&self, username: &str) -> Vec<Grant> {
-        let now = now_unix();
         let mut grants = crate::util::lock(&self.grants);
-        grants.retain(|_, g| g.expires_at > now);
+        prune_expired(&mut grants, now_unix());
         grants
             .values()
             .filter(|g| g.username == username)
@@ -353,5 +439,70 @@ mod tests {
         assert!(s.revoke("u", &id));
         assert_eq!(s.resolve(&token), None);
         assert_eq!(store().resolve(&token), None);
+    }
+
+    #[test]
+    fn lease_carries_the_expiry_it_was_admitted_on() {
+        let s = store();
+        let (token, _) = s.create("u", 2, Duration::from_secs(60), "").unwrap();
+        let lease = s.lease(&token).expect("live lease");
+        assert_eq!(lease.username, "u");
+        assert_eq!(lease.index, 2);
+        assert!(lease.valid());
+        assert!(!lease.expired());
+        assert!(!lease.revoked());
+        let remaining = lease
+            .deadline()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(remaining <= Duration::from_secs(60));
+        assert!(remaining > Duration::from_secs(58));
+    }
+
+    #[test]
+    fn expired_token_cannot_be_leased() {
+        let s = store();
+        let (token, _) = s.create("u", 0, Duration::from_secs(0), "").unwrap();
+        assert!(s.lease(&token).is_none());
+    }
+
+    #[test]
+    fn revocation_invalidates_a_live_lease_for_good() {
+        let s = store();
+        let (token, id) = s.create("u", 0, Duration::from_secs(60), "").unwrap();
+        let lease = s.lease(&token).unwrap();
+        assert!(lease.valid());
+        assert!(s.revoke("u", &id));
+        assert!(lease.revoked());
+        assert!(!lease.valid());
+        // Nothing can bring it back: the grant is gone and a fresh lease is
+        // refused, while the old handle stays invalid.
+        assert!(s.lease(&token).is_none());
+        assert!(!lease.valid());
+    }
+
+    #[test]
+    fn sweep_invalidates_leases_on_expired_grants() {
+        let s = store();
+        let (token, _) = s.create("u", 0, Duration::from_secs(1), "").unwrap();
+        let lease = s.lease(&token).unwrap();
+        assert!(lease.valid());
+        // Nothing has told the lease anything yet; only the clock has moved.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(lease.expired());
+        assert!(!lease.valid());
+        assert!(!lease.revoked(), "the sweep has not run yet");
+        // The scheduled sweep signals viewers of expired grants explicitly.
+        assert_eq!(s.sweep(), 1);
+        assert!(lease.revoked());
+        assert_eq!(s.sweep(), 0, "already pruned");
+    }
+
+    #[test]
+    fn expired_lease_yields_a_deadline_that_is_already_due() {
+        let s = store();
+        let (token, _) = s.create("u", 0, Duration::from_secs(1), "").unwrap();
+        let lease = s.lease(&token).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(lease.deadline() <= tokio::time::Instant::now());
     }
 }

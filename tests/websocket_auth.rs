@@ -185,7 +185,9 @@ where
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut output = Vec::new();
     while Instant::now() < deadline {
-        let message = timeout(Duration::from_secs(2), ws.next())
+        // Generous per-frame wait: every test here boots its own server and
+        // login shell, and they all run in parallel on the same box.
+        let message = timeout(Duration::from_secs(5), ws.next())
             .await
             .expect("command output timeout")
             .expect("socket closed")
@@ -393,4 +395,191 @@ async fn replay_hello_reinstates_alt_screen_scrolled_out_of_the_ring() {
     assert_eq!(hello["mode"], "replay");
     let init = hello["init"].as_str().expect("replay hello carries init");
     assert!(init.contains("\u{1b}[?1049h"), "init={init:?}");
+}
+
+/// Open slot 0 on the authenticated mux so a viewer has something to attach
+/// to, and keep the mux socket alive for the caller.
+async fn open_slot_zero(
+    server: &TestServer,
+    cookie: &str,
+    csrf: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let request = ws_request(
+        format!("{}/webshell/private/ws?csrf={csrf}", server.ws),
+        Some(cookie),
+        &server.http,
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws.send(Message::Text(
+        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string(),
+    ))
+    .await
+    .unwrap();
+    recv_hello(&mut ws, 0).await;
+    ws
+}
+
+async fn create_share(server: &TestServer, cookie: &str, csrf: &str, ttl_secs: u64) -> Value {
+    let response = http_client()
+        .post(format!("{}/webshell/private/api/share", server.http))
+        .header(COOKIE, cookie)
+        .form(&[
+            ("csrf", csrf),
+            ("index", "0"),
+            ("ttl_secs", &ttl_secs.to_string()),
+            ("note", "test"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.unwrap()
+}
+
+fn share_token(share: &Value) -> String {
+    let url = share["url"].as_str().unwrap();
+    url.split_once("token=").unwrap().1.to_string()
+}
+
+/// Connect a read-only viewer and consume the hello + replay frames.
+async fn connect_viewer(
+    server: &TestServer,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let request = ws_request(
+        format!("{}/webshell/public/access/ws?token={token}", server.ws),
+        None,
+        &server.http,
+    );
+    let (mut viewer, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let hello = timeout(Duration::from_secs(5), viewer.next())
+        .await
+        .expect("viewer hello timeout")
+        .expect("viewer closed")
+        .unwrap();
+    assert!(
+        matches!(hello, Message::Text(_)),
+        "first frame is the hello"
+    );
+    let replay = timeout(Duration::from_secs(5), viewer.next())
+        .await
+        .expect("viewer replay timeout")
+        .expect("viewer closed")
+        .unwrap();
+    assert!(
+        matches!(replay, Message::Binary(_)),
+        "second frame is the replay"
+    );
+    viewer
+}
+
+/// Drain a viewer until the server closes it, returning how long that took
+/// and whether the close came from the server (a Close frame or EOF) rather
+/// than from anything the client did.
+async fn wait_for_server_close<S>(
+    viewer: &mut tokio_tungstenite::WebSocketStream<S>,
+    max: Duration,
+) -> Duration
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let started = Instant::now();
+    loop {
+        match timeout(max, viewer.next()).await {
+            Err(_) => panic!("server did not close the viewer within {max:?}"),
+            Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) => {
+                return started.elapsed();
+            }
+            Ok(Some(Ok(_))) => continue,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_viewer_is_closed_by_the_server_at_expiry() {
+    let server = TestServer::start().await;
+    let (cookie, csrf) = server.login().await;
+    let mut owner = open_slot_zero(&server, &cookie, &csrf).await;
+
+    let share = create_share(&server, &cookie, &csrf, 2).await;
+    let token = share_token(&share);
+    let mut viewer = connect_viewer(&server, &token).await;
+
+    // Keep the shell producing output the whole time, so a viewer that was
+    // still allowed to stream would have frames to receive.
+    // Through `sh` so it works whatever the login shell is.
+    owner
+        .send(Message::Binary(
+            b"\x00sh -c 'while :; do echo tick; sleep 0.1; done'\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+
+    // The viewer never polls status and never disconnects on its own: the
+    // server has to end it, and within the token's lifetime plus slack.
+    let took = wait_for_server_close(&mut viewer, Duration::from_secs(6)).await;
+    assert!(took <= Duration::from_millis(3500), "closed after {took:?}");
+
+    // Once expired, no new stream can be opened with that token...
+    let request = ws_request(
+        format!("{}/webshell/public/access/ws?token={token}", server.ws),
+        None,
+        &server.http,
+    );
+    expect_ws_status(request, StatusCode::FORBIDDEN).await;
+
+    // ...and the status/meta endpoints agree.
+    let status: Value = http_client()
+        .get(format!(
+            "{}/webshell/public/access/status?token={token}",
+            server.http
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["valid"], false);
+    let meta = http_client()
+        .get(format!(
+            "{}/webshell/public/access/meta?token={token}",
+            server.http
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(meta.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_viewer_is_closed_by_the_server_on_revocation() {
+    let server = TestServer::start().await;
+    let (cookie, csrf) = server.login().await;
+    let _owner = open_slot_zero(&server, &cookie, &csrf).await;
+
+    let share = create_share(&server, &cookie, &csrf, 3600).await;
+    let token = share_token(&share);
+    let grant_id = share["grant_id"].as_str().unwrap().to_string();
+    let mut viewer = connect_viewer(&server, &token).await;
+
+    let revoke = http_client()
+        .post(format!("{}/webshell/private/api/share/revoke", server.http))
+        .header(COOKIE, &cookie)
+        .form(&[("csrf", csrf.as_str()), ("grant_id", grant_id.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(revoke.status().is_success(), "revoke: {}", revoke.status());
+
+    // Revocation is pushed to the live viewer, not discovered at next poll.
+    let took = wait_for_server_close(&mut viewer, Duration::from_secs(5)).await;
+    assert!(took <= Duration::from_secs(2), "closed after {took:?}");
+
+    let request = ws_request(
+        format!("{}/webshell/public/access/ws?token={token}", server.ws),
+        None,
+        &server.http,
+    );
+    expect_ws_status(request, StatusCode::FORBIDDEN).await;
 }

@@ -195,7 +195,11 @@ You can even broadcast your live session in 1 to N multicasting.
   validity (1 day / 3 / 7 / 30, or custom seconds) and an optional note saying
   what it is for. Read-only and expiry are **enforced server-side**; the link
   stops working exactly at expiry (the viewer pops an "expired" notice), and
-  dies immediately if sharing is disabled.
+  dies immediately if sharing is disabled. The server ends the stream itself,
+  with nothing required of the viewer: the socket's write half lives inside a
+  lease guard that checks expiry and revocation before every frame, a timer
+  consumes the guard at the deadline, and a scheduled sweep closes anything
+  that somehow outlived it. Once invalid, a lease can never become valid again.
 - **Revocable sharing.** Every link you hand out is listed under
   *share → Manage existing links*, with its note, slot and time left. Revoke one
   and it stops resolving **and disconnects anyone watching through it right
