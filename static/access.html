@@ -196,6 +196,23 @@
       }, Math.min(secs * 1000, MAX_TIMEOUT));
     }
 
+    // Repaint after the page was backgrounded: a hidden tab gets no animation
+    // frames and xterm pauses rendering, so rows rewritten meanwhile can come
+    // back stale until something forces a full redraw. Refit and mark every
+    // row dirty, once on the next frame and once shortly after.
+    function repaintVisible() {
+      const paint = () => {
+        if (document.visibilityState !== "visible") return;
+        rescale();
+        term.refresh(0, term.rows - 1);
+      };
+      requestAnimationFrame(paint);
+      setTimeout(paint, 150);
+    }
+    document.addEventListener("visibilitychange", repaintVisible);
+    window.addEventListener("focus", repaintVisible);
+    window.addEventListener("pageshow", repaintVisible);
+
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       return `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;

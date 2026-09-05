@@ -745,14 +745,16 @@
         // Keep the keyboard shift-clamp honest as the cursor row changes.
         this.term.onCursorMove(() => { if (this.isActive()) scheduleLayout(); });
 
-        // Touch scrollback: one-finger drag drives xterm's own scrollable
-        // viewport by raw pixel deltas — content tracks the finger 1:1 —
-        // with a momentum fling on release. xterm 5.5 registers its own
-        // touch handlers on term.element (a child of this.pane); capturing
-        // here + stopPropagation on move keeps the pane the single owner of
-        // the gesture so xterm's handler can't double-scroll or fight
-        // zoom-pan.
-        this.viewport = this.pane.querySelector(".xterm-viewport");
+        // Touch scrollback: one-finger drag scrolls the buffer by pixel
+        // deltas — accumulated and paid out in whole lines through xterm's
+        // public scrollLines(), so it does not depend on the viewport's DOM
+        // (xterm 6 replaced the natively scrolling .xterm-viewport with its
+        // own scrollable element) — with a momentum fling on release. xterm
+        // registers its own touch handlers on term.element (a child of
+        // this.pane); capturing here + stopPropagation on move keeps the
+        // pane the single owner of the gesture so xterm's handler can't
+        // double-scroll or fight zoom-pan.
+        this.scrollAccum = 0;     // px of drag not yet turned into lines
         this.touchY = null;
         this.touchT = 0;
         this.touchV = 0;          // px/ms, low-passed drag velocity
@@ -760,6 +762,7 @@
         this.pane.addEventListener("touchstart", (e) => {
           this.flinging = false;  // any touch stops a fling
           this.touchV = 0;
+          this.scrollAccum = 0;
           this.touchT = e.timeStamp;
           this.touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
         }, { passive: true, capture: true });
@@ -786,8 +789,7 @@
             e.preventDefault();
             return;
           }
-          if (!this.viewport) return;
-          this.viewport.scrollTop -= dy;
+          this.scrollByPixels(-dy);
           this.touchV = 0.8 * (dy / dt) + 0.2 * this.touchV;
           e.preventDefault();
         }, { passive: false, capture: true });
@@ -804,6 +806,25 @@
       }
 
       isActive() { return active === this.index; }
+
+      // Height of one terminal row in CSS pixels, from the live element.
+      cellHeight() {
+        const h = this.term.element ? this.term.element.getBoundingClientRect().height : 0;
+        return this.term.rows > 0 ? h / this.term.rows : 0;
+      }
+
+      // Scroll the normal buffer by a pixel distance (positive = towards the
+      // bottom). Sub-line remainders carry over so a slow drag still moves.
+      scrollByPixels(px) {
+        const cellH = this.cellHeight();
+        if (!(cellH > 0)) return;
+        this.scrollAccum += px;
+        const lines = Math.trunc(this.scrollAccum / cellH);
+        if (lines !== 0) {
+          this.scrollAccum -= lines * cellH;
+          this.term.scrollLines(lines);
+        }
+      }
 
       // Forget the app's mouse-tracking request. Call after term.reset():
       // xterm's parser state is wiped, so ours must match.
@@ -822,7 +843,7 @@
       // Momentum fling: keep scrolling after release with exponential decay
       // until the velocity fades or a new touch interrupts.
       fling() {
-        if (this.flinging || !this.viewport) return;
+        if (this.flinging) return;
         this.flinging = true;
         let last = performance.now();
         const step = (now) => {
@@ -835,7 +856,7 @@
             this.flinging = false;
             return;
           }
-          this.viewport.scrollTop -= this.touchV * dt;
+          this.scrollByPixels(-this.touchV * dt);
           requestAnimationFrame(step);
         };
         requestAnimationFrame(step);
@@ -1703,6 +1724,28 @@
 
     setInterval(refreshSlots, 5000);
 
+    // Repaint the visible terminal after the page was backgrounded. While a
+    // tab is hidden the browser stops animation frames and xterm pauses its
+    // renderer; rows the shell rewrote in the meantime (an app's bottom
+    // status line that changes rarely, e.g. Claude Code's) can come back
+    // stale or blank, and only a resize used to repair it. Do what a resize
+    // does: refit, then mark every row dirty. Once on the next frame — which
+    // only fires once the tab is actually visible — and once more shortly
+    // after, in case xterm's own visibility callback lands after ours.
+    function repaintActive() {
+      const paint = () => {
+        const s = sessions[active];
+        if (!s || document.visibilityState !== "visible") return;
+        s.fitAndResize();
+        s.term.refresh(0, s.term.rows - 1);
+      };
+      requestAnimationFrame(paint);
+      setTimeout(paint, 150);
+    }
+    // Alt-tabbing between apps changes focus without a visibilitychange.
+    window.addEventListener("focus", repaintActive);
+    window.addEventListener("pageshow", repaintActive);
+
     // Coming back to the foreground (mobile backgrounds kill sockets):
     // reconnect dead sessions immediately instead of waiting out the
     // exponential backoff, which can sit at 5s.
@@ -1712,6 +1755,7 @@
         hiddenAt = performance.now();
         return;
       }
+      repaintActive();
       if (Conn.failures >= MAX_FAILURES) { refreshSlots(); return; }  // given up: reload only
       // Mobile network stacks can leave a dead TCP connection looking OPEN
       // to JavaScript after the app resumes. Reconnect proactively after a

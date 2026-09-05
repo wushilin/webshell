@@ -20,8 +20,8 @@
 
 set -euo pipefail
 
-XTERM_VERSION="${XTERM_VERSION:-5.5.0}"
-ADDON_FIT_VERSION="${ADDON_FIT_VERSION:-0.10.0}"
+XTERM_VERSION="${XTERM_VERSION:-6.0.0}"
+ADDON_FIT_VERSION="${ADDON_FIT_VERSION:-0.11.0}"
 
 cd "$(dirname "$0")"
 VENDOR="static/vendor"
