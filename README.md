@@ -49,19 +49,19 @@ They have no shared-library dependencies at all — no glibc version to match, n
 PAM, nothing to install alongside them. Drop one on any Linux host and run it:
 
 ```sh
-# pick your architecture
-curl -fsSLO https://github.com/wushilin/webshell/releases/latest/download/webshell-x86_64-unknown-linux-musl
-curl -fsSLO https://github.com/wushilin/webshell/releases/latest/download/webshell-aarch64-unknown-linux-musl
+VER=0.3.0                       # or whatever the latest release is
+ARCH=x86_64                     # or aarch64
+BASE=https://github.com/wushilin/webshell/releases/download/v$VER
 
-chmod +x webshell-*-unknown-linux-musl
-sudo install -m 0755 webshell-x86_64-unknown-linux-musl /usr/local/bin/webshell
+curl -fsSLO $BASE/webshell-$VER-linux-$ARCH-musl
+sudo install -m 0755 webshell-$VER-linux-$ARCH-musl /usr/local/bin/webshell
 webshell --version
 ```
 
 Verify the download against the checksums published with the release:
 
 ```sh
-curl -fsSLO https://github.com/wushilin/webshell/releases/latest/download/SHA256SUMS
+curl -fsSLO $BASE/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 

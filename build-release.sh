@@ -76,7 +76,14 @@ for target in "${TARGETS[@]}"; do
     fi
     echo "   verified statically linked"
 
-    cp "$bin" "$OUT/webshell-${target}"
+    # Asset names follow the convention established by earlier releases:
+    # webshell-<version>-linux-<arch>-musl
+    case "$target" in
+        x86_64-*)  arch=x86_64 ;;
+        aarch64-*) arch=aarch64 ;;
+        *)         echo "error: no asset name mapped for $target" >&2; exit 1 ;;
+    esac
+    cp "$bin" "$OUT/webshell-${VERSION}-linux-${arch}-musl"
 done
 
 # 3. Checksums, so a download can be verified.
