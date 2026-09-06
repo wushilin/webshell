@@ -57,9 +57,12 @@ struct File {
 
 /// Reads and writes the enrollment file.
 ///
-/// Every mutation takes the same lock and writes the whole file while holding
-/// it: enrollment is read-modify-write, and two people enrolling at once would
-/// otherwise lose one of them.
+/// Every mutation takes the same lock and writes the whole file **while still
+/// holding it**: enrollment is read-modify-write, and two people enrolling at
+/// once would otherwise lose one of them. Snapshotting under the lock and
+/// writing after releasing it looks equivalent and is not — two writers can
+/// interleave so that the slower one lands a snapshot taken before the faster
+/// one's change, reverting it on disk while memory still looks right.
 pub struct EnrollmentStore {
     path: PathBuf,
     inner: Mutex<HashMap<Identity, Record>>,
@@ -103,27 +106,28 @@ impl EnrollmentStore {
             Some(_) => return Ok(true),
             None => record.sub = Some(sub.to_string()),
         }
-        let snapshot = guard.clone();
-        drop(guard);
-        self.write(&snapshot)?;
+        // Written while still holding the lock — see `write`.
+        self.write(&guard)?;
         Ok(true)
     }
 
     /// Record a verified TOTP secret, completing enrollment.
     pub fn enroll(&self, id: &Identity, secret: &str, now: u64) -> anyhow::Result<()> {
-        let snapshot = {
-            let mut guard = lock(&self.inner);
-            let record = guard.entry(id.clone()).or_default();
-            record.mfa_secret = Some(secret.to_string());
-            record.enrolled_at = Some(now);
-            guard.clone()
-        };
-        self.write(&snapshot)
+        let mut guard = lock(&self.inner);
+        let record = guard.entry(id.clone()).or_default();
+        record.mfa_secret = Some(secret.to_string());
+        record.enrolled_at = Some(now);
+        // Written while still holding the lock — see `write`.
+        self.write(&guard)
     }
 
     /// Serialize the whole file atomically, mode 0600. It holds every user's
     /// TOTP secret, so it is never world-readable and never a half-written
     /// file another process could load.
+    ///
+    /// Callers must hold the map lock across this, so that the map and the file
+    /// change as one step. It takes `&HashMap` rather than the guard to keep
+    /// the write itself testable, but every call site passes a live guard.
     fn write(&self, entries: &HashMap<Identity, Record>) -> anyhow::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -156,6 +160,11 @@ impl EnrollmentStore {
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
             std::fs::rename(&tmp, &self.path)?;
+            // The rename is metadata: without this a crash can lose the swap
+            // even though the bytes it points at were safely on disk.
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
             Ok(())
         })();
         if result.is_err() {

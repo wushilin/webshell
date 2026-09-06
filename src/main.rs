@@ -1,5 +1,6 @@
 mod certs;
 mod config;
+mod devices;
 mod enrollment;
 mod identity;
 mod localauth;
@@ -29,6 +30,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
 use config::{Config, Settings};
+use devices::DeviceStore;
 use enrollment::EnrollmentStore;
 use identity::Identity;
 use session::SessionStore;
@@ -36,6 +38,11 @@ use share::ShareStore;
 use terminals::Terminals;
 
 const COOKIE_NAME: &str = "webshell_sid";
+/// Trusted-device cookie. Separate from the session cookie by design: it
+/// outlives logout, carries its own Max-Age, and proves only that this
+/// browser has already passed a TOTP challenge — never that anyone is
+/// logged in.
+const DEVICE_COOKIE: &str = "webshell_td";
 const BASE_PATH: &str = "/webshell";
 
 /// Display preferences the owner sets, mirrored to read-only viewers so their
@@ -58,8 +65,9 @@ impl LoginGuard {
     fn new() -> Self {
         LoginGuard {
             inner: Mutex::new((0, Instant::now())),
-            // PAM is intentionally serialized. This is a single-user service,
-            // and unbounded spawn_blocking calls are an easy authentication DoS.
+            // Password checks are intentionally serialized. Argon2id is
+            // deliberately expensive, so unbounded concurrent verification is
+            // an easy authentication DoS against a single-user service.
             permit: tokio::sync::Semaphore::new(1),
         }
     }
@@ -100,6 +108,8 @@ struct AppState {
     login_guard: Arc<LoginGuard>,
     /// Per-identity `sub` pin and TOTP secret.
     enrollment: Arc<EnrollmentStore>,
+    /// Browsers that have already passed a TOTP challenge and may skip it.
+    devices: Arc<DeviceStore>,
     /// Outbound client for the Google token exchange. Reused so TLS sessions
     /// and connections are pooled across logins.
     http: reqwest::Client,
@@ -116,7 +126,7 @@ impl axum::extract::FromRef<AppState> for Key {
     }
 }
 
-/// webshell — a browser-based, PAM-authenticated login shell.
+/// webshell — a browser-based login shell.
 #[derive(clap::Parser)]
 #[command(name = "webshell", version, about)]
 struct Cli {
@@ -387,6 +397,35 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
     };
     tracing::info!("enrollment state: {}", enrollment_path.display());
 
+    // Trusted devices live beside the config too. Loaded even when the feature
+    // is off, so that turning it back on does not silently start from nothing
+    // — but never consulted while `remember_device` is false.
+    let device_path = if config.device_path.is_absolute() {
+        config.device_path.clone()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(&config.device_path)
+    };
+    let devices = match DeviceStore::load(&device_path, now_unix()) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            eprintln!("startup error: {e}");
+            std::process::exit(1);
+        }
+    };
+    if config.remember_device {
+        tracing::info!(
+            "trusted devices: {} (window {} days, max {} per identity)",
+            device_path.display(),
+            config.remember_device_window.as_secs() / 86400,
+            config.max_devices_per_identity,
+        );
+    } else {
+        tracing::info!("trusted devices: disabled");
+    }
+
     let sessions = if simple {
         Arc::new(SessionStore::new(config.session_ttl))
     } else if let Some(configured_path) = &config.session_path {
@@ -438,6 +477,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         prefs: Arc::new(Mutex::new(HashMap::new())),
         login_guard: Arc::new(LoginGuard::new()),
         enrollment,
+        devices: devices.clone(),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
@@ -456,6 +496,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
             ticker.tick().await;
             sessions.sweep();
             shares.sweep();
+            devices.sweep(now_unix());
         }
     });
 
@@ -479,6 +520,8 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
         .route("/webshell/private/api/shares", get(list_shares))
         .route("/webshell/private/api/share/revoke", post(revoke_share))
         .route("/webshell/private/api/prefs", post(set_prefs))
+        .route("/webshell/private/api/devices", get(list_devices))
+        .route("/webshell/private/api/device/revoke", post(revoke_device))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let app = Router::new()
@@ -582,6 +625,15 @@ fn generate_cookie_secret() -> String {
     let mut buf = [0u8; 64];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     base64::engine::general_purpose::STANDARD.encode(buf)
+}
+
+/// Wall-clock seconds. Trust records, share grants and enrollment all stamp
+/// themselves in unix seconds, so this is the one place that reads the clock.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn derive_key(master: &[u8], context: &[u8]) -> Vec<u8> {
@@ -786,6 +838,129 @@ fn session_cookie(state: &AppState, id: String) -> Cookie<'static> {
         .build()
 }
 
+/// The trusted-device cookie. Unlike the session cookie this carries an
+/// explicit `Max-Age`: a browser-session cookie would evaporate on restart,
+/// which is precisely what this feature exists to survive.
+///
+/// `SameSite=Lax` is load-bearing rather than conventional. The Google
+/// callback is a cross-site top-level navigation, so `Strict` would withhold
+/// the cookie at exactly the moment the login needs to consult it.
+fn device_cookie(state: &AppState, token: String) -> Cookie<'static> {
+    Cookie::build((DEVICE_COOKIE, token))
+        .path(BASE_PATH)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(state.config.cookie_secure)
+        .max_age(
+            time::Duration::try_from(state.config.remember_device_window)
+                .unwrap_or(time::Duration::DAY * 30),
+        )
+        .build()
+}
+
+/// Removal has to match the cookie's path, or the browser keeps the original
+/// and we "clear" nothing.
+fn cleared_device_cookie() -> Cookie<'static> {
+    Cookie::build((DEVICE_COOKIE, "")).path(BASE_PATH).build()
+}
+
+/// The `enrolled_at` of an identity's current TOTP secret, or `None` if it is
+/// not enrolled. Trust records pin this, so a re-enrollment — including an
+/// operator hand-editing `enrollment.toml` — strands every older record.
+fn current_enrolled_at(state: &AppState, identity: &Identity) -> Option<u64> {
+    let record = state.enrollment.get(identity)?;
+    record.enrolled().then_some(record.enrolled_at).flatten()
+}
+
+/// The trusted-device cookie's value, if the browser presented one that the
+/// jar's signature accepts. An unsigned or tampered cookie never reaches the
+/// store.
+fn device_token(jar: &SignedCookieJar) -> Option<String> {
+    Some(jar.get(DEVICE_COOKIE)?.value().to_string())
+}
+
+/// Best-effort client address for the device listing. Display only — never
+/// compared, because a phone roaming between cell and wifi would otherwise
+/// un-trust itself. Proxy headers are attacker-settable, which is fine for a
+/// string that only ever gets shown back to its own owner.
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn user_agent(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Decide whether this browser may skip the TOTP step for `identity`, having
+/// already passed the first factor.
+///
+/// Returns the device id to log on success. Every gate lives here rather than
+/// spread across the two login paths: the feature must be enabled, the cookie
+/// signed and present, the record live, owned by this identity, and bound to
+/// the identity's *current* TOTP secret.
+fn trusted_device(
+    state: &AppState,
+    jar: &SignedCookieJar,
+    identity: &Identity,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if !state.config.remember_device {
+        return None;
+    }
+    let token = device_token(jar)?;
+    let enrolled_at = current_enrolled_at(state, identity)?;
+    state.devices.authorize(
+        &token,
+        identity,
+        enrolled_at,
+        &devices::Client {
+            user_agent: &user_agent(headers),
+            ip: &client_ip(headers),
+        },
+        now_unix(),
+    )
+}
+
+/// Clear a trust cookie that was presented but did not authorize, so it stops
+/// failing on every subsequent login.
+///
+/// Does nothing while the feature is off: a deployment that toggles
+/// `remember_device` off and back on should find its records where it left
+/// them, not discover that every login in between quietly deleted one.
+fn forget_stale_device(
+    state: &AppState,
+    jar: SignedCookieJar,
+    identity: &Identity,
+) -> SignedCookieJar {
+    if !state.config.remember_device {
+        return jar;
+    }
+    let Some(token) = device_token(&jar) else {
+        return jar;
+    };
+    // The record is this identity's own and it just failed to authorize, so it
+    // is dead weight — expired, or stranded by a re-enrollment. A cookie
+    // naming *someone else's* device is left alone: this browser may simply be
+    // shared, and that trust is still theirs.
+    //
+    // One call, not a lookup followed by a removal: two steps leave a window in
+    // which the record can change owner or vanish between them.
+    state.devices.forget_if_owned(&token, identity);
+    tracing::info!("clearing an unusable trusted-device cookie for {identity}");
+    jar.remove(cleared_device_cookie())
+}
+
 fn ensure_session(state: &AppState, jar: SignedCookieJar) -> (SignedCookieJar, String) {
     if let Some(cookie) = jar.get(COOKIE_NAME) {
         let id = cookie.value().to_string();
@@ -870,8 +1045,10 @@ struct LocalLoginForm {
     password: String,
 }
 
-/// Log in with a system account's password, verified by `su` on a pty. Nothing
-/// here links to PAM, which is what lets this binary be statically linked.
+/// Log in with a password webshell manages itself, verified against the
+/// argon2id hash in the config. Deliberately not the system password: checking
+/// that would need PAM (`dlopen`) or a setuid helper, and avoiding both is what
+/// lets this binary be statically linked. See `localauth`.
 async fn local_login(
     State(state): State<AppState>,
     jar: SignedCookieJar,
@@ -944,6 +1121,16 @@ async fn local_login(
         tracing::info!("login success for {user}");
         return (jar, Redirect::to("/webshell/private/")).into_response();
     }
+    // The password just checked out. A trusted device skips the *code* only —
+    // it could not have skipped the step above.
+    if let Some(device) = trusted_device(&state, &jar, &who, &headers) {
+        state.login_guard.record_success();
+        let new_id = state.sessions.login(&id, &user);
+        let jar = jar.add(session_cookie(&state, new_id));
+        tracing::info!("login success for {user}; MFA skipped via trusted device {device}");
+        return (jar, Redirect::to("/webshell/private/")).into_response();
+    }
+    let jar = forget_stale_device(&state, jar, &who);
     let new_id = state.sessions.begin_mfa(&id, &user);
     let jar = jar.add(session_cookie(&state, new_id));
     (jar, Redirect::to("/webshell/mfa")).into_response()
@@ -1123,7 +1310,16 @@ async fn oauth_callback(
         tracing::info!("login success for {user}");
         return (jar, Redirect::to("/webshell/private/")).into_response();
     }
+    // Google has just vouched for this identity. A trusted device skips the
+    // code that would follow — never the sign-in that came before it.
+    if let Some(device) = trusted_device(&state, &jar, &verified.identity, &headers) {
+        let new_id = state.sessions.login(&id, &user);
+        let jar = jar.add(session_cookie(&state, new_id));
+        tracing::info!("login success for {user}; MFA skipped via trusted device {device}");
+        return (jar, Redirect::to("/webshell/private/")).into_response();
+    }
     // MFA is required: hand off to enrollment or verification, still unauthenticated.
+    let jar = forget_stale_device(&state, jar, &verified.identity);
     let new_id = state.sessions.begin_mfa(&id, &user);
     let jar = jar.add(session_cookie(&state, new_id));
     (jar, Redirect::to("/webshell/mfa")).into_response()
@@ -1200,6 +1396,10 @@ struct MfaForm {
     /// Candidate secret during enrollment; absent when already enrolled.
     #[serde(default)]
     seed: Option<String>,
+    /// "Remember this device". An unchecked box submits nothing at all, so
+    /// absent means no — a browser cannot opt in by omission.
+    #[serde(default)]
+    remember: Option<String>,
 }
 
 /// The TOTP step: enrollment for an identity with no secret yet, verification
@@ -1230,10 +1430,25 @@ fn render_mfa(
 
     // Already enrolled: ask for a code, and never re-show the secret.
     if record.enrolled() {
+        // Built, not hidden: a disabled option should be absent from the page,
+        // the same way `render_login` omits a login method it cannot offer.
+        let remember = if state.config.remember_device {
+            let days = state.config.remember_device_window.as_secs() / 86400;
+            format!(
+                "<div class=\"remember\">\
+                 <input type=\"checkbox\" id=\"remember\" name=\"remember\" value=\"1\" />\
+                 <label for=\"remember\">Remember this device for {days} days\
+                 <span class=\"hint\">You will still enter your password. \
+                 Only do this on a device you control.</span></label></div>"
+            )
+        } else {
+            String::new()
+        };
         let html = include_str!("../static/mfa_verify.html")
             .replace("{{CSRF}}", &html_escape(&session.csrf))
             .replace("{{NONCE}}", &html_escape(&nonce))
             .replace("{{USER}}", &html_escape(id.subject()))
+            .replace("<!--REMEMBER-->", &remember)
             .replace("<!--ERROR-->", error);
         return (html_headers(&nonce, true, headers), Html(html)).into_response();
     }
@@ -1309,10 +1524,7 @@ async fn mfa_submit(
     }
 
     if enrolling {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = now_unix();
         if let Err(e) = state.enrollment.enroll(&identity, &secret, now) {
             tracing::error!("could not persist enrollment: {e}");
             return (
@@ -1322,11 +1534,54 @@ async fn mfa_submit(
                 .into_response();
         }
         tracing::info!("MFA enrollment completed for {identity}");
+        // A fresh secret strands any trust established against the previous
+        // one. The `enrolled_at` pin already makes those records unusable;
+        // this clears the corpses rather than leaving them to expire.
+        let dropped = state.devices.revoke_all(&identity);
+        if dropped > 0 {
+            tracing::info!("re-enrollment revoked {dropped} trusted device(s) for {identity}");
+        }
     }
 
     state.login_guard.record_success();
     let new_id = state.sessions.login(&id, &session.username);
-    let jar = jar.add(session_cookie(&state, new_id));
+    let mut jar = jar.add(session_cookie(&state, new_id));
+
+    // Trust this browser, if it asked and the deployment allows it. Only after
+    // the code verified, cleared the replay guard, and (when enrolling) the
+    // secret reached disk — a device is never trusted on the strength of a
+    // code that did not fully land.
+    //
+    // Enrollment deliberately does not offer the box, so a `remember` that
+    // arrives on that path was hand-crafted rather than clicked; it is
+    // ignored rather than honoured.
+    if state.config.remember_device && form.remember.is_some() && !enrolling {
+        match current_enrolled_at(&state, &identity) {
+            Some(enrolled_at) => {
+                match state.devices.mint(
+                    &identity,
+                    enrolled_at,
+                    state.config.remember_device_window.as_secs(),
+                    state.config.max_devices_per_identity,
+                    &devices::Client {
+                        user_agent: &user_agent(&headers),
+                        ip: &client_ip(&headers),
+                    },
+                    now_unix(),
+                ) {
+                    Ok((token, device_id)) => {
+                        jar = jar.add(device_cookie(&state, token));
+                        tracing::info!("trusted device {device_id} created for {identity}");
+                    }
+                    // Not being remembered is a papercut; failing the login
+                    // over it would be worse. The user is authenticated.
+                    Err(e) => tracing::error!("could not record a trusted device: {e}"),
+                }
+            }
+            None => tracing::error!("cannot trust a device for unenrolled {identity}"),
+        }
+    }
+
     tracing::info!("login success for {identity}");
     (jar, Redirect::to("/webshell/private/")).into_response()
 }
@@ -1349,6 +1604,11 @@ async fn mfa_cancel(
 #[derive(Deserialize)]
 struct LogoutForm {
     csrf: String,
+    /// "Sign out and forget this device": also drop the trust record for the
+    /// browser making the request. Plain logout deliberately leaves it — the
+    /// whole point of a remembered device is that it outlives a session.
+    #[serde(default)]
+    forget: Option<String>,
 }
 
 /// A form carrying nothing but its CSRF token.
@@ -1362,6 +1622,7 @@ async fn logout(
     jar: SignedCookieJar,
     Form(form): Form<LogoutForm>,
 ) -> Response {
+    let mut forget = false;
     if let Some((id, session)) = current_session(&state, &jar) {
         if !csrf_matches(&session.csrf, &form.csrf) {
             return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
@@ -1369,8 +1630,23 @@ async fn logout(
         // Share grants remain independent of login sessions and can be revoked
         // individually through the shares API.
         state.sessions.remove(&id);
+        forget = form.forget.is_some();
     }
     let jar = jar.remove(Cookie::from(COOKIE_NAME));
+    // Only on request: logging out of a session is not the same as saying this
+    // browser is no longer yours.
+    if forget {
+        if let Some(token) = device_token(&jar) {
+            if let Some(device_id) = state.devices.revoke_token(&token) {
+                tracing::info!("logout forgot trusted device {device_id}");
+            }
+        }
+        return (
+            jar.remove(cleared_device_cookie()),
+            Redirect::to("/webshell/login"),
+        )
+            .into_response();
+    }
     (jar, Redirect::to("/webshell/login")).into_response()
 }
 
@@ -1383,10 +1659,20 @@ async fn terminal_page(
         return Redirect::to("/webshell/login").into_response();
     };
     let nonce = config::random_token(16);
+    // Built, not hidden — same rule as the login methods and the MFA
+    // checkbox. With the feature off there is no button, and the modal's
+    // script never runs because the element it keys on does not exist.
+    let devices_btn = if state.config.remember_device {
+        "<button class=\"action\" id=\"devices\" \
+         title=\"Browsers that skip the authenticator code\">devices</button>"
+    } else {
+        ""
+    };
     let html = include_str!("../static/terminal.html")
         .replace("{{CSRF}}", &html_escape(&session.csrf))
         .replace("{{USER}}", &html_escape(&session.username))
         .replace("{{SLOTS}}", &state.config.slots_per_user.to_string())
+        .replace("<!--DEVICESBTN-->", devices_btn)
         .replace("{{NONCE}}", &html_escape(&nonce));
     // no-store: this markup carries the CSRF token and the username.
     (html_headers(&nonce, true, &headers), Html(html)).into_response()
@@ -1554,10 +1840,7 @@ async fn list_shares(State(state): State<AppState>, jar: SignedCookieJar) -> Res
     let Some(session) = authed_session(&state, &jar) else {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = now_unix();
     let mut entries: Vec<ShareEntry> = state
         .shares
         .list(&session.username)
@@ -1596,6 +1879,114 @@ async fn revoke_share(
     } else {
         (StatusCode::NOT_FOUND, "share grant not found").into_response()
     }
+}
+
+/// One trusted device, as the management modal sees it. The cookie value is
+/// not here and never will be: this endpoint describes devices, it does not
+/// hand them out.
+#[derive(serde::Serialize)]
+struct DeviceEntry {
+    id: String,
+    /// Whether this row is the browser making the request, so "revoke the
+    /// others" is unambiguous.
+    current: bool,
+    user_agent: String,
+    last_ip: String,
+    created_at: u64,
+    expires_at: u64,
+    last_used_at: u64,
+    expires_in_secs: u64,
+}
+
+async fn list_devices(State(state): State<AppState>, jar: SignedCookieJar) -> Response {
+    let Some(session) = authed_session(&state, &jar) else {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    };
+    if !state.config.remember_device {
+        // The feature being off is not an error; it is an empty list plus a
+        // flag the UI uses to explain why.
+        return Json(serde_json::json!({ "enabled": false, "devices": [] })).into_response();
+    }
+    let Ok(identity) = session.username.parse::<Identity>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "malformed identity").into_response();
+    };
+    let now = now_unix();
+    let here = device_token(&jar).and_then(|t| state.devices.id_for_token(&t));
+    let devices: Vec<DeviceEntry> = match current_enrolled_at(&state, &identity) {
+        Some(enrolled_at) => state
+            .devices
+            .list(&identity, enrolled_at, now)
+            .into_iter()
+            .map(|d| DeviceEntry {
+                current: here.as_deref() == Some(d.id.as_str()),
+                id: d.id,
+                user_agent: d.user_agent,
+                last_ip: d.last_ip,
+                created_at: d.created_at,
+                expires_at: d.expires_at,
+                last_used_at: d.last_used_at,
+                expires_in_secs: d.expires_at.saturating_sub(now),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Json(serde_json::json!({
+        "enabled": true,
+        "window_days": state.config.remember_device_window.as_secs() / 86400,
+        "devices": devices,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct RevokeDeviceForm {
+    csrf: String,
+    /// The device to forget. Omitted (or empty) with `all=1` means every one.
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    all: Option<String>,
+}
+
+async fn revoke_device(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Form(form): Form<RevokeDeviceForm>,
+) -> Response {
+    let Some(session) = authed_session(&state, &jar) else {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    };
+    if !csrf_matches(&session.csrf, &form.csrf) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let Ok(identity) = session.username.parse::<Identity>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "malformed identity").into_response();
+    };
+
+    // Scoped to the caller exactly as share revocation is: another identity's
+    // device id is indistinguishable from one that does not exist.
+    if form.all.is_some() {
+        let count = state.devices.revoke_all(&identity);
+        tracing::info!("{identity} revoked all {count} trusted device(s)");
+        // Revoking everything includes this browser, so its cookie goes too.
+        return (jar.remove(cleared_device_cookie()), StatusCode::NO_CONTENT).into_response();
+    }
+    // Which device this browser is, resolved *before* the revocation. Asking
+    // afterwards whether our own cookie still resolves would answer a
+    // different question: a concurrent revocation of some other device would
+    // read as "we revoked ourselves" and clear a cookie that is still good.
+    let here = device_token(&jar).and_then(|t| state.devices.id_for_token(&t));
+
+    if !state.devices.revoke(&identity, &form.device_id) {
+        return (StatusCode::NOT_FOUND, "device not found").into_response();
+    }
+    tracing::info!("{identity} revoked trusted device {}", form.device_id);
+    // If the caller just revoked the browser it is sitting at, clear the now
+    // useless cookie rather than leaving it to fail at the next login.
+    if here.as_deref() == Some(form.device_id.as_str()) {
+        return (jar.remove(cleared_device_cookie()), StatusCode::NO_CONTENT).into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]

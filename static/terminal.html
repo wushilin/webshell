@@ -167,6 +167,15 @@
     }
     .link-row .action { flex: 0 0 auto; padding: .3rem .55rem; }
     #linksEmpty { color: #9aa0aa; padding: .6rem 0; }
+    /* Trusted-devices modal: same row shape as the links list, so the two
+       management dialogs read alike. */
+    #devicesModal .modal { width: min(94vw, 560px); }
+    #devicesList { max-height: min(52vh, 380px); overflow-y: auto; margin: .2rem 0 0; }
+    #devicesEmpty { color: #9aa0aa; padding: .6rem 0; }
+    .link-here {
+      display: inline-block; padding: .05rem .4rem; border-radius: 5px;
+      background: #1f3a2b; color: #a7e8c0; font-size: .72rem; margin-right: .4rem;
+    }
     /* Display-settings popover */
     .cog-panel {
       position: absolute; top: calc(var(--bar-height, 44px) + 4px);
@@ -270,6 +279,7 @@
     <button class="action" id="share" title="Create a read-only share link for this slot">share</button>
     <button class="action" id="reset" title="Kill and restart the selected slot">reset</button>
     <button class="action danger" id="del" title="Close the selected slot's shell (no restart)">delete</button>
+    <!--DEVICESBTN-->
     <span class="grow" id="grow"></span>
     <span id="status">connecting…</span>
     <button class="action" id="more" title="Menu">⋯</button>
@@ -341,6 +351,22 @@
       <p id="linksEmpty" hidden>No active share links.</p>
       <div class="modal-actions">
         <button type="button" class="action primary" id="linksClose">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="devicesModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h3>Trusted devices</h3>
+      <p class="modal-sub">Browsers that skip the authenticator code when you sign in.
+        They still ask for your password. Revoking one makes it ask for a code again
+        on its next sign-in.</p>
+      <div id="devicesList"></div>
+      <p id="devicesEmpty" hidden>No trusted devices.</p>
+      <div class="modal-actions">
+        <button type="button" class="action primary" id="devicesClose">Done</button>
+        <button type="button" class="action" id="devicesForget" hidden>Sign out &amp; forget this browser</button>
+        <button type="button" class="action danger" id="devicesRevokeAll">Revoke all</button>
       </div>
     </div>
   </div>
@@ -1041,15 +1067,21 @@
     const resetBtn = document.getElementById("reset");
     const delBtn = document.getElementById("del");
     const cogBtn = document.getElementById("cog");
+    // Absent entirely when the server did not render it.
+    const devicesBarBtn = document.getElementById("devices");
     const logoutForm = document.getElementById("logoutForm");
     const narrow = window.matchMedia("(max-width: 640px)");
 
     function layoutBar() {
+      // `devices` is optional, so build the list rather than naming it inline:
+      // a null in these arrays would throw and take the whole bar with it.
+      const inBar = [roLabel, shareBtn, resetBtn, delBtn];
+      if (devicesBarBtn) inBar.push(devicesBarBtn);
       if (narrow.matches) {
-        [roLabel, shareBtn, resetBtn, delBtn, cogBtn, logoutForm].forEach((el) => morePanel.appendChild(el));
+        [...inBar, cogBtn, logoutForm].forEach((el) => morePanel.appendChild(el));
       } else {
         morePanel.hidden = true;
-        [roLabel, shareBtn, resetBtn, delBtn].forEach((el) => barEl.insertBefore(el, growEl));
+        inBar.forEach((el) => barEl.insertBefore(el, growEl));
         barEl.appendChild(cogBtn);
         barEl.appendChild(logoutForm);
       }
@@ -1586,6 +1618,189 @@
       // The row that had focus is gone with the re-render, which would drop
       // focus to the body and strand a keyboard user inside an open modal.
       if (!linksModal.hidden) document.getElementById("linksClose").focus();
+    }
+
+    // ---- trusted devices ----
+    // Present only when the server rendered the button; a deployment with
+    // "remember this device" switched off has no such element and none of
+    // this runs.
+    const devicesBtn = document.getElementById("devices");
+    if (devicesBtn) {
+      const devicesModal = document.getElementById("devicesModal");
+      const devicesList = document.getElementById("devicesList");
+      const devicesEmpty = document.getElementById("devicesEmpty");
+      const revokeAllBtn = document.getElementById("devicesRevokeAll");
+      const forgetBtn = document.getElementById("devicesForget");
+
+      // "Firefox on Android" out of a User-Agent. Best-effort and cosmetic:
+      // the row still shows the raw string as a tooltip, so a browser this
+      // does not recognise is never unidentifiable.
+      function describe(ua) {
+        if (!ua) return "Unknown browser";
+        const browser = /Edg\//.test(ua) ? "Edge"
+          : /OPR\//.test(ua) ? "Opera"
+          : /Firefox\//.test(ua) ? "Firefox"
+          : /Chrome\//.test(ua) ? "Chrome"
+          : /Safari\//.test(ua) ? "Safari" : null;
+        const os = /Android/.test(ua) ? "Android"
+          : /iPhone|iPad|iPod/.test(ua) ? "iOS"
+          : /Mac OS X/.test(ua) ? "macOS"
+          : /Windows/.test(ua) ? "Windows"
+          : /Linux/.test(ua) ? "Linux" : null;
+        if (browser && os) return browser + " on " + os;
+        return browser || os || "Unknown browser";
+      }
+
+      function whenText(unix) {
+        if (!unix) return "never";
+        const secs = Math.max(0, Math.floor(Date.now() / 1000) - unix);
+        if (secs < 90) return "just now";
+        if (secs < 3600) return Math.round(secs / 60) + "m ago";
+        if (secs < 86400) return Math.round(secs / 3600) + "h ago";
+        return Math.round(secs / 86400) + "d ago";
+      }
+
+      function renderDevices(data) {
+        devicesList.replaceChildren();
+        const entries = (data && data.devices) || [];
+        devicesEmpty.textContent = (data && data.enabled === false)
+          ? "Remembering devices is switched off on this server."
+          : "No trusted devices.";
+        devicesEmpty.hidden = entries.length > 0;
+        revokeAllBtn.hidden = entries.length === 0;
+        // Only offered when this browser is actually one of the trusted ones;
+        // otherwise it is just a confusing second log-out button.
+        forgetBtn.hidden = !entries.some((d) => d.current);
+        for (const d of entries) {
+          const row = document.createElement("div");
+          row.className = "link-row";
+
+          const main = document.createElement("div");
+          main.className = "link-main";
+          const name = document.createElement("div");
+          name.className = "link-note";
+          // textContent, never innerHTML: this came from a User-Agent header.
+          name.textContent = describe(d.user_agent);
+          name.title = d.user_agent || "";
+
+          const meta = document.createElement("div");
+          meta.className = "link-meta";
+          if (d.current) {
+            const here = document.createElement("span");
+            here.className = "link-here";
+            here.textContent = "this browser";
+            meta.append(here);
+          }
+          let line = "last used " + whenText(d.last_used_at)
+                   + " · expires in " + humanizeLeft(d.expires_in_secs);
+          if (d.last_ip) line += " · " + d.last_ip;
+          meta.append(document.createTextNode(line));
+          main.append(name, meta);
+
+          const revokeBtn = document.createElement("button");
+          revokeBtn.type = "button";
+          revokeBtn.className = "action danger";
+          revokeBtn.textContent = "revoke";
+          revokeBtn.addEventListener("click", () => revokeDevice(d));
+
+          row.append(main, revokeBtn);
+          devicesList.append(row);
+        }
+      }
+
+      async function refreshDevices() {
+        try {
+          const res = await fetch("/webshell/private/api/devices", { credentials: "same-origin" });
+          if (!res.ok) throw new Error("http " + res.status);
+          renderDevices(await res.json());
+        } catch (_) {
+          devicesList.replaceChildren();
+          revokeAllBtn.hidden = true;
+          devicesEmpty.hidden = false;
+          devicesEmpty.textContent = "Could not load your trusted devices.";
+        }
+      }
+
+      async function postRevoke(body) {
+        try {
+          const res = await fetch("/webshell/private/api/device/revoke", {
+            method: "POST", credentials: "same-origin",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams(body),
+          });
+          if (!res.ok && res.status !== 404) {
+            await Dialog.alert("Revoke failed", "The server refused. Your session may have expired.");
+          }
+        } catch (_) {
+          await Dialog.alert("Revoke failed", "Could not reach the server. Check your connection and try again.");
+        }
+        await refreshDevices();
+        // The row that had focus is gone with the re-render, which would strand
+        // a keyboard user inside an open modal.
+        if (!devicesModal.hidden) document.getElementById("devicesClose").focus();
+      }
+
+      async function revokeDevice(d) {
+        const ok = await Dialog.confirm({
+          title: d.current ? "Stop trusting this browser?" : "Revoke this device?",
+          body: describe(d.user_agent) + (d.current ? " — the one you are using now" : "")
+                + ". It will ask for an authenticator code the next time it signs in. "
+                + "You stay signed in here.",
+          ok: "Revoke",
+          destructive: true,
+        });
+        if (!ok) return;
+        await postRevoke({ csrf: CSRF, device_id: d.id });
+      }
+
+      revokeAllBtn.addEventListener("click", async () => {
+        const ok = await Dialog.confirm({
+          title: "Revoke every trusted device?",
+          body: "Every browser, including this one, will ask for an authenticator "
+                + "code the next time it signs in. You stay signed in here.",
+          ok: "Revoke all",
+          destructive: true,
+        });
+        if (!ok) return;
+        await postRevoke({ csrf: CSRF, all: "1" });
+      });
+
+      // Logging out and dropping this browser's trust in one step. Rides the
+      // existing logout form so it carries the same CSRF token and lands on
+      // the same redirect; plain "log out" deliberately leaves trust alone.
+      forgetBtn.addEventListener("click", async () => {
+        const ok = await Dialog.confirm({
+          title: "Sign out and forget this browser?",
+          body: "You are signed out, and the next sign-in here asks for an "
+                + "authenticator code again. Your other devices are untouched.",
+          ok: "Sign out & forget",
+          destructive: true,
+        });
+        if (!ok) return;
+        const field = document.createElement("input");
+        field.type = "hidden";
+        field.name = "forget";
+        field.value = "1";
+        logoutForm.appendChild(field);
+        logoutForm.submit();
+      });
+
+      function openDevicesModal() {
+        morePanel.hidden = true;
+        devicesList.replaceChildren();
+        devicesEmpty.hidden = true;
+        revokeAllBtn.hidden = true;
+        devicesModal.hidden = false;
+        refreshDevices();
+      }
+      function closeDevicesModal() { devicesModal.hidden = true; }
+
+      devicesBtn.addEventListener("click", openDevicesModal);
+      document.getElementById("devicesClose").addEventListener("click", closeDevicesModal);
+      devicesModal.addEventListener("click", (e) => { if (e.target === devicesModal) closeDevicesModal(); });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && !devicesModal.hidden) closeDevicesModal();
+      });
     }
 
     function openLinksModal() {

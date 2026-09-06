@@ -105,6 +105,23 @@ pub struct Mfa {
     /// Where per-identity enrollment state is kept. Relative paths resolve
     /// against the config file's directory.
     pub enrollment_path: String,
+    /// Offer "remember this device", letting a browser that has already passed
+    /// a code skip the code (never the password or Google sign-in) for
+    /// `remember_device_days`. Off means the checkbox is never rendered *and*
+    /// an existing trust cookie is never honoured — turning this off revokes
+    /// trust immediately rather than merely stopping new grants.
+    pub remember_device: bool,
+    /// How long a remembered device stays trusted. Absolute from the moment
+    /// the box was ticked, never extended by use. Clamped to 1..=90.
+    pub remember_device_days: u64,
+    /// Where trusted-device records are kept. Relative paths resolve against
+    /// the config file's directory. Deliberately not `enrollment_path`: that
+    /// file holds TOTP secrets and is written rarely, this one churns on every
+    /// login, and a bad write here must not take the secrets with it.
+    pub device_path: String,
+    /// Most simultaneously-trusted browsers per identity. Reaching it evicts
+    /// the least recently used rather than refusing.
+    pub max_devices_per_identity: usize,
 }
 
 impl Default for Mfa {
@@ -112,6 +129,10 @@ impl Default for Mfa {
         Mfa {
             required: true,
             enrollment_path: "enrollment.toml".into(),
+            remember_device: false,
+            remember_device_days: 30,
+            device_path: "devices.toml".into(),
+            max_devices_per_identity: 10,
         }
     }
 }
@@ -290,6 +311,12 @@ pub struct Config {
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
     pub mfa_enrollment_path: std::path::PathBuf,
+    /// Whether "remember this device" is offered and honoured at all.
+    pub remember_device: bool,
+    /// Trust window, absolute from the moment the box was ticked.
+    pub remember_device_window: Duration,
+    pub device_path: std::path::PathBuf,
+    pub max_devices_per_identity: usize,
     /// The OS account every shell runs as — the user running this process.
     /// Logins are Google identities; they all share this account.
     pub owner: String,
@@ -435,6 +462,18 @@ impl Config {
             google_client_id: s.google.client_id,
             google_client_secret: s.google.client_secret,
             mfa_enrollment_path: std::path::PathBuf::from(s.mfa.enrollment_path),
+            // Trust is meaningless without a second factor to skip, so it
+            // follows `required` rather than standing on its own — otherwise
+            // turning MFA off would leave a live bypass for a check that is
+            // no longer happening.
+            remember_device: s.mfa.required && s.mfa.remember_device,
+            // Bounded like every other sizing knob: an unclamped value here is
+            // an indefinite second-factor bypass one typo away.
+            remember_device_window: Duration::from_secs(
+                s.mfa.remember_device_days.clamp(1, 90) * 24 * 3600,
+            ),
+            device_path: std::path::PathBuf::from(s.mfa.device_path),
+            max_devices_per_identity: s.mfa.max_devices_per_identity.clamp(1, 64),
             owner_home: owner.home,
             owner: owner.name,
             // Load-bearing for the wire format, not just a sanity bound: the
@@ -458,12 +497,6 @@ impl Config {
         }
     }
 
-    /// Verify a login attempt via PAM. Only the process owner may log in (the
-    /// username must match); blocks, so call from a blocking task. Returns the
-    /// owner's username on success.
-    /// Whether this identity is on the allowlist. Comparison is on the
-    /// normalized form, so capitalisation in the config cannot cause a
-    /// mysterious denial.
     /// The stored hash for a local identity, if one is configured.
     pub fn local_password(&self, id: &crate::identity::Identity) -> Option<&str> {
         let wanted = id.to_string();
@@ -492,6 +525,9 @@ impl Config {
             && self.redirect_uri().is_some()
     }
 
+    /// Whether this identity is on the allowlist. Comparison is on the
+    /// normalized form, so capitalisation in the config cannot cause a
+    /// mysterious denial.
     pub fn permits(&self, id: &crate::identity::Identity) -> bool {
         self.users.contains(id)
     }

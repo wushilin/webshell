@@ -42,6 +42,29 @@ mode is meant for quick, local, trusted sharing — the password lives in the
 process environment, and there is no second factor. For anything exposed to the
 internet, use the full config below: put it behind TLS and enable MFA.
 
+## Install
+
+Every release ships **statically linked musl binaries** for both architectures.
+They have no shared-library dependencies at all — no glibc version to match, no
+PAM, nothing to install alongside them. Drop one on any Linux host and run it:
+
+```sh
+# pick your architecture
+curl -fsSLO https://github.com/wushilin/webshell/releases/latest/download/webshell-x86_64-unknown-linux-musl
+curl -fsSLO https://github.com/wushilin/webshell/releases/latest/download/webshell-aarch64-unknown-linux-musl
+
+chmod +x webshell-*-unknown-linux-musl
+sudo install -m 0755 webshell-x86_64-unknown-linux-musl /usr/local/bin/webshell
+webshell --version
+```
+
+Verify the download against the checksums published with the release:
+
+```sh
+curl -fsSLO https://github.com/wushilin/webshell/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
 ## Build
 
 ```sh
@@ -55,8 +78,14 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 This works because nothing here depends on the host's auth stack — no PAM, no
-`dlopen`, no setuid helper. `./build-x86_64.sh` cross-compiles a glibc build via
-`cargo-zigbuild` if you prefer one.
+`dlopen`, no setuid helper. `./build-release.sh` builds the static musl binaries
+for both x86_64 and aarch64 (via `cargo-zigbuild`) exactly as a release does;
+`./build-x86_64.sh` cross-compiles a glibc build if you prefer one.
+
+The one thing a static build gives up is NSS: `getpwuid` reads `/etc/passwd`
+directly, so the process owner's login shell and home directory resolve there
+and not from LDAP or SSSD. For the single account webshell runs as, that is
+almost always what you want anyway — set `[terminals] login_cmd` if it is not.
 
 ## Stateful: the shell outlives the connection
 
@@ -266,6 +295,10 @@ Every table and key is optional; a missing one falls back to the default.
 | | `secret_base64` | *(generated)* | base64 cookie key (≥64 bytes). If unset in config-backed mode, webshell generates one and writes it into the config on startup. |
 | `[mfa]` | `required` | `true` | Require a TOTP code. |
 | | `enrollment_path` | `enrollment.toml` | Per-identity enrollment state, relative to the config file. |
+| | `remember_device` | `false` | Offer "remember this device", letting a browser that has already passed a code skip the **code** — never the password — for a while. See below. |
+| | `remember_device_days` | `30` | How long a remembered device stays trusted. Absolute from the moment the box was ticked; clamped to 1–90. |
+| | `device_path` | `devices.toml` | Trusted-device state, relative to the config file. |
+| | `max_devices_per_identity` | `10` | Simultaneously-trusted browsers per identity; reaching it evicts the least recently used. |
 | `[google]` | `client_id` | *(none)* | OAuth client ID. |
 | | `client_secret` | *(none)* | OAuth client secret. |
 | `[terminals]` | `max_sessions` | `10` | Persistent slots per identity. |
@@ -431,6 +464,27 @@ webshell is ever reached. If your account is not under **Test users** while the
 app is in Testing, Google refuses with an "app has not completed verification"
 notice.
 
+#### If Google sign-in is your only method, plan the lockout
+
+With `login_methods = ["google"]` there is no other door. A revoked OAuth
+client, an expired secret, a DNS or network outage, or simply deleting yourself
+from **Test users** locks everyone out of the web UI at once. Nothing is lost —
+the config is a file on the host, and you fix it with shell access:
+
+```sh
+# on the host, as the account webshell runs as
+$EDITOR config.toml        # login_methods = ["local", "google"]
+                           # and make sure [local_passwords] has an entry
+webshell passwd local:alice   # prints an argon2id hash to paste in
+webshell validate -c config.toml
+# restart the service
+```
+
+Keeping `"local"` in `login_methods` permanently — with MFA on and a strong
+argon2id password — costs nothing and removes the failure mode entirely. If you
+do run Google-only, make sure you can still get a shell on the host by some
+other route.
+
 ### TOTP MFA
 
 With `mfa.required = true`, an identity with no enrolled secret is sent through
@@ -449,6 +503,44 @@ code from before a restart has almost certainly expired.
 
 `[mfa].enrollment_path` is written by webshell, not you. It holds each identity's
 secret and the Google `sub` pinned on first login, and is created mode `0600`.
+
+### Remember this device
+
+Off by default. With `mfa.remember_device = true`, the verify screen offers
+**Remember this device for 30 days**. Tick it and that browser stops being asked
+for a code until the window runs out.
+
+**It skips the second factor only.** The password, or the Google sign-in, is
+verified on every single login regardless. The cookie is not a credential that
+logs anyone in — it is evidence that this browser has already proved possession
+of the authenticator. It also never skips enrollment: an identity with no secret
+always goes through the QR screen.
+
+Some details worth knowing before turning it on:
+
+- **The window is absolute**, counted from when you ticked the box, and using the
+  device never extends it. A sliding window would let a stolen cookie refresh its
+  own lifetime indefinitely.
+- **Re-enrolling a TOTP secret revokes every device** for that identity. This is
+  also the recovery path: to un-trust everything for someone who lost their
+  authenticator, delete their `mfa_secret` line from `enrollment.toml`. Their
+  devices stop working the moment the secret changes, with no second cleanup step.
+- **Turning `remember_device` back off revokes trust immediately** — an existing
+  cookie stops being honoured, it does not merely stop being issued. The records
+  are kept, so switching it on again restores them.
+- **Trust survives logging out**, which is the point. The devices dialog offers
+  *Sign out & forget this browser* when you want both.
+- One cookie holds trust for one identity. A browser used by two allowlisted
+  identities is only trusted for whichever ticked the box most recently.
+
+Manage them from the **devices** button in the terminal toolbar (under `⋯` on a
+narrow screen): every trusted browser you hold, which one you are using now, when
+each was last used, and a revoke button for one or all. It is self-service — you
+see only your own devices, exactly as with share links.
+
+`[mfa].device_path` is written by webshell, not you, and is created mode `0600`.
+It stores a hash of each cookie rather than the cookie itself, so the file is not
+a set of usable bypasses.
 
 ## Run
 

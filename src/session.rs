@@ -132,7 +132,7 @@ impl SessionStore {
                 );
             }
         }
-        store.persist();
+        store.persist_locked(&lock(&store.inner));
         Ok(store)
     }
 
@@ -179,8 +179,7 @@ impl SessionStore {
                 if let Some(session) = guard.remove(&key) {
                     session.revoke();
                 }
-                drop(guard);
-                self.persist();
+                self.persist_locked(&guard);
                 None
             }
             None => None,
@@ -188,10 +187,10 @@ impl SessionStore {
     }
 
     pub fn remove(&self, id: &str) {
-        let removed = lock(&self.inner).remove(&session_key(id));
-        if let Some(session) = removed {
+        let mut guard = lock(&self.inner);
+        if let Some(session) = guard.remove(&session_key(id)) {
             session.revoke();
-            self.persist();
+            self.persist_locked(&guard);
         }
     }
 
@@ -218,8 +217,7 @@ impl SessionStore {
                 revoked,
             },
         );
-        drop(guard);
-        self.persist();
+        self.persist_locked(&guard);
         new_id
     }
 
@@ -243,44 +241,34 @@ impl SessionStore {
                 revoked,
             },
         );
-        drop(guard);
-        self.persist();
+        self.persist_locked(&guard);
         new_id
     }
 
     /// Drop every expired session. Intended to be called periodically.
     pub fn sweep(&self) {
         let ttl = self.ttl;
-        let changed = {
-            let mut changed = false;
-            lock(&self.inner).retain(|_, s| {
-                let keep = !s.expired(ttl);
-                if !keep {
-                    s.revoke();
-                    changed = true;
-                }
-                keep
-            });
-            changed
-        };
+        let mut guard = lock(&self.inner);
+        let mut changed = false;
+        guard.retain(|_, s| {
+            let keep = !s.expired(ttl);
+            if !keep {
+                s.revoke();
+                changed = true;
+            }
+            keep
+        });
         if changed {
-            self.persist();
+            self.persist_locked(&guard);
         }
     }
 
     /// Attach an in-flight OIDC login to a pre-auth session.
     pub fn set_oauth(&self, id: &str, flow: Option<crate::oidc::Flow>) {
-        let changed = {
-            let mut guard = lock(&self.inner);
-            if let Some(session) = guard.get_mut(&session_key(id)) {
-                session.oauth = flow;
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
-            self.persist();
+        let mut guard = lock(&self.inner);
+        if let Some(session) = guard.get_mut(&session_key(id)) {
+            session.oauth = flow;
+            self.persist_locked(&guard);
         }
     }
 
@@ -288,12 +276,20 @@ impl SessionStore {
         self.ttl
     }
 
-    fn persist(&self) {
+    /// Persist while the caller still holds the map lock.
+    ///
+    /// Every mutation must go through this rather than mutating, releasing the
+    /// lock and then persisting. Two writers that snapshot under the lock but
+    /// write after releasing it can interleave, and the slower one lands a
+    /// snapshot taken before the faster one's change — reverting it on disk
+    /// while memory still looks correct. For a session store that means a
+    /// logged-out session reappearing after a restart.
+    fn persist_locked(&self, guard: &HashMap<String, Session>) {
         let Some(path) = &self.path else {
             return;
         };
         let sessions = {
-            lock(&self.inner)
+            guard
                 .iter()
                 .filter(|(_, s)| meaningful(s) && !s.expired(self.ttl))
                 .map(|(k, s)| {
@@ -383,6 +379,11 @@ fn write_atomic(path: &Path, disk: &DiskStore) -> anyhow::Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        // The rename is metadata: without this a crash can lose the swap even
+        // though the bytes it points at were safely on disk.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     })();
     if result.is_err() {
