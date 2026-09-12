@@ -6,7 +6,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use crate::terminals::{AttachMode, Attachment, PtyCmd, Terminals};
+use crate::terminals::{AttachMode, Attachment, PtyCmd, Redraw, ScreenHandle, Terminals};
 
 /// Control messages the browser may send as text frames on the mux socket.
 #[derive(Deserialize)]
@@ -88,6 +88,49 @@ fn hello_json(term: Option<usize>, a: &Attachment) -> String {
     }
 }
 
+/// Server-initiated redraw. `screen` is the server's own rendering of the
+/// visible grid (see `Scrollback::screen_snapshot`), base64 because it is
+/// raw terminal bytes inside a JSON control frame; `cols`/`rows` let the
+/// client refuse a snapshot taken at a size it no longer has. Sent as a
+/// control frame rather than tagged output on purpose: it is not part of
+/// the stream, so it never moves the client's offset, and the client can
+/// decide whether to apply it. `term` is present on the mux socket, absent
+/// for a viewer.
+fn redraw_json(term: Option<usize>, r: &Redraw) -> String {
+    use base64::Engine as _;
+    let screen = base64::engine::general_purpose::STANDARD.encode(&r.screen);
+    match term {
+        Some(t) => format!(
+            r#"{{"type":"redraw","term":{t},"cols":{},"rows":{},"screen":"{screen}"}}"#,
+            r.cols, r.rows
+        ),
+        None => format!(
+            r#"{{"type":"redraw","cols":{},"rows":{},"screen":"{screen}"}}"#,
+            r.cols, r.rows
+        ),
+    }
+}
+
+/// A periodic tick that never fires when `period` is `None`. Unlike a bare
+/// `interval`, the first tick is one full period out — a redraw straight
+/// after the hello would land in the middle of the replay parse.
+fn redraw_ticker(period: Option<std::time::Duration>) -> Option<tokio::time::Interval> {
+    let period = period?;
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Some(tick)
+}
+
+/// Await the next redraw tick, or park forever when there is no ticker.
+async fn next_redraw(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn closed_json(term: usize, reason: &str) -> String {
     format!(
         r#"{{"type":"closed","term":{},"reason":"{}"}}"#,
@@ -111,21 +154,52 @@ fn tagged(term: usize, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Spawn the per-channel forward task: terminal output -> tagged frames,
-/// shutdown -> closed frame. All frames go through `out_tx`, the connection's
-/// single FIFO writer queue, so hello/replay (queued by the caller BEFORE
-/// spawning this task) can never be overtaken by live output.
+/// shutdown -> closed frame, and the periodic redraw. All frames go through
+/// `out_tx`, the connection's single FIFO writer queue, so hello/replay
+/// (queued by the caller BEFORE spawning this task) can never be overtaken
+/// by live output.
+///
+/// The redraw lives here rather than in the connection loop because only
+/// this task knows where `output_rx` stands in the stream: the snapshot has
+/// to be queued after every byte it already reflects, which
+/// `ScreenHandle::redraw` guarantees by draining the receiver under the
+/// same lock the reader thread broadcasts under.
 fn spawn_forward(
     term: usize,
     attachment_parts: (
         tokio::sync::broadcast::Receiver<Vec<u8>>,
         tokio::sync::watch::Receiver<bool>,
     ),
+    screen: ScreenHandle,
+    redraw: Option<std::time::Duration>,
     out_tx: mpsc::Sender<Message>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (mut output_rx, mut shutdown_rx) = attachment_parts;
+        let mut redraw_tick = redraw_ticker(redraw);
         loop {
             tokio::select! {
+                _ = next_redraw(&mut redraw_tick) => {
+                    let r = screen.redraw(&mut output_rx);
+                    let mut gone = false;
+                    for bytes in &r.pending {
+                        if out_tx.send(Message::Binary(tagged(term, bytes))).await.is_err() {
+                            gone = true;
+                            break;
+                        }
+                    }
+                    if gone {
+                        break;
+                    }
+                    if r.lagged {
+                        // Same hole in the stream as the Lagged arm below.
+                        let _ = out_tx.send(Message::Text(closed_json(term, "error"))).await;
+                        break;
+                    }
+                    if out_tx.send(Message::Text(redraw_json(Some(term), &r))).await.is_err() {
+                        break;
+                    }
+                },
                 // Terminal died or was reset: tell the client; a re-open
                 // respawns a fresh shell.
                 _ = shutdown_rx.changed() => {
@@ -158,12 +232,16 @@ fn spawn_forward(
 /// Multiplexed bridge: one WebSocket carrying every opened slot for `user`.
 /// Binary frames route by their slot-index prefix; JSON text frames carry
 /// control. Attachments drop when the connection dies; shells keep running.
+///
+/// `redraw` is the period of the server-initiated redraw (see
+/// `redraw_json`); every open channel gets one per period.
 pub async fn mux_bridge(
     socket: WebSocket,
     terminals: Arc<Terminals>,
     user: String,
     mut revoked: tokio::sync::watch::Receiver<bool>,
     deadline: tokio::time::Instant,
+    redraw: Option<std::time::Duration>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(512);
@@ -269,6 +347,7 @@ pub async fn mux_bridge(
                                 let Attachment {
                                     input_tx,
                                     output_rx,
+                                    screen,
                                     shutdown_rx,
                                     replay,
                                     ..
@@ -293,8 +372,13 @@ pub async fn mux_bridge(
                                 {
                                     break;
                                 }
-                                let forward =
-                                    spawn_forward(term, (output_rx, shutdown_rx), out_tx.clone());
+                                let forward = spawn_forward(
+                                    term,
+                                    (output_rx, shutdown_rx),
+                                    screen,
+                                    redraw,
+                                    out_tx.clone(),
+                                );
                                 channels.insert(
                                     term,
                                     Channel {
@@ -479,11 +563,13 @@ pub async fn bridge(
     attachment: Attachment,
     read_only: bool,
     lease: Option<crate::share::Lease>,
+    redraw: Option<std::time::Duration>,
 ) {
     let hello = hello_json(None, &attachment);
     let Attachment {
         input_tx,
         mut output_rx,
+        screen,
         mut shutdown_rx,
         replay,
         ..
@@ -532,6 +618,7 @@ pub async fn bridge(
     let leased = out.lease.is_some();
     let mut audit = tokio::time::interval(std::time::Duration::from_secs(SHARE_AUDIT_SECS));
     audit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut redraw_tick = redraw_ticker(redraw);
 
     // Every arm below ends the task by `return`, and none of them kills the
     // shell: slots are persistent and resumable.
@@ -554,6 +641,24 @@ pub async fn bridge(
             _ = audit.tick(), if leased => {
                 if !out.valid() {
                     out.close().await;
+                    return;
+                }
+            },
+            // Server-initiated redraw: through the guard like any other
+            // frame, so an expired lease gets nothing. Output the snapshot
+            // already reflects goes first (see `ScreenHandle::redraw`).
+            _ = next_redraw(&mut redraw_tick) => {
+                let r = screen.redraw(&mut output_rx);
+                for bytes in &r.pending {
+                    if out.send(Message::Binary(bytes.clone())).await.is_err() {
+                        return;
+                    }
+                }
+                if r.lagged {
+                    out.close().await;
+                    return;
+                }
+                if out.send(Message::Text(redraw_json(None, &r))).await.is_err() {
                     return;
                 }
             },
@@ -615,6 +720,60 @@ mod tests {
     #[test]
     fn empty_init_is_omitted_from_the_hello() {
         assert_eq!(init_json(b""), "");
+    }
+
+    #[test]
+    fn redraw_frames_carry_the_screen_and_the_slot_only_on_the_mux() {
+        use base64::Engine as _;
+        let r = Redraw {
+            pending: Vec::new(),
+            lagged: false,
+            cols: 80,
+            rows: 24,
+            screen: b"\x1b[H\x1b[Jhello".to_vec(),
+        };
+        let mux: serde_json::Value = serde_json::from_str(&redraw_json(Some(3), &r)).unwrap();
+        assert_eq!(mux["type"], "redraw");
+        assert_eq!(mux["term"], 3);
+        assert_eq!(mux["cols"], 80);
+        assert_eq!(mux["rows"], 24);
+        let screen = base64::engine::general_purpose::STANDARD
+            .decode(mux["screen"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(screen, r.screen);
+        let viewer: serde_json::Value = serde_json::from_str(&redraw_json(None, &r)).unwrap();
+        assert_eq!(viewer["type"], "redraw");
+        assert!(viewer.get("term").is_none());
+    }
+
+    #[tokio::test]
+    async fn redraw_ticker_is_silent_when_disabled_and_skips_the_immediate_tick() {
+        use std::time::Duration;
+        let mut off = redraw_ticker(None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), next_redraw(&mut off))
+                .await
+                .is_err(),
+            "a disabled ticker never fires"
+        );
+
+        // Real time, generous bounds: the point is that the first tick is a
+        // full period out rather than immediate, and that ticks keep coming.
+        let period = Duration::from_millis(100);
+        let mut on = redraw_ticker(Some(period));
+        let started = tokio::time::Instant::now();
+        next_redraw(&mut on).await;
+        let first = started.elapsed();
+        assert!(
+            first >= period && first < 4 * period,
+            "first tick at {first:?}"
+        );
+        next_redraw(&mut on).await;
+        let second = started.elapsed();
+        assert!(
+            second >= 2 * period && second < 6 * period,
+            "second tick at {second:?}"
+        );
     }
 
     #[test]

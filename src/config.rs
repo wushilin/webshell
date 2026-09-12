@@ -159,6 +159,14 @@ pub struct TerminalSettings {
     /// Login command override, as an argv array, e.g. ["/usr/bin/fish", "-l"].
     /// Empty = the owner's passwd login shell, run with "-l".
     pub login_cmd: Vec<String>,
+    /// Seconds between server-initiated redraw ticks. On every tick each
+    /// attached browser repaints the rows currently on screen from its own
+    /// buffer — the wire carries a one-line control frame, never terminal
+    /// bytes, so the shell is not disturbed and the scrollback is untouched.
+    /// This is the safety net for a renderer that dropped a row (a
+    /// fullscreen app's status line going blank until the next resize).
+    /// The timer lives here, not in the browser; 0 disables it.
+    pub redraw_interval_secs: u64,
     /// Extra environment for every spawned shell, applied after the built-ins
     /// (TERM, HOME, USER, LOGNAME) so a key here overrides them. Declared
     /// last: this serializes as the [terminals.envs] sub-table, and TOML
@@ -172,6 +180,7 @@ impl Default for TerminalSettings {
             max_sessions: 10,
             scrollback_bytes: 128 * 1024,
             login_cmd: Vec::new(),
+            redraw_interval_secs: 30,
             envs: std::collections::BTreeMap::new(),
         }
     }
@@ -333,6 +342,9 @@ pub struct Config {
     /// Extra environment seeded into every spawned shell ([terminals.envs]).
     pub envs: std::collections::BTreeMap<String, String>,
     pub scrollback_cap: usize,
+    /// Period of the server-initiated redraw tick sent to every attached
+    /// client ([terminals] redraw_interval_secs); `None` when disabled.
+    pub redraw_interval: Option<Duration>,
     pub session_ttl: Duration,
     pub session_path: Option<std::path::PathBuf>,
     pub cookie_secure: bool,
@@ -452,6 +464,13 @@ impl Config {
         let aggregate_budget = 256 * 1024 * 1024;
         let scrollback_cap = requested_scrollback.min(aggregate_budget / slots_per_user);
         let ws_message_limit = 64 * 1024;
+        // A tick is one tiny text frame per attached slot, but it also makes
+        // every browser rebuild its visible rows: sub-second would be a
+        // constant repaint storm for no benefit, so the floor is one second.
+        let redraw_interval = match s.terminals.redraw_interval_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs.clamp(1, 3600))),
+        };
 
         Config {
             bind_addr: s.network.bind,
@@ -486,6 +505,7 @@ impl Config {
             login_cmd,
             envs: s.terminals.envs,
             scrollback_cap,
+            redraw_interval,
             session_ttl: Duration::from_secs(s.auth.session_ttl_secs.max(60)),
             session_path: s.auth.session_path.map(Into::into),
             cookie_secure: s.network.cookie_secure,
@@ -714,7 +734,25 @@ mod tests {
     fn sample_config_documents_login_cmd_and_envs() {
         let sample = Settings::sample_toml();
         assert!(sample.contains("login_cmd = []"));
+        assert!(sample.contains("redraw_interval_secs = 30"));
         assert!(sample.contains("[terminals.envs]"));
+    }
+
+    #[test]
+    fn redraw_interval_is_optional_and_bounded() {
+        let with = |secs: u64| {
+            let s = Settings {
+                terminals: TerminalSettings {
+                    redraw_interval_secs: secs,
+                    ..TerminalSettings::default()
+                },
+                ..Settings::default()
+            };
+            Config::from_settings(s).redraw_interval
+        };
+        assert_eq!(with(5), Some(Duration::from_secs(5)));
+        assert_eq!(with(0), None, "0 switches the tick off");
+        assert_eq!(with(u64::MAX), Some(Duration::from_secs(3600)));
     }
 
     #[test]

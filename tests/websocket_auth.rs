@@ -397,6 +397,112 @@ async fn replay_hello_reinstates_alt_screen_scrolled_out_of_the_ring() {
     assert!(init.contains("\u{1b}[?1049h"), "init={init:?}");
 }
 
+/// Wait for a server-sent `redraw` control frame, returning how long it took
+/// and the frame. Everything else (output, other control frames) is drained
+/// meanwhile.
+async fn wait_for_redraw<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    term: Option<u64>,
+    max: Duration,
+) -> (Duration, Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let started = Instant::now();
+    loop {
+        let remaining = max.saturating_sub(started.elapsed());
+        let message = timeout(remaining, ws.next())
+            .await
+            .expect("no redraw tick within the deadline")
+            .expect("socket closed")
+            .expect("websocket read");
+        if let Message::Text(text) = message {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["type"] == "redraw" {
+                match term {
+                    Some(t) => assert_eq!(value["term"], t, "tick names its slot"),
+                    None => assert!(value.get("term").is_none(), "viewer ticks carry no slot"),
+                }
+                return (started.elapsed(), value);
+            }
+        }
+    }
+}
+
+/// The screen a `redraw` frame carries, decoded and rendered to plain text
+/// by feeding it to a fresh emulator of the advertised size.
+fn redraw_screen_text(frame: &Value) -> String {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(frame["screen"].as_str().expect("redraw carries a screen"))
+        .unwrap();
+    let rows = frame["rows"].as_u64().unwrap() as u16;
+    let cols = frame["cols"].as_u64().unwrap() as u16;
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(&bytes);
+    parser.screen().contents()
+}
+
+/// The server-initiated redraw: after a slot is opened, the mux carries a
+/// `redraw` control frame for it once per `redraw_interval_secs` (the default
+/// 30s in simple mode), holding the server's own rendering of the visible
+/// screen. It rides outside the byte stream, so it cannot disturb the shell
+/// or the stream offset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_sends_a_periodic_redraw_with_the_servers_screen() {
+    let server = TestServer::start().await;
+    let (cookie, csrf) = server.login().await;
+    let mut ws = open_slot_zero(&server, &cookie, &csrf).await;
+
+    // Put something recognisable on the screen. Not waited for: the first
+    // redraw is a full period out, long after any shell has run this.
+    ws.send(Message::Binary(b"\x00echo REDRAW-MARKER-7\n".to_vec()))
+        .await
+        .unwrap();
+
+    // The first tick is one full period out, never immediately after the
+    // hello. (One period is as long as this test can afford to wait; the
+    // ticker's cadence beyond that is unit-tested in pty.rs.)
+    let (first, frame) = wait_for_redraw(&mut ws, Some(0), Duration::from_secs(45)).await;
+    assert!(
+        first >= Duration::from_secs(25),
+        "first tick after {first:?}"
+    );
+    assert_eq!(frame["cols"], 80);
+    assert_eq!(frame["rows"], 24);
+    let screen = redraw_screen_text(&frame);
+    assert!(
+        screen.contains("REDRAW-MARKER-7"),
+        "the server's screen shows what the shell printed: {screen:?}"
+    );
+
+    // Not a resize in disguise: the PTY geometry is untouched by the ticks.
+    let size = run_command(
+        &mut ws,
+        0,
+        "stty size; printf '\\n\\122\\104\\127\\061\\n'\n",
+        "RDW1",
+    )
+    .await;
+    assert!(size.windows(5).any(|w| w == b"24 80"));
+}
+
+/// A read-only share viewer gets the same tick on its single-channel socket,
+/// without a slot index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_viewer_receives_the_redraw_tick() {
+    let server = TestServer::start().await;
+    let (cookie, csrf) = server.login().await;
+    let _owner = open_slot_zero(&server, &cookie, &csrf).await;
+
+    let share = create_share(&server, &cookie, &csrf, 3600).await;
+    let token = share_token(&share);
+    let mut viewer = connect_viewer(&server, &token).await;
+    let (took, frame) = wait_for_redraw(&mut viewer, None, Duration::from_secs(45)).await;
+    assert!(took >= Duration::from_secs(25), "tick after {took:?}");
+    assert!(frame["screen"].is_string() && frame["cols"] == 80 && frame["rows"] == 24);
+}
+
 /// Open slot 0 on the authenticated mux so a viewer has something to attach
 /// to, and keep the mux socket alive for the caller.
 async fn open_slot_zero(

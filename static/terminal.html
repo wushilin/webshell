@@ -457,6 +457,7 @@
     const panesEl = document.getElementById("panes");
     const roEl = document.getElementById("ro");
     const enc = new TextEncoder();
+    const b64bytes = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
     function hardenTermTextarea(pane) {
       const ta = pane.querySelector(".xterm-helper-textarea");
@@ -586,6 +587,7 @@
             if (!s) return;
             if (m.type === "hello") s.onHello(m);
             else if (m.type === "closed") s.onClosed(m);
+            else if (m.type === "redraw") s.redraw(m);
             return;
           }
           const data = new Uint8Array(ev.data);
@@ -911,6 +913,26 @@
       fitAndResize() {
         try { this.fit.fit(); } catch (_) { /* hidden/0-size */ }
         this.sendResize();
+      }
+
+      // Server redraw: the server's own rendering of the visible screen, as
+      // escape sequences that clear the display in place and rewrite every
+      // row with its attributes and cursor. Written into xterm like any
+      // output, so it lands after everything sent before it and repaints
+      // from what the server knows the screen holds — not from this page's
+      // memory of it, which is what may already be wrong. Nothing in it adds
+      // a line, so the scrollback and the scroll position are untouched.
+      // Refused when the sizes disagree (a resize is in flight: the snapshot
+      // was taken at the old grid), while a replay is mid-flight, or before
+      // the hello (a replaced attachment's frame). The timer is the
+      // server's; the client only acts on it. The follow-up refresh() also
+      // repairs a renderer that dropped a row.
+      redraw(m) {
+        if (this.awaitingHello || this.snapshotBuffer !== null) return;
+        if (m.cols !== this.term.cols || m.rows !== this.term.rows) return;
+        const paint = () => { if (this.isActive()) this.term.refresh(0, this.term.rows - 1); };
+        if (typeof m.screen === "string") this.term.write(b64bytes(m.screen), paint);
+        else paint();
       }
 
       // Ask the server to (re)attach this slot. Deliberately omit an

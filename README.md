@@ -49,7 +49,7 @@ They have no shared-library dependencies at all — no glibc version to match, n
 PAM, nothing to install alongside them. Drop one on any Linux host and run it:
 
 ```sh
-VER=0.3.0                       # or whatever the latest release is
+VER=0.4.0                       # or whatever the latest release is
 ARCH=x86_64                     # or aarch64
 BASE=https://github.com/wushilin/webshell/releases/download/v$VER
 
@@ -111,6 +111,18 @@ browser terminal first, which avoids carrying stale parser or fullscreen-screen
 state across a dropped connection. There is no screen-scraping or redraw
 guesswork.
 
+Separately, the server keeps its own rendering of each slot's visible screen,
+fed the same bytes the browsers get, and on a fixed period
+(`redraw_interval_secs`, 30 by default; 0 turns it off) sends every attached
+browser a `redraw` control frame carrying that screen — every visible row with
+its attributes and the cursor, as escape sequences the browser writes straight
+into its terminal. The browser therefore repaints from what the server knows
+the screen holds, not from its own memory of it. The shell is not signalled,
+the paint clears and rewrites the display in place without adding a line, and
+the scroll position and scrollback are untouched. It is a lightweight,
+authoritative repair for a screen that has drifted, such as a fullscreen app's
+status line going blank until the next resize.
+
 **The honest limits:**
 
 - Slots live in the server process. They survive dropped connections and
@@ -143,7 +155,8 @@ for an automated agent driving a shell:
   are live, so a supervisor can see what is running without attaching.
 
 The wire protocol is deliberately small — JSON control frames (`open`, `resize`,
-`mode`, `close`) and binary frames tagged with a one-byte slot index — so it is
+`mode`, `close` from the client; `hello`, `closed` and the periodic `redraw` tick
+from the server) and binary frames tagged with a one-byte slot index — so it is
 straightforward to drive programmatically. Note that authentication still
 applies — signed cookie + CSRF, behind Google or a local password: an agent has
 to log in like anyone else, and there is no API-token path today.
@@ -304,6 +317,7 @@ Every table and key is optional; a missing one falls back to the default.
 | `[terminals]` | `max_sessions` | `10` | Persistent slots per identity. |
 | | `scrollback_bytes` | `131072` | Replay buffer per slot. |
 | | `login_cmd` | *(passwd shell + `-l`)* | Shell override, as an argv array — see below. |
+| | `redraw_interval_secs` | `30` | Period of the server-sent `redraw` frame carrying the server's rendering of the visible screen, which browsers write in place; `0` disables it. |
 | | `envs` | *(empty)* | Extra environment for every shell — see below. |
 | `[sharing]` | `enabled` | `true` | Master switch for share links. |
 | | `max_duration_secs` | `2592000` | Cap on a link's lifetime. |

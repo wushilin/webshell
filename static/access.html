@@ -213,6 +213,23 @@
     window.addEventListener("focus", repaintVisible);
     window.addEventListener("pageshow", repaintVisible);
 
+    // Server redraw: the server's own rendering of the visible screen, as
+    // escape sequences that clear the display in place and rewrite every
+    // row. Written into xterm like any output, so it repaints from what the
+    // server knows the screen holds rather than this page's memory of it.
+    // Nothing in it adds a line, so scrollback and scroll position are
+    // untouched. Refused when the sizes disagree (the owner resized; our
+    // rescale follows on the next meta poll) or while a replay is mid-
+    // flight. The follow-up refresh() also repairs a dropped row.
+    function redrawVisible(m) {
+      if (snapshotBuffer !== null) return;
+      if (m.cols !== term.cols || m.rows !== term.rows) return;
+      const paint = () => term.refresh(0, term.rows - 1);
+      if (typeof m.screen === "string") {
+        term.write(Uint8Array.from(atob(m.screen), (c) => c.charCodeAt(0)), paint);
+      } else paint();
+    }
+
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       return `${proto}//${location.host}/webshell/public/access/ws?token=${encodeURIComponent(token)}`;
@@ -230,6 +247,7 @@
         if (typeof ev.data === "string") {
           let m;
           try { m = JSON.parse(ev.data); } catch (_) { return; }
+          if (m.type === "redraw") { redrawVisible(m); return; }
           if (m.type === "hello") {
             const gen = ++renderGeneration;
             snapshotBuffer = [];

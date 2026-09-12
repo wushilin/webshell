@@ -181,15 +181,32 @@ struct Scrollback {
     /// Mode state at the ring's front — what the oldest surviving byte
     /// assumes the terminal looks like. See [`ModeTracker`].
     front_state: ModeTracker,
+    /// The server's own rendering of the visible screen, fed every byte the
+    /// clients get. The periodic redraw ships its contents so a browser
+    /// repaints from what the server knows the screen holds, not from its
+    /// own (possibly already wrong) memory. No scrollback is kept here: the
+    /// ring is the history; this is only the grid.
+    screen: vt100::Parser,
+    /// PTY grid (cols, rows) the screen is modelled at.
+    size: (u16, u16),
+    /// Set by a resize. The emulator truncates on resize where xterm.js
+    /// reflows, so the model is rebuilt from the ring at the next snapshot —
+    /// the same replay a reconnecting client performs, which is the one
+    /// state both sides can agree on. Deferred rather than done per resize
+    /// event because a window drag fires dozens.
+    stale: bool,
 }
 
 impl Scrollback {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, cols: u16, rows: u16) -> Self {
         Scrollback {
             buf: VecDeque::new(),
             cap,
             total: 0,
             front_state: ModeTracker::new(),
+            screen: vt100::Parser::new(rows, cols, 0),
+            size: (cols, rows),
+            stale: false,
         }
     }
     fn push(&mut self, data: &[u8]) {
@@ -200,6 +217,35 @@ impl Scrollback {
             evicted.push(self.buf.pop_front().expect("len > cap > 0"));
         }
         self.front_state.feed(&evicted);
+        self.screen.process(data);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        if self.size != (cols, rows) {
+            self.size = (cols, rows);
+            self.stale = true;
+        }
+    }
+
+    /// The visible screen as escape sequences that reproduce it: clear the
+    /// display in place, rewrite every row with its attributes, restore the
+    /// cursor. Nothing in it switches buffers or modes, and clearing the
+    /// display never pushes rows into a terminal's scrollback, so a client
+    /// can write it into whatever buffer it is showing without disturbing
+    /// history or its scroll position. Rebuilds the model first if a resize
+    /// left it stale.
+    fn screen_snapshot(&mut self) -> Vec<u8> {
+        if self.stale {
+            let (cols, rows) = self.size;
+            let mut fresh = vt100::Parser::new(rows, cols, 0);
+            fresh.process(&self.front_init());
+            let (a, b) = self.buf.as_slices();
+            fresh.process(a);
+            fresh.process(b);
+            self.screen = fresh;
+            self.stale = false;
+        }
+        self.screen.screen().contents_formatted()
     }
 
     /// Escape sequences a full replay must be prefixed with so the ring's
@@ -282,10 +328,63 @@ impl Terminal {
     }
 }
 
+/// Opaque handle on a slot's screen model, for the periodic redraw.
+#[derive(Clone)]
+pub struct ScreenHandle(Arc<Mutex<Scrollback>>);
+
+/// One redraw's worth of frames, in the order they must reach the client.
+pub struct Redraw {
+    /// Output that was broadcast before the snapshot was taken but had not
+    /// yet been pulled from `output_rx`. It must go out BEFORE `screen`:
+    /// the snapshot already reflects it, and replaying it afterwards would
+    /// paint it twice.
+    pub pending: Vec<Vec<u8>>,
+    /// The receiver overran while draining: the stream has a hole and the
+    /// caller must close the channel as it would on any lag.
+    pub lagged: bool,
+    pub cols: u16,
+    pub rows: u16,
+    /// See `Scrollback::screen_snapshot`.
+    pub screen: Vec<u8>,
+}
+
+impl ScreenHandle {
+    /// Take a snapshot consistent with `output_rx`'s position in the
+    /// stream. The reader thread pushes and broadcasts under this same
+    /// lock, so everything broadcast so far is already queued in the
+    /// receiver and nothing new can arrive while it is drained here.
+    pub fn redraw(&self, output_rx: &mut broadcast::Receiver<Vec<u8>>) -> Redraw {
+        let mut sb = lock(&self.0);
+        let mut pending = Vec::new();
+        let mut lagged = false;
+        loop {
+            match output_rx.try_recv() {
+                Ok(bytes) => pending.push(bytes),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    lagged = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        let (cols, rows) = sb.size;
+        let screen = sb.screen_snapshot();
+        Redraw {
+            pending,
+            lagged,
+            cols,
+            rows,
+            screen,
+        }
+    }
+}
+
 /// What a client needs to bridge a WebSocket to a terminal.
 pub struct Attachment {
     pub input_tx: std::sync::mpsc::SyncSender<PtyCmd>,
     pub output_rx: broadcast::Receiver<Vec<u8>>,
+    /// The slot's screen model, for the periodic redraw.
+    pub screen: ScreenHandle,
     /// Fires when the terminal dies or is reset; the bridge should disconnect.
     pub shutdown_rx: watch::Receiver<bool>,
     /// Recent output to write before streaming live data (resume/replay).
@@ -439,6 +538,7 @@ impl Terminals {
         Ok(Attachment {
             input_tx: term.input_tx.clone(),
             output_rx,
+            screen: ScreenHandle(term.scrollback.clone()),
             shutdown_rx: term.shutdown_tx.subscribe(),
             replay,
             mode,
@@ -486,6 +586,7 @@ impl Terminals {
         Ok(Attachment {
             input_tx: term.input_tx.clone(),
             output_rx,
+            screen: ScreenHandle(term.scrollback.clone()),
             shutdown_rx: term.shutdown_tx.subscribe(),
             replay,
             mode,
@@ -624,7 +725,7 @@ fn spawn_terminal(
     // receiver just re-opens and the scrollback ring heals it with a delta
     // or a full replay.
     let (output_tx, _) = broadcast::channel::<Vec<u8>>(64);
-    let scrollback = Arc::new(Mutex::new(Scrollback::new(scrollback_cap)));
+    let scrollback = Arc::new(Mutex::new(Scrollback::new(scrollback_cap, cols, rows)));
     let alive = Arc::new(AtomicBool::new(true));
     let size = Arc::new(Mutex::new((cols, rows)));
     let (shutdown_tx, _) = watch::channel(false);
@@ -674,6 +775,7 @@ fn spawn_terminal(
     {
         let size = size.clone();
         let killer = killer.clone();
+        let scrollback = scrollback.clone();
         std::thread::spawn(move || {
             let mut writer = writer;
             let mut child = child;
@@ -687,6 +789,7 @@ fn spawn_terminal(
                     }
                     PtyCmd::Resize { cols, rows } => {
                         *lock(&size) = (cols, rows);
+                        lock(&scrollback).resize(cols, rows);
                         let _ = master.resize(PtySize {
                             rows,
                             cols,
@@ -724,7 +827,7 @@ mod tests {
 
     #[test]
     fn fresh_open_is_full_replay() {
-        let mut s = Scrollback::new(10);
+        let mut s = Scrollback::new(10, 80, 24);
         s.push(b"hello");
         let (mode, base, bytes) = s.cut(None);
         assert_eq!(mode, AttachMode::Replay);
@@ -734,7 +837,7 @@ mod tests {
 
     #[test]
     fn resume_within_window_returns_missed_tail() {
-        let mut s = Scrollback::new(10);
+        let mut s = Scrollback::new(10, 80, 24);
         s.push(b"hello"); // client saw these 5 bytes
         s.push(b"world"); // client missed these 5
         let (mode, base, bytes) = s.cut(Some(5));
@@ -745,7 +848,7 @@ mod tests {
 
     #[test]
     fn resume_up_to_date_returns_empty_delta() {
-        let mut s = Scrollback::new(10);
+        let mut s = Scrollback::new(10, 80, 24);
         s.push(b"hello");
         let (mode, base, bytes) = s.cut(Some(5));
         assert_eq!(mode, AttachMode::Resume);
@@ -755,7 +858,7 @@ mod tests {
 
     #[test]
     fn missing_more_than_the_ring_replays() {
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"hello"); // total 5, ring holds "ello"
         let (mode, base, bytes) = s.cut(Some(0)); // missed 5 > ring 4
         assert_eq!(mode, AttachMode::Replay);
@@ -765,7 +868,7 @@ mod tests {
 
     #[test]
     fn exact_window_fit_resumes() {
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"hello"); // total 5, ring "ello"
         let (mode, base, bytes) = s.cut(Some(1)); // missed 4 == ring len
         assert_eq!(mode, AttachMode::Resume);
@@ -775,7 +878,7 @@ mod tests {
 
     #[test]
     fn bogus_future_offset_replays() {
-        let mut s = Scrollback::new(10);
+        let mut s = Scrollback::new(10, 80, 24);
         s.push(b"hello");
         let (mode, base, bytes) = s.cut(Some(99)); // offset > total: bogus client
         assert_eq!(mode, AttachMode::Replay);
@@ -785,7 +888,7 @@ mod tests {
 
     #[test]
     fn replay_reinstates_alt_screen_trimmed_from_the_ring() {
-        let mut s = Scrollback::new(16);
+        let mut s = Scrollback::new(16, 80, 24);
         s.push(b"\x1b[?1049h"); // fullscreen app enters the alt screen…
         s.push(&[b'x'; 64]); // …then its redraws trim the enable out
         let (mode, _, _) = s.cut(None);
@@ -795,7 +898,7 @@ mod tests {
 
     #[test]
     fn no_init_while_the_enable_is_still_in_the_ring() {
-        let mut s = Scrollback::new(1024);
+        let mut s = Scrollback::new(1024, 80, 24);
         s.push(b"\x1b[?1049h");
         s.push(b"drawing");
         assert!(s.front_init().is_empty());
@@ -803,7 +906,7 @@ mod tests {
 
     #[test]
     fn leaving_alt_screen_clears_the_init() {
-        let mut s = Scrollback::new(8);
+        let mut s = Scrollback::new(8, 80, 24);
         s.push(b"\x1b[?1049h");
         s.push(&[b'x'; 32]);
         s.push(b"\x1b[?1049l"); // app exits the alt screen…
@@ -813,7 +916,7 @@ mod tests {
 
     #[test]
     fn tracker_survives_sequences_split_across_evictions() {
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"\x1b[?10");
         s.push(b"49h");
         s.push(&[b'x'; 16]);
@@ -822,7 +925,7 @@ mod tests {
 
     #[test]
     fn init_reinstates_each_tracked_mode() {
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"\x1b[?1h\x1b[?2004h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1049h");
         s.push(&[b'x'; 8]);
         assert_eq!(
@@ -836,7 +939,7 @@ mod tests {
         // Claude Code's exact enable set, trimmed from the ring, must come
         // back in the init — the client synthesizes wheel reports only while
         // it knows the app wants SGR mouse tracking.
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
         s.push(&[b'x'; 8]);
         assert_eq!(
@@ -844,7 +947,7 @@ mod tests {
             b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h".as_slice()
         );
 
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"\x1b[?1000h\x1b[?1006h\x1b[?1006l\x1b[?1000l");
         s.push(&[b'x'; 8]);
         assert_eq!(s.front_init(), b"".as_slice());
@@ -852,7 +955,7 @@ mod tests {
 
     #[test]
     fn combined_params_and_untracked_modes_are_handled() {
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"\x1b[?1049;2004h\x1b[?12h\x1b[31m");
         s.push(&[b'x'; 8]);
         assert_eq!(s.front_init(), b"\x1b[?1049h\x1b[?2004h".as_slice());
@@ -860,7 +963,7 @@ mod tests {
 
     #[test]
     fn total_keeps_counting_past_the_cap() {
-        let mut s = Scrollback::new(4);
+        let mut s = Scrollback::new(4, 80, 24);
         s.push(b"aaaa");
         s.push(b"bbbb");
         s.push(b"cc");
@@ -868,6 +971,82 @@ mod tests {
         assert_eq!(mode, AttachMode::Replay);
         assert_eq!(base, 6); // total 10 − ring 4
         assert_eq!(bytes, b"bbcc");
+    }
+
+    /// Plain text of a `contents_formatted` snapshot: escape sequences
+    /// stripped, one string per screen row.
+    fn plain_rows(snapshot: &[u8], cols: u16, rows: usize) -> Vec<String> {
+        let mut p = vt100::Parser::new(rows as u16, cols, 0);
+        p.process(snapshot);
+        (0..rows)
+            .map(|r| {
+                p.screen()
+                    .contents_between(r as u16, 0, r as u16, cols)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn screen_model_follows_the_stream() {
+        let mut s = Scrollback::new(1024, 80, 24);
+        s.push(b"hello\r\n\x1b[31mworld\x1b[m");
+        let snap = s.screen_snapshot();
+        let rows = plain_rows(&snap, 80, 24);
+        assert_eq!(rows[0], "hello");
+        assert_eq!(rows[1], "world");
+        // The colour survives the round trip, and the snapshot is a
+        // self-contained repaint: clear in place, then the rows.
+        assert!(snap.starts_with(b"\x1b[?25h\x1b[m\x1b[H\x1b[J"), "{snap:?}");
+        assert!(snap.windows(5).any(|w| w == b"\x1b[31m"), "{snap:?}");
+        // Nothing in it switches buffers or touches modes.
+        assert!(!snap.windows(4).any(|w| w == b"\x1b[?1"), "{snap:?}");
+    }
+
+    #[test]
+    fn snapshot_never_scrolls_the_client() {
+        // A full bottom row is the one write that could push the screen
+        // up a line on the client. The snapshot must leave the cursor in
+        // the pending-wrap state instead of emitting anything past it.
+        let mut s = Scrollback::new(4096, 10, 3);
+        s.push(b"row0\r\nrow1\r\n0123456789");
+        let snap = s.screen_snapshot();
+        let mut p = vt100::Parser::new(3, 10, 100);
+        p.process(&snap);
+        assert_eq!(p.screen().contents_between(0, 0, 0, 10).trim_end(), "row0");
+        assert_eq!(p.screen().contents_between(2, 0, 2, 10), "0123456789");
+        assert_eq!(p.screen().scrollback(), 0, "no line was scrolled off");
+    }
+
+    #[test]
+    fn resize_rebuilds_the_screen_from_the_ring() {
+        let mut s = Scrollback::new(4096, 10, 3);
+        // A 15-character line wraps at 10 columns…
+        s.push(b"abcdefghijklmno\r\n$ ");
+        assert_eq!(plain_rows(&s.screen_snapshot(), 10, 3)[0], "abcdefghij");
+        // …and after widening it is one row again, as it would be for a
+        // client that reconnected at the new size — not the emulator's
+        // truncate-in-place.
+        s.resize(20, 3);
+        let rows = plain_rows(&s.screen_snapshot(), 20, 3);
+        assert_eq!(rows[0], "abcdefghijklmno");
+        assert_eq!(rows[1], "$");
+        assert!(!s.stale);
+    }
+
+    #[test]
+    fn rebuild_reinstates_modes_trimmed_from_the_ring() {
+        let mut s = Scrollback::new(16, 10, 3);
+        s.push(b"\x1b[?1049h"); // alt screen enable…
+        s.push(b"\x1b[Hfullscreen"); // …scrolled out by later output
+        s.push(&[b'x'; 8]);
+        s.resize(12, 3);
+        let _ = s.screen_snapshot();
+        assert!(
+            s.screen.screen().alternate_screen(),
+            "rebuild replayed the init"
+        );
     }
 
     #[test]

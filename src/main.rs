@@ -2143,6 +2143,7 @@ async fn access_ws(
         (Some(e), Some(o)) => Some((e, o)),
         _ => None,
     };
+    let redraw = state.config.redraw_interval;
     match state.terminals.attach_view(&user, index, resume) {
         Ok(attachment) => {
             tracing::info!("access ws: attached (viewer) user={user:?} term={index}");
@@ -2153,7 +2154,7 @@ async fn access_ws(
                     // The lease carries the expiry the token was admitted
                     // on; the bridge force-closes at that instant and refuses
                     // to forward anything past it — see `pty::bridge`.
-                    pty::bridge(socket, attachment, true, Some(lease))
+                    pty::bridge(socket, attachment, true, Some(lease), redraw)
                 })
         }
         Err(e) => {
@@ -2204,9 +2205,12 @@ async fn ws_handler(
     let revoked = session.revocation();
     let deadline = tokio::time::Instant::now() + session.remaining(state.sessions.ttl());
     let user = session.username;
+    let redraw = state.config.redraw_interval;
     ws.max_message_size(state.config.ws_message_limit)
         .max_frame_size(state.config.ws_message_limit)
-        .on_upgrade(move |socket| pty::mux_bridge(socket, terminals, user, revoked, deadline))
+        .on_upgrade(move |socket| {
+            pty::mux_bridge(socket, terminals, user, revoked, deadline, redraw)
+        })
 }
 
 fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> String {
