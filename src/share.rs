@@ -36,6 +36,11 @@ fn now_unix() -> u64 {
 /// link someone may already be watching.
 pub const MAX_GRANTS_PER_USER: usize = 32;
 
+/// Most viewer sockets one link may hold open at once. A link is a bearer
+/// capability that may be forwarded anywhere, and each viewer pins a copy of
+/// the slot's scrollback, so the number watching through it must be bounded.
+pub const MAX_VIEWERS_PER_GRANT: usize = 32;
+
 /// Longest note we store with a grant. Notes are a memory aid for the owner,
 /// not a document.
 const MAX_NOTE_LEN: usize = 120;
@@ -61,6 +66,9 @@ pub struct Grant {
     pub note: String,
     #[serde(skip_serializing)]
     revoked: tokio::sync::watch::Sender<bool>,
+    /// One permit per open viewer socket, held by its [`Lease`].
+    #[serde(skip_serializing)]
+    viewers: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Why `create` refused.
@@ -68,6 +76,15 @@ pub struct Grant {
 pub enum CreateError {
     /// The owner already holds `MAX_GRANTS_PER_USER` active links.
     TooMany,
+}
+
+/// Why `lease` refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LeaseError {
+    /// Bad signature, unknown or revoked grant, or expired.
+    Invalid,
+    /// `MAX_VIEWERS_PER_GRANT` viewers are already watching through it.
+    Full,
 }
 
 /// A viewer's admission to one shared slot, valid until `expires_at`.
@@ -82,6 +99,9 @@ pub struct Lease {
     /// Unix seconds, as signed into the token.
     pub expires_at: u64,
     pub revoked: tokio::sync::watch::Receiver<bool>,
+    /// This viewer's place under the grant's viewer cap, given back when the
+    /// socket (and so the lease) goes away.
+    _viewer: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Lease {
@@ -220,6 +240,7 @@ impl ShareStore {
                 expires_at: exp,
                 note: sanitize_note(note),
                 revoked,
+                viewers: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_VIEWERS_PER_GRANT)),
             },
         );
         Ok((token, id))
@@ -301,21 +322,27 @@ impl ShareStore {
     /// returned [`Lease`] carries the expiry the token was signed with, so the
     /// caller derives its force-close deadline from the *same* check that
     /// admitted it — there is no second lookup that could disagree.
-    pub fn lease(&self, token: &str) -> Option<Lease> {
-        let (id, user, index, exp) = self.verify(token)?;
+    pub fn lease(&self, token: &str) -> Result<Lease, LeaseError> {
+        let (id, user, index, exp) = self.verify(token).ok_or(LeaseError::Invalid)?;
         if now_unix() >= exp {
-            return None;
+            return Err(LeaseError::Invalid);
         }
         let grants = crate::util::lock(&self.grants);
-        let grant = grants.get(&id)?;
+        let grant = grants.get(&id).ok_or(LeaseError::Invalid)?;
         if grant.username != user || grant.index != index || grant.expires_at != exp {
-            return None;
+            return Err(LeaseError::Invalid);
         }
-        Some(Lease {
+        let viewer = grant
+            .viewers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| LeaseError::Full)?;
+        Ok(Lease {
             username: user,
             index,
             expires_at: exp,
             revoked: grant.revoked.subscribe(),
+            _viewer: viewer,
         })
     }
 
@@ -459,10 +486,23 @@ mod tests {
     }
 
     #[test]
+    fn a_link_admits_a_bounded_number_of_viewers() {
+        let s = store();
+        let (token, _) = s.create("u", 0, Duration::from_secs(60), "").unwrap();
+        let mut held: Vec<_> = (0..MAX_VIEWERS_PER_GRANT)
+            .map(|_| s.lease(&token).expect("under the cap"))
+            .collect();
+        assert_eq!(s.lease(&token).err(), Some(LeaseError::Full));
+        // A viewer leaving frees its place.
+        held.pop();
+        assert!(s.lease(&token).is_ok());
+    }
+
+    #[test]
     fn expired_token_cannot_be_leased() {
         let s = store();
         let (token, _) = s.create("u", 0, Duration::from_secs(0), "").unwrap();
-        assert!(s.lease(&token).is_none());
+        assert!(s.lease(&token).is_err());
     }
 
     #[test]
@@ -476,7 +516,7 @@ mod tests {
         assert!(!lease.valid());
         // Nothing can bring it back: the grant is gone and a fresh lease is
         // refused, while the old handle stays invalid.
-        assert!(s.lease(&token).is_none());
+        assert!(s.lease(&token).is_err());
         assert!(!lease.valid());
     }
 

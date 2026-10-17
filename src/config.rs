@@ -47,6 +47,7 @@ pub struct Network {
     /// would lock out every client.
     pub strict_origin: bool,
     /// Mark the session cookie `Secure` (set this when served over HTTPS).
+    /// Implied by an `https://` public_base_url.
     pub cookie_secure: bool,
 }
 
@@ -404,6 +405,14 @@ impl Config {
             .as_deref()
             .map(|u| u.trim_end_matches('/').to_string());
 
+        // An https public_base_url says the browser arrives over TLS, even
+        // when a proxy in front terminates it; a cookie sent in clear on some
+        // stray http:// request is the failure to rule out.
+        let cookie_secure = s.network.cookie_secure
+            || public_base_url
+                .as_deref()
+                .is_some_and(|u| u.to_ascii_lowercase().starts_with("https://"));
+
         // Additive: the configured extras and the public base URL both just
         // widen what the Host fallback already allows.
         let allowed_origins = s
@@ -508,7 +517,7 @@ impl Config {
             redraw_interval,
             session_ttl: Duration::from_secs(s.auth.session_ttl_secs.max(60)),
             session_path: s.auth.session_path.map(Into::into),
-            cookie_secure: s.network.cookie_secure,
+            cookie_secure,
             allowed_origins,
             strict_origin: s.network.strict_origin,
             ws_message_limit,
@@ -705,6 +714,24 @@ mod tests {
             cfg.public_base_url.as_deref(),
             Some("https://shell.example.com")
         );
+    }
+
+    #[test]
+    fn an_https_base_url_makes_the_cookie_secure() {
+        let with_base = |url: &str| {
+            Config::from_settings(Settings {
+                network: Network {
+                    public_base_url: Some(url.into()),
+                    ..Network::default()
+                },
+                ..Settings::default()
+            })
+            .cookie_secure
+        };
+        assert!(with_base("https://shell.example.com"));
+        assert!(with_base("HTTPS://shell.example.com"));
+        assert!(!with_base("http://127.0.0.1:8080"));
+        assert!(!Config::from_settings(Settings::default()).cookie_secure);
     }
 
     #[test]

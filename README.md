@@ -247,7 +247,9 @@ You can even broadcast your live session in 1 to N multicasting.
   and it stops resolving **and disconnects anyone watching through it right
   then** — not at their next reload. Links are HMAC-signed capabilities tracked
   in memory, so they also all die when the server restarts, and one account may
-  hold at most 32 live links.
+  hold at most 32 live links, each watched by at most 32 viewers at once. A
+  viewer that stops reading for 30 seconds is dropped, and a stalled one can
+  never hold its socket past the link's expiry or revocation.
 - **Faithful viewer.** The read-only view mirrors the owner's terminal grid and
   font and scales to fit — no wrong-wrapping from size mismatches — and shows a
   live "expires in …" countdown.
@@ -257,7 +259,9 @@ You can even broadcast your live session in 1 to N multicasting.
   `/webshell/private/*`, signed `HttpOnly` `SameSite=Lax` session cookies
   (`Secure` when configured), per-session CSRF tokens on every state-changing
   request and the WebSocket, an `Origin` check on WS upgrades, session-id
-  rotation on login, short-lived pre-auth sessions, and a login tarpit.
+  rotation on login, short-lived pre-auth sessions, a per-identity login
+  tarpit, and a lockout on repeated wrong TOTP codes. Shells never inherit the
+  server's own `WEBSHELL_*` environment.
 - **No host auth dependency.** No PAM, no `dlopen`, no setuid helper, nothing
   exec'd — so it is unaffected by SELinux confinement and builds as a **static
   musl binary** that runs anywhere.
@@ -300,7 +304,7 @@ Every table and key is optional; a missing one falls back to the default.
 | | `public_base_url` | *(none)* | Browser-facing base URL. Builds share links, is accepted as a WS `Origin`, and **the Google redirect URI is derived from it**. |
 | | `allowed_origins` | *(empty)* | Extra WebSocket `Origin`s, on top of the request's own `Host`. |
 | | `strict_origin` | `false` | Accept only the listed origins, dropping the Host fallback. |
-| | `cookie_secure` | `false` | Mark the session cookie `Secure`. **Set `true` when served over HTTPS.** |
+| | `cookie_secure` | `false` | Mark the session cookie `Secure` and send HSTS. Implied by an `https://` `public_base_url`; **set `true` when served over HTTPS without one.** |
 | `[auth]` | `users` | *(empty)* | The allowlist, as `provider:subject`. Nobody can log in while empty. |
 | | `login_methods` | `["local"]` | `"local"`, `"google"`, or both. |
 | | `session_ttl_secs` | `28800` | Login-session lifetime. |
@@ -514,6 +518,13 @@ last few accepted codes per identity and refuses a repeat for as long as it coul
 still verify. Resubmit one and you are told it has already been used; wait for the
 next. The memory lives in the process, so a restart clears it — harmless, since a
 code from before a restart has almost certainly expired.
+
+**Wrong codes lock the second factor.** Five wrong codes in a row lock that
+identity's code step for 15 minutes and end the half-finished login, so the
+password (or Google sign-in) has to be passed again first. Each further run of
+five doubles the wait, up to 24 hours; a right code clears it. A lockout is
+logged as a warning naming the identity. Like the replay memory, it lives in the
+process.
 
 `[mfa].enrollment_path` is written by webshell, not you. It holds each identity's
 secret and the Google `sub` pinned on first login, and is created mode `0600`.

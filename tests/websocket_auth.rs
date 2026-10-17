@@ -503,6 +503,31 @@ async fn share_viewer_receives_the_redraw_tick() {
     assert!(frame["screen"].is_string() && frame["cols"] == 80 && frame["rows"] == 24);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shells_do_not_inherit_the_servers_secrets() {
+    // Simple mode is started with WEBSHELL_PASSWORD in its environment; a
+    // shell that could print it would hand it to every share viewer.
+    let server = TestServer::start().await;
+    let (cookie, csrf) = server.login().await;
+    let mut ws = open_slot_zero(&server, &cookie, &csrf).await;
+    let output = run_command(
+        &mut ws,
+        0,
+        // The marker is spelled in octal so the echoed command line, which
+        // also comes back, cannot satisfy it.
+        "env | grep -c '^WEBSHELL_'; printf '\\n\\105\\116\\126\\060\\n'\n",
+        "ENV0",
+    )
+    .await;
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("test-password"), "secret leaked: {text:?}");
+    // grep's count, then printf's blank line and marker, through the tty.
+    assert!(
+        text.contains("0\r\n\r\nENV0"),
+        "expected no WEBSHELL_ variables; output={text:?}"
+    );
+}
+
 /// Open slot 0 on the authenticated mux so a viewer has something to attach
 /// to, and keep the mux socket alive for the caller.
 async fn open_slot_zero(

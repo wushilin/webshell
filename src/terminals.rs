@@ -646,6 +646,15 @@ fn build_command(
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    // CommandBuilder starts from the server's whole environment, which can
+    // carry WEBSHELL_PASSWORD (simple mode) and WEBSHELL_SECRET (the cookie and
+    // share signing key). A shell must never see them: anything printed there
+    // reaches share-link viewers too.
+    for (key, _) in std::env::vars_os() {
+        if is_server_secret_env(&key) {
+            cmd.env_remove(key);
+        }
+    }
     cmd.env("TERM", "xterm-256color");
     // Do not trust the service manager's inherited identity environment. The
     // process is already running as the owner, and these values come from that
@@ -662,6 +671,11 @@ fn build_command(
         cmd.env(k, v);
     }
     Ok(cmd)
+}
+
+/// The server's own configuration namespace, stripped from every shell.
+fn is_server_secret_env(key: &std::ffi::OsStr) -> bool {
+    key.to_str().is_some_and(|k| k.starts_with("WEBSHELL_"))
 }
 
 fn spawn_terminal(
@@ -1077,6 +1091,25 @@ mod tests {
         );
         assert_eq!(cmd.get_env("USER"), Some(std::ffi::OsStr::new("alice")));
         assert_eq!(cmd.get_env("LOGNAME"), Some(std::ffi::OsStr::new("alice")));
+    }
+
+    #[test]
+    fn build_command_strips_server_secrets_from_env() {
+        // The process environment is shared by every test thread, so use a
+        // name no other test touches.
+        std::env::set_var("WEBSHELL_TEST_STRIP_SECRET", "hunter2");
+        let envs = [("WEBSHELL_OPERATOR_SET".to_string(), "kept".to_string())].into();
+        let cmd = build_command(&["/bin/sh".to_string()], "u", "o", "/", &envs).unwrap();
+        std::env::remove_var("WEBSHELL_TEST_STRIP_SECRET");
+        assert_eq!(cmd.get_env("WEBSHELL_TEST_STRIP_SECRET"), None);
+        assert!(!cmd
+            .iter_full_env_as_str()
+            .any(|(k, _)| k == "WEBSHELL_TEST_STRIP_SECRET"));
+        // An explicit [terminals.envs] entry is the operator's choice.
+        assert_eq!(
+            cmd.get_env("WEBSHELL_OPERATOR_SET"),
+            Some(std::ffi::OsStr::new("kept"))
+        );
     }
 
     #[test]

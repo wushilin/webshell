@@ -472,6 +472,14 @@ fn valid_size(cols: u16, rows: u16) -> (u16, u16) {
 /// clock, as a safety net behind the exact deadline timer.
 const SHARE_AUDIT_SECS: u64 = 15;
 
+/// Longest a viewer socket may take to accept one frame before it is dropped.
+/// A connected browser drains its socket continuously; one that has stopped
+/// for this long is gone or hostile, and holding it pins its attachment.
+const VIEWER_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a closing viewer gets to take the Close frame.
+const VIEWER_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Why a [`ViewerOutput`] refused to forward a frame.
 enum Stop {
     /// The lease is no longer valid (expired or revoked); a Close frame has
@@ -517,17 +525,41 @@ impl ViewerOutput {
     /// the frame is dropped, a Close is sent instead, and `Err(Stop::Invalid)`
     /// tells the caller to consume the guard. Validity is re-evaluated on
     /// every call, so this holds even if no timer or channel ever fired.
+    ///
+    /// The write itself is bounded too. A peer that stops reading would
+    /// otherwise park this await forever, and while it is parked nothing else
+    /// in the bridge runs — no deadline, no revocation. So the write races the
+    /// lease ending and a stall limit, and loses the socket to either.
     async fn send(&mut self, msg: Message) -> Result<(), Stop> {
         if !self.valid() {
-            let _ = self.sink.send(Message::Close(None)).await;
+            let _ = tokio::time::timeout(VIEWER_CLOSE_GRACE, self.sink.send(Message::Close(None)))
+                .await;
             return Err(Stop::Invalid);
         }
-        self.sink.send(msg).await.map_err(|_| Stop::Gone)
+        let write = tokio::time::timeout(VIEWER_STALL_LIMIT, self.sink.send(msg));
+        let Some(lease) = &self.lease else {
+            return match write.await {
+                Ok(Ok(())) => Ok(()),
+                _ => Err(Stop::Gone),
+            };
+        };
+        let mut revoked = lease.revoked.clone();
+        tokio::select! {
+            r = write => match r {
+                Ok(Ok(())) => Ok(()),
+                _ => Err(Stop::Gone),
+            },
+            _ = tokio::time::sleep_until(lease.deadline()) => Err(Stop::Invalid),
+            // Revoked, or the sender dropped by a sweep: the same thing here.
+            _ = revoked.wait_for(|r| *r) => Err(Stop::Invalid),
+        }
     }
 
-    /// End the stream: send Close and give up the sink for good.
+    /// End the stream: send Close and give up the sink for good. A peer that
+    /// is not reading gets a moment for the Close, then just the drop.
     async fn close(mut self) {
-        let _ = self.sink.send(Message::Close(None)).await;
+        let _ =
+            tokio::time::timeout(VIEWER_CLOSE_GRACE, self.sink.send(Message::Close(None))).await;
         // `self.sink` drops here; the guard is gone.
     }
 }

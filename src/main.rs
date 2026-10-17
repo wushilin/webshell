@@ -53,24 +53,73 @@ struct ClientPrefs {
     font_family: String,
 }
 
-/// Tarpit for login attempts: each recent failure adds delay before the next
-/// attempt is processed, throttling brute-force without ever locking out the
-/// legitimate user (a success clears it). Failures older than a minute decay.
+/// Wrong TOTP codes in a row before an identity's second factor locks.
+const MFA_MAX_STRIKES: u32 = 5;
+/// First MFA lockout; each further round of strikes doubles it.
+const MFA_LOCKOUT_BASE: Duration = Duration::from_secs(15 * 60);
+const MFA_LOCKOUT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+/// A run of wrong codes is forgotten only after this long without another.
+/// Longer than the lockout cap, so waiting out a lock never resets the run.
+const MFA_STRIKE_MEMORY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Throttle bucket shared by every name that is not on the allowlist, so junk
+/// attempts slow each other down and never the identities that exist.
+const UNLISTED_BUCKET: &str = "unlisted";
+
+/// Tarpit for login and MFA attempts. Each bucket (an allowlisted identity, or
+/// the shared unlisted bucket) has its own failure count, and each recent
+/// failure adds delay before that bucket's next attempt; a success clears it
+/// and failures older than a minute decay. Attempts within a bucket are
+/// serialized, so concurrency cannot outrun the delay, while one bucket's
+/// queue never holds up another's.
+///
+/// On top of the tarpit, wrong TOTP codes are capped per identity: the tarpit
+/// alone still allows a guess every few seconds, indefinitely, to someone who
+/// already holds the first factor.
 struct LoginGuard {
-    inner: Mutex<(u32, Instant)>,
-    permit: tokio::sync::Semaphore,
+    buckets: Mutex<HashMap<String, Arc<Bucket>>>,
+    mfa: Mutex<HashMap<String, MfaStrikes>>,
+    argon2: tokio::sync::Semaphore,
+}
+
+/// One bucket's recent failure count and when it last changed. Held across
+/// an attempt, which is what serializes attempts on the same bucket.
+type Bucket = tokio::sync::Mutex<(u32, Instant)>;
+
+/// A run of consecutive wrong codes for one identity.
+struct MfaStrikes {
+    count: u32,
+    last: Instant,
+    locked_until: Option<Instant>,
+}
+
+/// One attempt holding its bucket. Report the outcome with `failed` or
+/// `succeeded`; dropping it records neither (a server-side error is not a
+/// guess).
+struct Attempt(tokio::sync::OwnedMutexGuard<(u32, Instant)>);
+
+impl Attempt {
+    fn failed(mut self) {
+        let recent = LoginGuard::recent_failures(&self.0);
+        *self.0 = (recent + 1, Instant::now());
+    }
+    fn succeeded(mut self) {
+        *self.0 = (0, Instant::now());
+    }
 }
 
 impl LoginGuard {
     fn new() -> Self {
         LoginGuard {
-            inner: Mutex::new((0, Instant::now())),
+            buckets: Mutex::new(HashMap::new()),
+            mfa: Mutex::new(HashMap::new()),
             // Password checks are intentionally serialized. Argon2id is
             // deliberately expensive, so unbounded concurrent verification is
             // an easy authentication DoS against a single-user service.
-            permit: tokio::sync::Semaphore::new(1),
+            argon2: tokio::sync::Semaphore::new(1),
         }
     }
+
     fn recent_failures(g: &(u32, Instant)) -> u32 {
         if g.1.elapsed() > Duration::from_secs(60) {
             0
@@ -78,21 +127,61 @@ impl LoginGuard {
             g.0
         }
     }
-    /// Delay to impose before the next attempt (grows with recent failures).
-    fn delay(&self) -> Duration {
-        let g = util::lock(&self.inner);
-        Duration::from_millis((Self::recent_failures(&g) as u64 * 300).min(5000))
-    }
-    fn record_failure(&self) {
-        let mut g = util::lock(&self.inner);
-        *g = (Self::recent_failures(&g) + 1, Instant::now());
-    }
-    fn record_success(&self) {
-        *util::lock(&self.inner) = (0, Instant::now());
+
+    /// Wait for `bucket`'s turn, then out its tarpit delay. Keys are
+    /// allowlisted identities or `UNLISTED_BUCKET`, so the map stays bounded.
+    async fn enter(&self, bucket: &str) -> Attempt {
+        let gate = util::lock(&self.buckets)
+            .entry(bucket.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((0, Instant::now()))))
+            .clone();
+        let g = gate.lock_owned().await;
+        let delay = Duration::from_millis((Self::recent_failures(&g) as u64 * 300).min(5000));
+        tokio::time::sleep(delay).await;
+        Attempt(g)
     }
 
-    async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.permit.acquire().await.expect("login semaphore closed")
+    async fn argon2_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.argon2
+            .acquire()
+            .await
+            .expect("argon2 semaphore closed")
+    }
+
+    /// Time left on `identity`'s MFA lockout, if it is locked.
+    fn mfa_locked(&self, identity: &str) -> Option<Duration> {
+        let until = util::lock(&self.mfa).get(identity)?.locked_until?;
+        let left = until.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// Count a wrong code. Returns the lockout it triggered, if any.
+    fn mfa_failed(&self, identity: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let mut map = util::lock(&self.mfa);
+        let s = map.entry(identity.to_string()).or_insert(MfaStrikes {
+            count: 0,
+            last: now,
+            locked_until: None,
+        });
+        if now.duration_since(s.last) > MFA_STRIKE_MEMORY {
+            s.count = 0;
+        }
+        s.count += 1;
+        s.last = now;
+        if !s.count.is_multiple_of(MFA_MAX_STRIKES) {
+            return None;
+        }
+        let round = s.count / MFA_MAX_STRIKES - 1;
+        let lock = MFA_LOCKOUT_BASE
+            .saturating_mul(1u32.checked_shl(round).unwrap_or(u32::MAX))
+            .min(MFA_LOCKOUT_MAX);
+        s.locked_until = Some(now + lock);
+        Some(lock)
+    }
+
+    fn mfa_succeeded(&self, identity: &str) {
+        util::lock(&self.mfa).remove(identity);
     }
 }
 
@@ -549,6 +638,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf, simple: bool) {
             "/webshell/",
             get(|| async { Redirect::to("/webshell/private/") }),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), hsts))
         .with_state(state);
 
     if let Some(tls) = tls {
@@ -994,6 +1084,22 @@ fn csrf_matches(expected: &str, provided: &str) -> bool {
 /// per request as a layer, so protection does not depend on each handler
 /// remembering to check. Browser navigations that fail are redirected to the
 /// login page; programmatic clients (fetch/WebSocket) get a 401.
+/// HSTS whenever the deployment is known to be reached over HTTPS — the same
+/// condition that marks the cookie `Secure`. It keeps a browser from ever
+/// trying `http://` first, where the cookie and the login form would be
+/// exposed to anyone on the path. No `includeSubDomains`: the parent domain's
+/// other hosts are not ours to commit.
+async fn hsts(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    if state.config.cookie_secure {
+        res.headers_mut().insert(
+            axum::http::header::STRICT_TRANSPORT_SECURITY,
+            axum::http::HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    res
+}
+
 async fn require_auth(
     State(state): State<AppState>,
     jar: SignedCookieJar,
@@ -1071,24 +1177,27 @@ async fn local_login(
     }
 
     // Check the allowlist BEFORE spending a password check: no reason to let an
-    // unlisted name drive su, and it keeps the tarpit for real attempts.
+    // unlisted name drive Argon2. Unlisted names share one tarpit bucket, so
+    // junk attempts never slow down an identity that exists.
     let who = Identity::new(identity::Provider::Local, &form.username);
     if !state.config.permits(&who) {
-        state.login_guard.record_failure();
+        state.login_guard.enter(UNLISTED_BUCKET).await.failed();
         tracing::warn!("login refused: {who} is not on the allowlist");
         return login_error(&state, &jar, &headers, "Wrong username or password.");
     }
 
-    let _permit = state.login_guard.acquire().await;
-    tokio::time::sleep(state.login_guard.delay()).await;
+    let attempt = state.login_guard.enter(&who.to_string()).await;
 
     // Argon2 is deliberately slow; keep it off the async runtime.
     let stored = state.config.local_password(&who).map(|h| h.to_string());
     let password = form.password.clone();
     let verified = match stored {
-        Some(hash) => tokio::task::spawn_blocking(move || localauth::verify(&hash, &password))
-            .await
-            .unwrap_or_else(|e| Err(format!("password check task failed: {e}"))),
+        Some(hash) => {
+            let _permit = state.login_guard.argon2_permit().await;
+            tokio::task::spawn_blocking(move || localauth::verify(&hash, &password))
+                .await
+                .unwrap_or_else(|e| Err(format!("password check task failed: {e}")))
+        }
         // Allowlisted but no password set: a configuration gap, not a wrong
         // password, and it must not read as one.
         None => Err(format!("no password is configured for {who}")),
@@ -1097,7 +1206,7 @@ async fn local_login(
     match verified {
         Ok(true) => {}
         Ok(false) => {
-            state.login_guard.record_failure();
+            attempt.failed();
             tracing::warn!("failed local login for {who}");
             return login_error(&state, &jar, &headers, "Wrong username or password.");
         }
@@ -1115,7 +1224,7 @@ async fn local_login(
 
     let user = who.to_string();
     if !state.config.mfa_required {
-        state.login_guard.record_success();
+        attempt.succeeded();
         let new_id = state.sessions.login(&id, &user);
         let jar = jar.add(session_cookie(&state, new_id));
         tracing::info!("login success for {user}");
@@ -1124,12 +1233,15 @@ async fn local_login(
     // The password just checked out. A trusted device skips the *code* only —
     // it could not have skipped the step above.
     if let Some(device) = trusted_device(&state, &jar, &who, &headers) {
-        state.login_guard.record_success();
+        attempt.succeeded();
         let new_id = state.sessions.login(&id, &user);
         let jar = jar.add(session_cookie(&state, new_id));
         tracing::info!("login success for {user}; MFA skipped via trusted device {device}");
         return (jar, Redirect::to("/webshell/private/")).into_response();
     }
+    // Half way in: the password is right but the login is not complete, so
+    // the bucket is not cleared until the code also checks out.
+    drop(attempt);
     let jar = forget_stale_device(&state, jar, &who);
     let new_id = state.sessions.begin_mfa(&id, &user);
     let jar = jar.add(session_cookie(&state, new_id));
@@ -1474,6 +1586,33 @@ fn render_mfa(
     (html_headers(&nonce, true, headers), Html(html)).into_response()
 }
 
+/// End an MFA-pending session whose identity is locked out, and send the
+/// browser back to sign in. Ending it means another round of guesses first
+/// costs the first factor again, not just the wait.
+fn mfa_locked_out(
+    state: &AppState,
+    jar: SignedCookieJar,
+    headers: &HeaderMap,
+    id: &str,
+    identity: &Identity,
+    left: Duration,
+) -> Response {
+    tracing::warn!(
+        "MFA locked for {identity} after repeated wrong codes; {}s left",
+        left.as_secs()
+    );
+    state.sessions.remove(id);
+    let jar = jar.add(session_cookie(state, state.sessions.create()));
+    let minutes = left.as_secs().div_ceil(60);
+    let page = login_error(
+        state,
+        &jar,
+        headers,
+        &format!("Too many wrong codes. Sign in again in {minutes} minute(s)."),
+    );
+    (jar, page).into_response()
+}
+
 /// Per-identity replay guard, created on first use.
 fn replay_guard(state: &AppState, user: &str) -> Arc<totp::ReplayGuard> {
     util::lock(&state.otp_used)
@@ -1497,9 +1636,12 @@ async fn mfa_submit(
     let Ok(identity) = session.username.parse::<Identity>() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "malformed identity").into_response();
     };
-    // Guessing a six-digit code is exactly the thing a tarpit is for.
-    let _permit = state.login_guard.acquire().await;
-    tokio::time::sleep(state.login_guard.delay()).await;
+    // Guessing a six-digit code is exactly the thing a tarpit is for. Codes
+    // have their own bucket, so they cannot be cleared by a right password.
+    let attempt = state.login_guard.enter(&format!("mfa:{identity}")).await;
+    if let Some(left) = state.login_guard.mfa_locked(&session.username) {
+        return mfa_locked_out(&state, jar, &headers, &id, &identity, left);
+    }
 
     let record = state.enrollment.get(&identity).unwrap_or_default();
     let enrolling = !record.enrolled();
@@ -1513,7 +1655,14 @@ async fn mfa_submit(
     let verified = totp::valid_seed(&secret) && totp::verify(&secret, &form.otp);
     let accepted = verified && replay_guard(&state, &session.username).accept(&form.otp);
     if !accepted {
-        state.login_guard.record_failure();
+        attempt.failed();
+        // A replayed code is a code the user really holds, not a guess, so
+        // only wrong codes count toward the lockout.
+        if !verified {
+            if let Some(lock) = state.login_guard.mfa_failed(&session.username) {
+                return mfa_locked_out(&state, jar, &headers, &id, &identity, lock);
+            }
+        }
         let message = if verified {
             "<p class=\"error\">That code has already been used. \
              Wait for your authenticator to show the next one.</p>"
@@ -1543,7 +1692,8 @@ async fn mfa_submit(
         }
     }
 
-    state.login_guard.record_success();
+    attempt.succeeded();
+    state.login_guard.mfa_succeeded(&session.username);
     let new_id = state.sessions.login(&id, &session.username);
     let mut jar = jar.add(session_cookie(&state, new_id));
 
@@ -2123,9 +2273,20 @@ async fn access_ws(
         tracing::warn!("access ws: rejected — sharing is disabled");
         return (StatusCode::FORBIDDEN, "sharing is disabled").into_response();
     }
-    let Some(lease) = state.shares.lease(&q.token) else {
-        tracing::warn!("access ws: rejected — invalid or expired share token");
-        return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
+    let lease = match state.shares.lease(&q.token) {
+        Ok(lease) => lease,
+        Err(share::LeaseError::Invalid) => {
+            tracing::warn!("access ws: rejected — invalid or expired share token");
+            return (StatusCode::FORBIDDEN, "invalid or expired share link").into_response();
+        }
+        Err(share::LeaseError::Full) => {
+            tracing::warn!("access ws: rejected — share link is at its viewer limit");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many viewers on this share link",
+            )
+                .into_response();
+        }
     };
     if !origin_allowed(&state, &headers) {
         tracing::warn!(
@@ -2252,4 +2413,42 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrong_codes_lock_the_second_factor_with_a_doubling_wait() {
+        let guard = LoginGuard::new();
+        let who = "local:alice";
+        for _ in 1..MFA_MAX_STRIKES {
+            assert_eq!(guard.mfa_failed(who), None);
+            assert_eq!(guard.mfa_locked(who), None);
+        }
+        assert_eq!(guard.mfa_failed(who), Some(MFA_LOCKOUT_BASE));
+        assert!(guard.mfa_locked(who).is_some());
+        // Another identity is untouched.
+        assert_eq!(guard.mfa_locked("local:bob"), None);
+        // The next round of strikes locks for twice as long.
+        for _ in 1..MFA_MAX_STRIKES {
+            assert_eq!(guard.mfa_failed(who), None);
+        }
+        assert_eq!(guard.mfa_failed(who), Some(MFA_LOCKOUT_BASE * 2));
+    }
+
+    #[test]
+    fn mfa_lockout_is_capped_and_cleared_by_a_right_code() {
+        let guard = LoginGuard::new();
+        let who = "local:alice";
+        let mut last = None;
+        for _ in 0..MFA_MAX_STRIKES * 40 {
+            last = guard.mfa_failed(who).or(last);
+        }
+        assert_eq!(last, Some(MFA_LOCKOUT_MAX));
+        guard.mfa_succeeded(who);
+        assert_eq!(guard.mfa_locked(who), None);
+        assert_eq!(guard.mfa_failed(who), None, "the run starts over");
+    }
 }
