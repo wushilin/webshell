@@ -92,7 +92,10 @@ jobs:
       matrix:
         include:
           - { arch: x86_64, vm_arch: x86-64, runner: ubuntu-24.04 }
-          - { arch: aarch64, vm_arch: arm64, runner: ubuntu-24.04-arm }
+          # x86 runner on purpose: the action's bundled qemu tools are x86-64
+          # binaries and do not run on arm runners. The arm64 guest is fully
+          # emulated as a result, so this job is the slow one.
+          - { arch: aarch64, vm_arch: arm64, runner: ubuntu-24.04 }
     defaults:
       run:
         # Every `run` below executes inside the FreeBSD VM. The workspace is
