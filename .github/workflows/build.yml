@@ -1,0 +1,167 @@
+# Build and test webshell natively on every supported platform:
+#
+#   linux   x86_64 / aarch64   static musl
+#   macos   x86_64 / aarch64
+#   freebsd x86_64 / aarch64   (in a VM; GitHub has no FreeBSD runners)
+#
+# Every artifact is built AND tested on its own OS and architecture — no
+# cross-compiling — so the integration suite exercises the real PTY layer on
+# each one. A `v*` tag additionally collects the six binaries plus SHA256SUMS
+# into a DRAFT release, to be reviewed and published by hand.
+#
+# Third-party actions are pinned to commit SHAs; the tag is in the comment.
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Oldest macOS the binaries promise to run on.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  native:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, suffix: "-musl" }
+          - { os: linux, arch: aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, suffix: "-musl" }
+          - { os: macos, arch: x86_64, runner: macos-15-intel, target: x86_64-apple-darwin, suffix: "" }
+          - { os: macos, arch: aarch64, runner: macos-15, target: aarch64-apple-darwin, suffix: "" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      # ring compiles C; for musl it must be compiled against musl's headers.
+      - name: Install musl tools
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_$(echo '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      # Same check as build-release.sh: a PT_INTERP segment means the binary
+      # needs a dynamic loader, which is what the musl artifacts exist to avoid.
+      - name: Verify statically linked
+        if: matrix.os == 'linux'
+        run: |
+          if readelf -l target/${{ matrix.target }}/release/webshell | grep -q INTERP; then
+            echo "error: binary is dynamically linked" >&2
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/webshell \
+             "out/webshell-$ver-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.suffix }}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: webshell-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  freebsd:
+    name: freebsd-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, vm_arch: x86-64, runner: ubuntu-24.04 }
+          - { arch: aarch64, vm_arch: arm64, runner: ubuntu-24.04-arm }
+    defaults:
+      run:
+        # Every `run` below executes inside the FreeBSD VM. The workspace is
+        # synced in before each step and back out after it.
+        shell: cpa.sh {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Built on the newest 14.x: FreeBSD supports only the latest minor of a
+      # branch, and a 14 binary also runs on 15.
+      - name: Start FreeBSD VM
+        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
+        with:
+          operating_system: freebsd
+          architecture: ${{ matrix.vm_arch }}
+          version: "14.5"
+          cpu_count: 4
+          memory: 8G
+
+      - name: Install Rust
+        run: sudo pkg install -y rust
+
+      # The target dir lives outside the workspace, so the sync back to the
+      # runner carries only out/, not gigabytes of build products.
+      - name: Build, test and package
+        run: |
+          export CARGO_TARGET_DIR="$HOME/cargo-target"
+          cargo build --release --locked
+          cargo test --release --locked
+          ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          mkdir -p out
+          cp "$CARGO_TARGET_DIR/release/webshell" "out/webshell-$ver-freebsd-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: webshell-freebsd-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [native, freebsd]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: webshell-*
+          path: dist
+          merge-multiple: true
+
+      # A tag that disagrees with Cargo.toml would publish binaries whose
+      # --version contradicts their file names.
+      - name: Check the tag matches the built version
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          ls dist
+          test "$(ls dist | wc -l)" -eq 6
+          if ls dist | grep -v -- "-$ver-"; then
+            echo "error: tag $GITHUB_REF_NAME does not match the artifacts above" >&2
+            exit 1
+          fi
+
+      - name: Checksums
+        run: cd dist && sha256sum webshell-* > SHA256SUMS && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*

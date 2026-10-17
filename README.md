@@ -44,19 +44,34 @@ internet, use the full config below: put it behind TLS and enable MFA.
 
 ## Install
 
-Every release ships **statically linked musl binaries** for both architectures.
-They have no shared-library dependencies at all — no glibc version to match, no
-PAM, nothing to install alongside them. Drop one on any Linux host and run it:
+Every release ships a binary for each supported platform, each one built and
+tested natively on that OS and CPU:
+
+| OS | `x86_64` | `aarch64` | Asset name |
+|---|---|---|---|
+| Linux | ✅ | ✅ | `webshell-<ver>-linux-<arch>-musl` |
+| macOS 11+ | ✅ | ✅ | `webshell-<ver>-macos-<arch>` |
+| FreeBSD 14+ | ✅ | ✅ | `webshell-<ver>-freebsd-<arch>` |
+
+The Linux binaries are **statically linked musl**: no shared-library
+dependencies at all — no glibc version to match, no PAM, nothing to install
+alongside them. Drop one on any Linux host and run it:
 
 ```sh
-VER=0.4.0                       # or whatever the latest release is
+VER=0.4.1                       # or whatever the latest release is
+OS=linux                        # or macos, freebsd
 ARCH=x86_64                     # or aarch64
+ASSET=webshell-$VER-$OS-$ARCH$( [ "$OS" = linux ] && echo -musl )
 BASE=https://github.com/wushilin/webshell/releases/download/v$VER
 
-curl -fsSLO $BASE/webshell-$VER-linux-$ARCH-musl
-sudo install -m 0755 webshell-$VER-linux-$ARCH-musl /usr/local/bin/webshell
+curl -fsSLO $BASE/$ASSET
+sudo install -m 0755 $ASSET /usr/local/bin/webshell
 webshell --version
 ```
+
+On macOS, a downloaded binary carries the quarantine flag; clear it with
+`xattr -d com.apple.quarantine /usr/local/bin/webshell` (the binaries are not
+notarized).
 
 Verify the download against the checksums published with the release:
 
@@ -78,9 +93,15 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 This works because nothing here depends on the host's auth stack — no PAM, no
-`dlopen`, no setuid helper. `./build-release.sh` builds the static musl binaries
-for both x86_64 and aarch64 (via `cargo-zigbuild`) exactly as a release does;
-`./build-x86_64.sh` cross-compiles a glibc build if you prefer one.
+`dlopen`, no setuid helper. On macOS and FreeBSD a plain `cargo build --release`
+is all there is to it.
+
+Releases are built by `.github/workflows/build.yml`, which builds and runs the
+full test suite natively on all six platforms (FreeBSD inside a VM) and, on a
+`v*` tag, gathers the binaries and `SHA256SUMS` into a draft release.
+`./build-release.sh` still builds the two static Linux binaries locally (via
+`cargo-zigbuild`); `./build-x86_64.sh` cross-compiles a glibc build if you
+prefer one.
 
 The one thing a static build gives up is NSS: `getpwuid` reads `/etc/passwd`
 directly, so the process owner's login shell and home directory resolve there

@@ -297,7 +297,10 @@ async fn mux_runs_commands_in_two_terminal_slots() {
     let colored = run_command(
         &mut ws,
         1,
-        "command ls --color=always /; printf '\\n\\105\\116\\104\\061\\n'\n",
+        // Color via printf, not `ls --color`: that flag is GNU-only, and the
+        // suite also runs on macOS and FreeBSD. The ESC byte appears only in
+        // output, never in the echoed command line.
+        "printf '\\033[1;34m'; command ls /; printf '\\033[0m\\n\\105\\116\\104\\061\\n'\n",
         "END1",
     )
     .await;
