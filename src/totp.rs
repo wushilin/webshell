@@ -1,13 +1,15 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
 
 const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 pub fn generate_seed() -> String {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 20];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("reading the OS random number generator");
     encode_base32(&bytes)
 }
 

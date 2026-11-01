@@ -660,9 +660,11 @@ pub fn origin_matches(allowed: &str, origin: &str) -> bool {
 }
 
 pub fn random_token(bytes: usize) -> String {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut buf = vec![0u8; bytes];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .expect("reading the OS random number generator");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 

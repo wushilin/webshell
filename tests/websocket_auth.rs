@@ -100,6 +100,9 @@ impl TestServer {
 }
 
 fn http_client() -> Client {
+    // reqwest is built without a crypto provider; the server installs ring
+    // in main(), and so must every other process that builds a client.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -180,7 +183,7 @@ where
 {
     let mut input = vec![term];
     input.extend_from_slice(command.as_bytes());
-    ws.send(Message::Binary(input)).await.unwrap();
+    ws.send(Message::Binary(input.into())).await.unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut output = Vec::new();
@@ -278,7 +281,7 @@ async fn mux_runs_commands_in_two_terminal_slots() {
 
     for term in 0..=1 {
         ws.send(Message::Text(
-            json!({"type":"open", "term":term, "cols":80, "rows":24}).to_string(),
+            json!({"type":"open", "term":term, "cols":80, "rows":24}).to_string().into(),
         ))
         .await
         .unwrap();
@@ -310,7 +313,7 @@ async fn mux_runs_commands_in_two_terminal_slots() {
     // Exercise the same resize control frames emitted by xterm's fit addon,
     // and ask the PTY itself to report its geometry after each transition.
     ws.send(Message::Text(
-        json!({"type":"resize", "term":0, "cols":101, "rows":31}).to_string(),
+        json!({"type":"resize", "term":0, "cols":101, "rows":31}).to_string().into(),
     ))
     .await
     .unwrap();
@@ -324,7 +327,7 @@ async fn mux_runs_commands_in_two_terminal_slots() {
     assert!(resized.windows(6).any(|w| w == b"31 101"));
 
     ws.send(Message::Text(
-        json!({"type":"resize", "term":0, "cols":80, "rows":24}).to_string(),
+        json!({"type":"resize", "term":0, "cols":80, "rows":24}).to_string().into(),
     ))
     .await
     .unwrap();
@@ -362,7 +365,7 @@ async fn replay_hello_reinstates_alt_screen_scrolled_out_of_the_ring() {
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     ws.send(Message::Text(
-        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string(),
+        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string().into(),
     ))
     .await
     .unwrap();
@@ -390,7 +393,7 @@ async fn replay_hello_reinstates_alt_screen_scrolled_out_of_the_ring() {
     );
     let (mut ws2, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     ws2.send(Message::Text(
-        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string(),
+        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string().into(),
     ))
     .await
     .unwrap();
@@ -439,8 +442,8 @@ fn redraw_screen_text(frame: &Value) -> String {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(frame["screen"].as_str().expect("redraw carries a screen"))
         .unwrap();
-    let rows = frame["rows"].as_u64().unwrap() as u16;
-    let cols = frame["cols"].as_u64().unwrap() as u16;
+    let rows = (frame["rows"].as_u64().unwrap() as u16).try_into().unwrap();
+    let cols = (frame["cols"].as_u64().unwrap() as u16).try_into().unwrap();
     let mut parser = vt100::Parser::new(rows, cols, 0);
     parser.process(&bytes);
     parser.screen().contents()
@@ -459,7 +462,7 @@ async fn mux_sends_a_periodic_redraw_with_the_servers_screen() {
 
     // Put something recognisable on the screen. Not waited for: the first
     // redraw is a full period out, long after any shell has run this.
-    ws.send(Message::Binary(b"\x00echo REDRAW-MARKER-7\n".to_vec()))
+    ws.send(Message::Binary(b"\x00echo REDRAW-MARKER-7\n".to_vec().into()))
         .await
         .unwrap();
 
@@ -545,7 +548,7 @@ async fn open_slot_zero(
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     ws.send(Message::Text(
-        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string(),
+        json!({"type":"open", "term":0, "cols":80, "rows":24}).to_string().into(),
     ))
     .await
     .unwrap();
@@ -644,7 +647,7 @@ async fn share_viewer_is_closed_by_the_server_at_expiry() {
     // Through `sh` so it works whatever the login shell is.
     owner
         .send(Message::Binary(
-            b"\x00sh -c 'while :; do echo tick; sleep 0.1; done'\n".to_vec(),
+            b"\x00sh -c 'while :; do echo tick; sleep 0.1; done'\n".to_vec().into(),
         ))
         .await
         .unwrap();

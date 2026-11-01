@@ -183,7 +183,7 @@ fn spawn_forward(
                     let r = screen.redraw(&mut output_rx);
                     let mut gone = false;
                     for bytes in &r.pending {
-                        if out_tx.send(Message::Binary(tagged(term, bytes))).await.is_err() {
+                        if out_tx.send(Message::Binary(tagged(term, bytes).into())).await.is_err() {
                             gone = true;
                             break;
                         }
@@ -193,10 +193,10 @@ fn spawn_forward(
                     }
                     if r.lagged {
                         // Same hole in the stream as the Lagged arm below.
-                        let _ = out_tx.send(Message::Text(closed_json(term, "error"))).await;
+                        let _ = out_tx.send(Message::Text(closed_json(term, "error").into())).await;
                         break;
                     }
-                    if out_tx.send(Message::Text(redraw_json(Some(term), &r))).await.is_err() {
+                    if out_tx.send(Message::Text(redraw_json(Some(term), &r).into())).await.is_err() {
                         break;
                     }
                 },
@@ -204,13 +204,13 @@ fn spawn_forward(
                 // respawns a fresh shell.
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        let _ = out_tx.send(Message::Text(closed_json(term, "exit"))).await;
+                        let _ = out_tx.send(Message::Text(closed_json(term, "exit").into())).await;
                         break;
                     }
                 },
                 out = output_rx.recv() => match out {
                     Ok(bytes) => {
-                        if out_tx.send(Message::Binary(tagged(term, &bytes))).await.is_err() {
+                        if out_tx.send(Message::Binary(tagged(term, &bytes).into())).await.is_err() {
                             break;
                         }
                     }
@@ -219,7 +219,7 @@ fn spawn_forward(
                         // the client's offset is no longer honest. Close the
                         // channel; the client re-opens with its offset and the
                         // ring heals it (delta or full replay).
-                        let _ = out_tx.send(Message::Text(closed_json(term, "error"))).await;
+                        let _ = out_tx.send(Message::Text(closed_json(term, "error").into())).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -362,11 +362,11 @@ pub async fn mux_bridge(
                                 // is self-inflicted (the stalled client is the
                                 // one penalised), which is why it is accepted
                                 // rather than worked around with a side queue.
-                                if out_tx.send(Message::Text(hello)).await.is_err() {
+                                if out_tx.send(Message::Text(hello.into())).await.is_err() {
                                     break;
                                 }
                                 if out_tx
-                                    .send(Message::Binary(tagged(term, &replay)))
+                                    .send(Message::Binary(tagged(term, &replay).into()))
                                     .await
                                     .is_err()
                                 {
@@ -391,7 +391,7 @@ pub async fn mux_bridge(
                             Err(e) => {
                                 tracing::warn!("mux: attach failed user={user:?} term={term}: {e}");
                                 if out_tx
-                                    .send(Message::Text(closed_json(term, "error")))
+                                    .send(Message::Text(closed_json(term, "error").into()))
                                     .await
                                     .is_err()
                                 {
@@ -614,10 +614,10 @@ pub async fn bridge(
     let mut out = ViewerOutput::new(sink, lease);
 
     // Nothing leaves the server on an expired lease — not even the hello.
-    if out.send(Message::Text(hello)).await.is_err() {
+    if out.send(Message::Text(hello.into())).await.is_err() {
         return;
     }
-    if out.send(Message::Binary(replay)).await.is_err() {
+    if out.send(Message::Binary(replay.into())).await.is_err() {
         return;
     }
 
@@ -682,7 +682,7 @@ pub async fn bridge(
             _ = next_redraw(&mut redraw_tick) => {
                 let r = screen.redraw(&mut output_rx);
                 for bytes in &r.pending {
-                    if out.send(Message::Binary(bytes.clone())).await.is_err() {
+                    if out.send(Message::Binary(bytes.clone().into())).await.is_err() {
                         return;
                     }
                 }
@@ -690,7 +690,7 @@ pub async fn bridge(
                     out.close().await;
                     return;
                 }
-                if out.send(Message::Text(redraw_json(None, &r))).await.is_err() {
+                if out.send(Message::Text(redraw_json(None, &r).into())).await.is_err() {
                     return;
                 }
             },
@@ -705,7 +705,7 @@ pub async fn bridge(
             // Shell output -> browser, through the guard.
             recv = output_rx.recv() => match recv {
                 Ok(bytes) => {
-                    if out.send(Message::Binary(bytes)).await.is_err() {
+                    if out.send(Message::Binary(bytes.into())).await.is_err() {
                         // Expired (Close already sent) or peer gone: either
                         // way, drop the guard.
                         return;
@@ -724,7 +724,7 @@ pub async fn bridge(
             msg = stream.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if !read_only {
-                        let _ = input_tx.try_send(PtyCmd::Input(b));
+                        let _ = input_tx.try_send(PtyCmd::Input(b.to_vec()));
                     }
                 }
                 Some(Ok(Message::Text(t))) => {

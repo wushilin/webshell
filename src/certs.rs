@@ -251,6 +251,7 @@ pub async fn serve_https(app: axum::Router, bind: &str, tls: TlsConfig) {
 
     let listener = bind_443(bind);
     axum_server::from_tcp(listener)
+        .expect("adopting the TLS listener")
         .acceptor(acceptor)
         .serve(app.into_make_service())
         .await
