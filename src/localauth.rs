@@ -13,17 +13,16 @@
 //! lives in a file owned by the account being protected rather than in
 //! root-only `/etc/shadow`. Keep the config mode 0600, and pair it with MFA.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
-use rand::rngs::OsRng;
 
 /// Hash a password for storage, returning a PHC string
 /// (`$argon2id$v=19$m=...,t=...,p=...$salt$hash`) that carries its own
 /// parameters — so raising the cost later does not invalidate existing hashes.
 pub fn hash(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut OsRng);
+    // The salt comes from the OS RNG (password-hash's getrandom feature).
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| format!("hashing the password: {e}"))
 }
@@ -71,7 +70,7 @@ pub fn verify(stored: &str, password: &str) -> Result<bool, String> {
     // Argon2's own comparison is constant-time.
     match Argon2::default().verify_password(password.as_bytes(), &parsed) {
         Ok(()) => Ok(true),
-        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
         Err(e) => Err(format!("verifying the password: {e}")),
     }
 }

@@ -197,6 +197,14 @@ struct Scrollback {
     stale: bool,
 }
 
+/// A screen emulator with no scrollback of its own (the ring is the
+/// history). vt100 cannot model a zero-sized screen, so a degenerate size
+/// becomes one cell rather than a panic.
+fn screen_model(cols: u16, rows: u16) -> vt100::Parser {
+    let dim = |n| std::num::NonZeroU16::new(n).unwrap_or(std::num::NonZeroU16::MIN);
+    vt100::Parser::new(dim(rows), dim(cols), 0)
+}
+
 impl Scrollback {
     fn new(cap: usize, cols: u16, rows: u16) -> Self {
         Scrollback {
@@ -204,7 +212,7 @@ impl Scrollback {
             cap,
             total: 0,
             front_state: ModeTracker::new(),
-            screen: vt100::Parser::new(rows, cols, 0),
+            screen: screen_model(cols, rows),
             size: (cols, rows),
             stale: false,
         }
@@ -237,7 +245,7 @@ impl Scrollback {
     fn screen_snapshot(&mut self) -> Vec<u8> {
         if self.stale {
             let (cols, rows) = self.size;
-            let mut fresh = vt100::Parser::new(rows, cols, 0);
+            let mut fresh = screen_model(cols, rows);
             fresh.process(&self.front_init());
             let (a, b) = self.buf.as_slices();
             fresh.process(a);
@@ -245,7 +253,7 @@ impl Scrollback {
             self.screen = fresh;
             self.stale = false;
         }
-        self.screen.screen().contents_formatted()
+        self.screen.screen().contents_formatted().into_bytes()
     }
 
     /// Escape sequences a full replay must be prefixed with so the ring's
@@ -990,7 +998,7 @@ mod tests {
     /// Plain text of a `contents_formatted` snapshot: escape sequences
     /// stripped, one string per screen row.
     fn plain_rows(snapshot: &[u8], cols: u16, rows: usize) -> Vec<String> {
-        let mut p = vt100::Parser::new(rows as u16, cols, 0);
+        let mut p = screen_model(cols, rows as u16);
         p.process(snapshot);
         (0..rows)
             .map(|r| {
@@ -1026,7 +1034,7 @@ mod tests {
         let mut s = Scrollback::new(4096, 10, 3);
         s.push(b"row0\r\nrow1\r\n0123456789");
         let snap = s.screen_snapshot();
-        let mut p = vt100::Parser::new(3, 10, 100);
+        let mut p = vt100::Parser::new(3.try_into().unwrap(), 10.try_into().unwrap(), 100);
         p.process(&snap);
         assert_eq!(p.screen().contents_between(0, 0, 0, 10).trim_end(), "row0");
         assert_eq!(p.screen().contents_between(2, 0, 2, 10), "0123456789");

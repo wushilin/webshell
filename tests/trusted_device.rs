@@ -11,7 +11,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::header::{COOKIE, LOCATION, SET_COOKIE};
 use reqwest::{Client, StatusCode};
 use sha1::Sha1;
@@ -190,6 +190,9 @@ device_path = "devices.toml"
 /// cookie is presented on which request, which an automatic jar would hide.
 /// Redirects are not followed, so the `Location` of each step is observable.
 fn http_client() -> Client {
+    // reqwest is built without a crypto provider; the server installs ring
+    // in main(), and so must every other process that builds a client.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()

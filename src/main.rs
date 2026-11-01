@@ -258,6 +258,10 @@ async fn main() {
         )
         .init();
 
+    // reqwest is built without a crypto provider; every rustls user in the
+    // process (OIDC client, ACME) shares ring.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     use clap::Parser;
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Run(ConfigArgs {
@@ -711,9 +715,11 @@ fn load_signing_key(secret_base64: Option<&str>) -> Key {
 }
 
 fn generate_cookie_secret() -> String {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut buf = [0u8; 64];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .expect("reading the OS random number generator");
     base64::engine::general_purpose::STANDARD.encode(buf)
 }
 
@@ -727,7 +733,7 @@ fn now_unix() -> u64 {
 }
 
 fn derive_key(master: &[u8], context: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let mut mac = Hmac::<Sha256>::new_from_slice(master).expect("HMAC accepts any key length");
     mac.update(context);

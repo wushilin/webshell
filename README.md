@@ -58,7 +58,7 @@ dependencies at all — no glibc version to match, no PAM, nothing to install
 alongside them. Drop one on any Linux host and run it:
 
 ```sh
-VER=0.4.1                       # or whatever the latest release is
+VER=0.4.2                       # or whatever the latest release is
 OS=linux                        # or macos, freebsd
 ARCH=x86_64                     # or aarch64
 ASSET=webshell-$VER-$OS-$ARCH$( [ "$OS" = linux ] && echo -musl )
